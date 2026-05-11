@@ -28,6 +28,10 @@ Available predicates (bool):
     inside_region(body, min, max)
     contact_between(geom_a, geom_b)
     contact_any()
+    body_on(body_a, body_b, z_offset=0.02, xy_tol=0.15)
+    body_inside(body, container, xy_tol=0.15, z_tol=0.15)
+    body_upright(body, tol=0.15)
+    grasped(body, gripper_prefix)
 
 Available reward terms (float):
 
@@ -115,6 +119,30 @@ def _joint_position(sim: SimEngine, joint: str) -> float | None:
     val = obs.get(joint)
     if isinstance(val, (int, float)) and not isinstance(val, bool):
         return float(val)
+    return None
+
+
+def _body_quaternion(sim: SimEngine, body: str) -> list[float] | None:
+    """Best-effort quaternion lookup. Returns ``None`` on any failure.
+
+    Quaternion convention: MuJoCo reports ``[w, x, y, z]``. Callers that
+    need just an axis can derive it from the rotation matrix, but doing
+    the arithmetic inline here keeps the predicate library numpy-free.
+    """
+    get_body_state = getattr(sim, "get_body_state", None)
+    if get_body_state is None:
+        return None
+    try:
+        result = get_body_state(body_name=body)
+    except Exception as e:  # noqa: BLE001 - defensive
+        logger.debug("body_quaternion(%r) failed: %s", body, e)
+        return None
+    if not isinstance(result, dict) or result.get("status") != "success":
+        return None
+    payload = _extract_json(result)
+    quat = payload.get("quaternion")
+    if isinstance(quat, list) and len(quat) == 4 and all(isinstance(c, (int, float)) for c in quat):
+        return [float(c) for c in quat]
     return None
 
 
@@ -243,6 +271,133 @@ def _contact_any() -> BoolPredicate:
     return check
 
 
+def _body_on(
+    body_a: str,
+    body_b: str,
+    z_offset: float = 0.02,
+    xy_tol: float = 0.15,
+) -> BoolPredicate:
+    """Approximate ``(on A B)`` predicate - A resting on top of B.
+
+    True when ``A.z > B.z + z_offset`` AND horizontal distance ``|A.xy - B.xy|
+    < xy_tol``. The z-offset parameter accounts for B's half-height + a small
+    buffer; tune per scene. Intended for sparse-success benchmarks (LIBERO,
+    etc.) where exact geometric containment isn't required.
+
+    For full fidelity (MJCF geom size lookup + narrow-phase collision), write
+    a scene-specific predicate and register it via :func:`register_predicate`.
+    """
+
+    def check(sim: SimEngine) -> bool:
+        pos_a = _body_position(sim, body_a)
+        pos_b = _body_position(sim, body_b)
+        if pos_a is None or pos_b is None:
+            return False
+        dx = pos_a[0] - pos_b[0]
+        dy = pos_a[1] - pos_b[1]
+        if (dx * dx + dy * dy) ** 0.5 > float(xy_tol):
+            return False
+        return pos_a[2] > pos_b[2] + float(z_offset)
+
+    return check
+
+
+def _body_inside(body: str, container: str, xy_tol: float = 0.15, z_tol: float = 0.15) -> BoolPredicate:
+    """Approximate ``(inside A B)`` predicate - A contained within B's volume.
+
+    True when A's position is within an axis-aligned box centered on B with
+    half-extents (``xy_tol``, ``xy_tol``, ``z_tol``). LIBERO-typical use is
+    "object inside basket / drawer / compartment" where exact bbox is
+    benchmark-specific; the defaults are tuned for table-top manipulation.
+
+    When richer geometry is available, override by registering a
+    scene-specific predicate.
+    """
+
+    def check(sim: SimEngine) -> bool:
+        pos_a = _body_position(sim, body)
+        pos_b = _body_position(sim, container)
+        if pos_a is None or pos_b is None:
+            return False
+        return (
+            abs(pos_a[0] - pos_b[0]) <= float(xy_tol)
+            and abs(pos_a[1] - pos_b[1]) <= float(xy_tol)
+            and abs(pos_a[2] - pos_b[2]) <= float(z_tol)
+        )
+
+    return check
+
+
+def _body_upright(body: str, tol: float = 0.15) -> BoolPredicate:
+    """True when ``body``'s local +Z axis is within ``tol`` of world +Z.
+
+    Computes the rotation-matrix element ``R[2,2]`` from the body's
+    quaternion. Upright → ``R[2,2] > 1 - tol``. The math (all unit-quat
+    identities, w² + x² + y² + z² = 1):
+
+        R[2,2] = 1 - 2*(x² + y²)
+
+    so the check is ``2*(x² + y²) < tol``. This is monotonic in "how
+    tipped over" the body is, so a small tol (0.01-0.2) corresponds
+    directly to the maximum allowed tilt.
+    """
+    t = float(tol)
+    if t < 0:
+        raise ValueError(f"body_upright: 'tol' must be >= 0, got {t}")
+
+    def check(sim: SimEngine) -> bool:
+        quat = _body_quaternion(sim, body)
+        if quat is None:
+            return False
+        # MuJoCo quat layout is (w, x, y, z).
+        _, x, y, _ = quat
+        return 2.0 * (x * x + y * y) < t
+
+    return check
+
+
+def _grasped(body: str, gripper_prefix: str) -> BoolPredicate:
+    """True when ``body`` is in contact with any geom whose name starts with ``gripper_prefix``.
+
+    Treats the gripper as a *set* of geoms (fingers, pads, tip sites) so
+    the caller only has to specify the common prefix - e.g. ``"robot0_gripper"``
+    for Panda covers both fingers. A body is "grasped" as long as any one
+    gripper geom is in contact with any geom matching the body name.
+
+    Backends must implement ``get_contacts()`` returning the MuJoCo
+    ``{"contacts": [{"geom1", "geom2", ...}]}`` shape. Other backends are
+    treated as "cannot check" and return ``False``.
+    """
+
+    def check(sim: SimEngine) -> bool:
+        get_contacts = getattr(sim, "get_contacts", None)
+        if get_contacts is None:
+            return False
+        try:
+            result = get_contacts()
+        except Exception as e:  # noqa: BLE001 - defensive
+            logger.debug("grasped(%r, %r) failed: %s", body, gripper_prefix, e)
+            return False
+        payload = _extract_json(result)
+        contacts = payload.get("contacts")
+        if not isinstance(contacts, list):
+            return False
+        for c in contacts:
+            if not isinstance(c, dict):
+                continue
+            g1 = c.get("geom1") or ""
+            g2 = c.get("geom2") or ""
+            # One side must be the grasped body (bare name or "_geom" suffix);
+            # the other must start with the gripper prefix.
+            body_match = {g1, g2} & {body, f"{body}_geom"}
+            gripper_match = any(isinstance(g, str) and g.startswith(gripper_prefix) for g in (g1, g2))
+            if body_match and gripper_match:
+                return True
+        return False
+
+    return check
+
+
 # Reward terms (float-valued)
 
 
@@ -304,6 +459,10 @@ PREDICATE_REGISTRY: dict[str, PredicateFactory] = {
     "inside_region": _inside_region,
     "contact_between": _contact_between,
     "contact_any": _contact_any,
+    "body_on": _body_on,
+    "body_inside": _body_inside,
+    "body_upright": _body_upright,
+    "grasped": _grasped,
     # float-valued
     "distance_neg": _distance_neg,
     "joint_progress": _joint_progress,

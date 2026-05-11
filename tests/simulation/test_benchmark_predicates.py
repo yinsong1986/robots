@@ -104,6 +104,10 @@ class TestRegistry:
             "inside_region",
             "contact_between",
             "contact_any",
+            "body_on",
+            "body_inside",
+            "body_upright",
+            "grasped",
             "distance_neg",
             "joint_progress",
             "constant",
@@ -272,3 +276,128 @@ class TestRewardTerms:
     def test_constant(self):
         term = make_predicate("constant", value=-0.01)
         assert term(None) == pytest.approx(-0.01)
+
+
+# LIBERO / #110 predicates
+
+
+class _BodyStateWithQuatSim:
+    """Extends _BodyStateSim with quaternion in the body-state payload."""
+
+    def __init__(self, bodies: dict[str, dict[str, Any]]):
+        self._bodies = bodies
+
+    def get_body_state(self, body_name: str) -> dict[str, Any]:
+        if body_name not in self._bodies:
+            return {"status": "error", "content": [{"text": "missing"}]}
+        payload = {
+            "position": self._bodies[body_name].get("position", [0, 0, 0]),
+            "quaternion": self._bodies[body_name].get("quaternion", [1, 0, 0, 0]),
+            "mass": 1.0,
+        }
+        return {"status": "success", "content": [{"text": body_name}, {"json": payload}]}
+
+    def get_observation(self, *_, **__) -> dict[str, Any]:
+        return {}
+
+
+class TestBodyOn:
+    def test_true_when_above_and_aligned(self):
+        sim = _BodyStateSim({"cube": [0.0, 0.0, 0.22], "table": [0.0, 0.0, 0.05]})
+        pred = make_predicate("body_on", body_a="cube", body_b="table", z_offset=0.1)
+        assert pred(sim) is True
+
+    def test_false_when_not_above(self):
+        sim = _BodyStateSim({"cube": [0.0, 0.0, 0.04], "table": [0.0, 0.0, 0.05]})
+        pred = make_predicate("body_on", body_a="cube", body_b="table", z_offset=0.01)
+        assert pred(sim) is False
+
+    def test_false_when_too_far_horizontally(self):
+        sim = _BodyStateSim({"cube": [1.0, 0.0, 0.2], "table": [0.0, 0.0, 0.05]})
+        pred = make_predicate("body_on", body_a="cube", body_b="table", xy_tol=0.1)
+        assert pred(sim) is False
+
+    def test_missing_body_returns_false(self):
+        sim = _BodyStateSim({"table": [0, 0, 0.05]})
+        pred = make_predicate("body_on", body_a="cube", body_b="table")
+        assert pred(sim) is False
+
+
+class TestBodyInside:
+    def test_true_inside_box(self):
+        sim = _BodyStateSim({"cube": [0.02, 0.01, 0.03], "basket": [0, 0, 0]})
+        pred = make_predicate("body_inside", body="cube", container="basket", xy_tol=0.1, z_tol=0.1)
+        assert pred(sim) is True
+
+    def test_false_outside_xy(self):
+        sim = _BodyStateSim({"cube": [0.5, 0.0, 0.0], "basket": [0, 0, 0]})
+        pred = make_predicate("body_inside", body="cube", container="basket", xy_tol=0.1, z_tol=0.1)
+        assert pred(sim) is False
+
+    def test_false_outside_z(self):
+        sim = _BodyStateSim({"cube": [0.0, 0.0, 0.5], "basket": [0, 0, 0]})
+        pred = make_predicate("body_inside", body="cube", container="basket", xy_tol=0.2, z_tol=0.1)
+        assert pred(sim) is False
+
+
+class TestBodyUpright:
+    def test_identity_quat_is_upright(self):
+        sim = _BodyStateWithQuatSim({"bottle": {"quaternion": [1.0, 0.0, 0.0, 0.0]}})
+        pred = make_predicate("body_upright", body="bottle")
+        assert pred(sim) is True
+
+    def test_tipped_on_side_is_not_upright(self):
+        # 90-deg rotation about x-axis: quat = (cos(pi/4), sin(pi/4), 0, 0) ≈ (0.707, 0.707, 0, 0)
+        sim = _BodyStateWithQuatSim({"bottle": {"quaternion": [0.7071, 0.7071, 0.0, 0.0]}})
+        pred = make_predicate("body_upright", body="bottle", tol=0.15)
+        assert pred(sim) is False
+
+    def test_small_tilt_within_tolerance(self):
+        # Small rotation about x-axis - x component ~= 0.1, so 2*(x²+y²) ~= 0.02 < default tol 0.15.
+        sim = _BodyStateWithQuatSim({"bottle": {"quaternion": [0.995, 0.1, 0.0, 0.0]}})
+        pred = make_predicate("body_upright", body="bottle", tol=0.15)
+        assert pred(sim) is True
+
+    def test_missing_body_returns_false(self):
+        sim = _BodyStateWithQuatSim({})
+        pred = make_predicate("body_upright", body="bottle")
+        assert pred(sim) is False
+
+    def test_negative_tol_rejected(self):
+        with pytest.raises(ValueError):
+            make_predicate("body_upright", body="bottle", tol=-0.1)
+
+
+class TestGrasped:
+    def test_detects_gripper_contact_by_prefix(self):
+        sim = _ContactSim(
+            [
+                {"geom1": "robot0_gripper_finger_r", "geom2": "cube_geom"},
+            ]
+        )
+        pred = make_predicate("grasped", body="cube", gripper_prefix="robot0_gripper")
+        assert pred(sim) is True
+
+    def test_contact_without_gripper_prefix_is_not_grasp(self):
+        sim = _ContactSim([{"geom1": "table", "geom2": "cube_geom"}])
+        pred = make_predicate("grasped", body="cube", gripper_prefix="robot0_gripper")
+        assert pred(sim) is False
+
+    def test_matches_either_ordering(self):
+        sim = _ContactSim(
+            [
+                {"geom1": "cube_geom", "geom2": "robot0_gripper_finger_l"},
+            ]
+        )
+        pred = make_predicate("grasped", body="cube", gripper_prefix="robot0_gripper")
+        assert pred(sim) is True
+
+    def test_no_contacts_returns_false(self):
+        sim = _ContactSim([])
+        pred = make_predicate("grasped", body="cube", gripper_prefix="robot0_gripper")
+        assert pred(sim) is False
+
+    def test_without_get_contacts_returns_false(self):
+        sim = _NoHelpersSim()
+        pred = make_predicate("grasped", body="cube", gripper_prefix="robot0_gripper")
+        assert pred(sim) is False
