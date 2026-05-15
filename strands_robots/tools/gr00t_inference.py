@@ -4,15 +4,41 @@ GR00T Inference Service Management Tool
 
 Manages GR00T policy inference services running in Docker containers.
 Uses Isaac-GR00T's native inference service for proper ZMQ/HTTP communication.
+
+Container lifecycle (``build_image`` / ``download_checkpoint`` /
+``start_container`` / ``lifecycle="full"``) wraps the four manual setup
+steps so an LLM driving the AgentTool can fully orchestrate a GR00T eval
+from a single prompt - see #148 for the motivation.
 """
 
 import os
 import socket
 import subprocess
 import time
+from pathlib import Path
 from typing import Any
 
 from strands import tool
+
+from strands_robots.utils import get_base_dir, require_optional
+
+# Default cache layout for the lifecycle helpers. Mirrors the layout
+# documented in the Isaac-GR00T README so users moving from the manual
+# four-step setup don't have to relocate their existing artefacts.
+_DEFAULT_REPO_URL = "https://github.com/NVIDIA/Isaac-GR00T"
+_DEFAULT_REPO_TAG = "n1.7-release"
+_DEFAULT_IMAGE_NAME = "gr00t:latest"
+_DEFAULT_CONTAINER_COMMAND = "tail -f /dev/null"
+
+
+def _isaac_gr00t_dir() -> Path:
+    """Default clone destination for the Isaac-GR00T source tree."""
+    return get_base_dir() / "Isaac-GR00T"
+
+
+def _checkpoints_dir() -> Path:
+    """Default download destination for HuggingFace checkpoints."""
+    return get_base_dir() / "checkpoints"
 
 
 @tool
@@ -36,6 +62,19 @@ def gr00t_inference(
     api_token: str | None = None,
     protocol: str = "n1.5",
     use_sim_policy_wrapper: bool = False,
+    repo_url: str = _DEFAULT_REPO_URL,
+    repo_tag: str = _DEFAULT_REPO_TAG,
+    source_dir: str | None = None,
+    image_name: str = _DEFAULT_IMAGE_NAME,
+    hf_repo: str | None = None,
+    hf_subfolder: str | None = None,
+    hf_local_dir: str | None = None,
+    hf_token: str | None = None,
+    volumes: dict[str, str] | None = None,
+    container_command: str = _DEFAULT_CONTAINER_COMMAND,
+    lifecycle: str = "full",
+    remove_volumes: bool = False,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Manage GR00T N1 inference services in Docker containers.
 
@@ -56,6 +95,25 @@ def gr00t_inference(
         - ``list``: Discover all running services across common ports (5555-5558, 8000-8003).
         - ``restart``: Stop and re-start a service (e.g., to swap checkpoints). Requires ``checkpoint_path``.
         - ``find_containers``: List available Isaac-GR00T Docker containers.
+        - ``build_image``: Clone Isaac-GR00T at ``repo_tag`` and run ``bash docker/build.sh``.
+          Idempotent - skips the build when ``image_name`` already exists in the local
+          docker daemon. Pass ``force=True`` to rebuild.
+        - ``download_checkpoint``: Download a HuggingFace checkpoint to a local cache
+          directory using ``huggingface_hub``. Requires ``hf_repo``;
+          ``hf_subfolder`` filters to a single sub-checkpoint (e.g.
+          ``"libero_spatial"``). Idempotent - skips when the local directory is
+          already populated unless ``force=True``.
+        - ``start_container``: ``docker run -d --gpus all --ipc=host`` on
+          ``image_name`` with ``container_name``, the volume mounts in ``volumes``,
+          ``HF_TOKEN`` env passthrough, and ``-p {port}:{port}``. Idempotent -
+          skips when a running container with the same name exists; reuses a
+          stopped container when ``force=True``.
+        - ``lifecycle``: One-call orchestration. ``lifecycle="full"`` runs
+          ``build_image`` → ``download_checkpoint`` → ``start_container`` → ``start`` and
+          waits for the inference port. ``lifecycle="teardown"`` removes the
+          container (and its volumes when ``remove_volumes=True``). Each sub-step
+          stays idempotent so re-running ``lifecycle="full"`` after a crash
+          resumes from where it stopped.
 
     Protocol selection:
         - **ZMQ** (default, ``http_server=False``): Low-latency binary protocol on port 5555.
@@ -153,6 +211,35 @@ def gr00t_inference(
             simulator-side observations into the format the policy expects.
             Ignored for N1.5 / N1.6 (no equivalent flag).
 
+    Container lifecycle args (used by ``build_image``, ``download_checkpoint``,
+    ``start_container``, ``lifecycle``):
+        repo_url: Isaac-GR00T git URL (default: ``https://github.com/NVIDIA/Isaac-GR00T``).
+        repo_tag: Branch / tag / SHA to check out (default: ``"n1.7-release"``).
+        source_dir: Where to clone the Isaac-GR00T source. Defaults to
+            ``$STRANDS_BASE_DIR/Isaac-GR00T`` (typically ``~/.strands_robots/Isaac-GR00T``).
+        image_name: Docker image tag for the built / used container
+            (default: ``"gr00t:latest"``).
+        hf_repo: HuggingFace dataset/model id (e.g., ``"nvidia/GR00T-N1.7-LIBERO"``).
+            Required for ``download_checkpoint``.
+        hf_subfolder: Subfolder pattern within the HF repo (e.g.,
+            ``"libero_spatial"``). When set, only files matching
+            ``<subfolder>/*`` are downloaded.
+        hf_local_dir: Where to download the checkpoint. Defaults to
+            ``$STRANDS_BASE_DIR/checkpoints/<basename(hf_repo)>``.
+        hf_token: HuggingFace API token (gated repos). Falls back to
+            ``HF_TOKEN`` / ``HUGGING_FACE_HUB_TOKEN`` env vars.
+        volumes: ``{host_path: container_path}`` mounts for ``start_container``.
+            Defaults to mounting ``hf_local_dir`` → ``/data/checkpoints`` and
+            ``~/.cache/huggingface`` → ``/root/.cache/huggingface``.
+        container_command: ``docker run`` command (default: ``"tail -f /dev/null"``,
+            so the container stays alive for ``docker exec``).
+        lifecycle: ``"full"`` (default - chain build → download → start_container
+            → start) or ``"teardown"`` (rm container + volumes).
+        remove_volumes: When ``lifecycle="teardown"``, also remove docker volumes
+            (default: ``False`` to preserve checkpoint mounts).
+        force: For idempotent steps - rebuild image, redownload checkpoint, or
+            recreate container even when the artefact is already present.
+
     Returns:
         Dict with operation results. Common fields:
 
@@ -227,6 +314,71 @@ def gr00t_inference(
         return _check_service_status(port)
     elif action == "stop":
         return _stop_service(port)
+    elif action == "build_image":
+        return _build_image(
+            repo_url=repo_url,
+            repo_tag=repo_tag,
+            source_dir=source_dir,
+            image_name=image_name,
+            force=force,
+        )
+    elif action == "download_checkpoint":
+        if hf_repo is None:
+            return {"status": "error", "message": "'hf_repo' is required for action='download_checkpoint'"}
+        return _download_checkpoint(
+            hf_repo=hf_repo,
+            hf_subfolder=hf_subfolder,
+            hf_local_dir=hf_local_dir,
+            hf_token=hf_token,
+            force=force,
+        )
+    elif action == "start_container":
+        return _start_container(
+            image_name=image_name,
+            container_name=container_name,
+            port=port,
+            volumes=volumes,
+            hf_token=hf_token,
+            container_command=container_command,
+            hf_local_dir=hf_local_dir,
+            force=force,
+        )
+    elif action == "lifecycle":
+        return _lifecycle(
+            phase=lifecycle,
+            # Phase-specific kwargs (most reused from start/start_container).
+            repo_url=repo_url,
+            repo_tag=repo_tag,
+            source_dir=source_dir,
+            image_name=image_name,
+            hf_repo=hf_repo,
+            hf_subfolder=hf_subfolder,
+            hf_local_dir=hf_local_dir,
+            hf_token=hf_token,
+            container_name=container_name,
+            volumes=volumes,
+            container_command=container_command,
+            remove_volumes=remove_volumes,
+            force=force,
+            # start kwargs - used at the tail of phase="full".
+            checkpoint_path=checkpoint_path,
+            policy_name=policy_name,
+            port=port,
+            data_config=data_config,
+            embodiment_tag=embodiment_tag,
+            denoising_steps=denoising_steps,
+            host=host,
+            timeout=timeout,
+            use_tensorrt=use_tensorrt,
+            trt_engine_path=trt_engine_path,
+            vit_dtype=vit_dtype,
+            llm_dtype=llm_dtype,
+            dit_dtype=dit_dtype,
+            http_server=http_server,
+            api_token=api_token,
+            protocol=protocol,
+            use_sim_policy_wrapper=use_sim_policy_wrapper,
+        )
     elif action == "start":
         if checkpoint_path is None:
             return {"status": "error", "message": "Checkpoint path required to start service"}
@@ -636,6 +788,530 @@ def _start_service(
         return {"status": "error", "message": f"Failed to start service: {e.stderr or e}"}
     except Exception as e:
         return {"status": "error", "message": f"Unexpected error: {e}"}
+
+
+# Container lifecycle helpers (#148-F3 wider)
+#
+# Each helper is idempotent and returns a structured status dict. They wrap
+# the manual four-step Isaac-GR00T setup (clone → docker build → hf
+# download → docker run) so an LLM driving this AgentTool can fully
+# orchestrate a GR00T eval from one prompt. Splitting them into per-action
+# entry points (rather than burying everything inside ``start``) keeps
+# each step independently re-runnable and makes the failure surface
+# obvious - if "build_image" succeeds but "download_checkpoint" fails,
+# the user / agent knows exactly which step to retry.
+
+
+def _image_exists(image_name: str) -> bool:
+    """Return True iff the local docker daemon already has ``image_name``.
+
+    Uses ``docker image inspect`` rather than ``docker images`` because the
+    former returns a non-zero exit code on miss (cleaner branch logic) and
+    works for tag-less digest pins too. Any docker invocation failure
+    (daemon down, command missing) returns False so the caller falls
+    through to a regular build, which then surfaces the real error.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", image_name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def _container_state(name: str) -> str:
+    """Return the current state of container ``name`` or ``"absent"``.
+
+    Possible values: ``"running"``, ``"exited"``, ``"created"``, ``"paused"``,
+    ``"restarting"``, ``"removing"``, ``"dead"``, ``"absent"``. Anything
+    other than ``"running"`` and ``"absent"`` is unusual and the caller
+    must decide whether to remove + recreate (``force=True``) or fail.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Status}}", name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return "absent"
+        return result.stdout.strip() or "absent"
+    except (FileNotFoundError, OSError):
+        return "absent"
+
+
+def _build_image(
+    *,
+    repo_url: str,
+    repo_tag: str,
+    source_dir: str | None,
+    image_name: str,
+    force: bool,
+) -> dict[str, Any]:
+    """Clone Isaac-GR00T at ``repo_tag`` and run ``bash docker/build.sh``.
+
+    Idempotent: when ``image_name`` is already in the local docker daemon
+    AND ``force=False``, returns success without touching the filesystem
+    or the docker daemon. Pass ``force=True`` to clean-rebuild.
+    """
+    if not force and _image_exists(image_name):
+        return {
+            "status": "success",
+            "image_name": image_name,
+            "skipped": True,
+            "message": f"Docker image {image_name!r} already exists; skipping build (use force=True to rebuild)",
+        }
+
+    dest = Path(source_dir).expanduser() if source_dir else _isaac_gr00t_dir()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Clone or update the repo at the requested tag. ``git fetch + checkout``
+        # is faster than re-cloning when the branch has just moved.
+        if (dest / ".git").is_dir():
+            subprocess.run(
+                ["git", "-C", str(dest), "fetch", "--depth", "1", "origin", repo_tag],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(dest), "checkout", repo_tag],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(dest), "submodule", "update", "--init", "--recursive"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        else:
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "--branch",
+                    repo_tag,
+                    "--recurse-submodules",
+                    repo_url,
+                    str(dest),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+        # Build the image. ``docker/build.sh`` is the canonical entrypoint
+        # documented in the Isaac-GR00T README. Use bash explicitly so the
+        # script's shebang isn't required.
+        build_script = dest / "docker" / "build.sh"
+        if not build_script.is_file():
+            return {
+                "status": "error",
+                "message": (
+                    f"docker/build.sh not found at {build_script} - the cloned repo may "
+                    f"not match the expected layout for tag {repo_tag!r}."
+                ),
+            }
+        subprocess.run(
+            ["bash", str(build_script)],
+            cwd=str(dest),
+            capture_output=True,
+            text=True,
+            check=True,
+            env={**os.environ, "DOCKER_BUILDKIT": os.environ.get("DOCKER_BUILDKIT", "1")},
+        )
+
+        return {
+            "status": "success",
+            "image_name": image_name,
+            "source_dir": str(dest),
+            "repo_tag": repo_tag,
+            "skipped": False,
+            "message": f"Built docker image {image_name!r} from {repo_url}@{repo_tag}",
+        }
+    except subprocess.CalledProcessError as e:
+        return {
+            "status": "error",
+            "message": f"Failed to build image: {e.stderr or e}",
+            "stderr": e.stderr or "",
+        }
+
+
+def _download_checkpoint(
+    *,
+    hf_repo: str,
+    hf_subfolder: str | None,
+    hf_local_dir: str | None,
+    hf_token: str | None,
+    force: bool,
+) -> dict[str, Any]:
+    """Download a HuggingFace checkpoint via ``huggingface_hub.snapshot_download``.
+
+    Idempotent: when ``local_dir`` already exists and is non-empty AND
+    ``force=False``, returns success without touching the network. Pass
+    ``force=True`` to refresh.
+
+    HF token resolution order:
+        1. Explicit ``hf_token`` kwarg.
+        2. ``HF_TOKEN`` env var (canonical, what ``huggingface_hub`` reads).
+        3. ``HUGGING_FACE_HUB_TOKEN`` env var (legacy alias).
+        4. None - downloads continue for ungated repos; gated ones surface
+           a clear ``snapshot_download`` error.
+    """
+    local_dir = Path(hf_local_dir).expanduser() if hf_local_dir else _checkpoints_dir() / hf_repo.replace("/", "__")
+
+    if not force and local_dir.is_dir() and any(local_dir.iterdir()):
+        return {
+            "status": "success",
+            "hf_repo": hf_repo,
+            "hf_subfolder": hf_subfolder,
+            "local_dir": str(local_dir),
+            "skipped": True,
+            "message": f"Checkpoint already at {local_dir}; skipping download (use force=True to refresh)",
+        }
+
+    token = hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+
+    try:
+        hub = require_optional(
+            "huggingface_hub",
+            pip_install="huggingface_hub",
+            purpose="downloading GR00T checkpoints",
+        )
+    except ImportError as e:
+        return {"status": "error", "message": str(e)}
+
+    local_dir.mkdir(parents=True, exist_ok=True)
+    allow_patterns = [f"{hf_subfolder}/*"] if hf_subfolder else None
+
+    try:
+        hub.snapshot_download(  # type: ignore[attr-defined]
+            repo_id=hf_repo,
+            local_dir=str(local_dir),
+            allow_patterns=allow_patterns,
+            token=token,
+        )
+    except Exception as e:  # noqa: BLE001 - HF errors are opaque + varied
+        return {"status": "error", "message": f"Failed to download {hf_repo!r}: {e}"}
+
+    return {
+        "status": "success",
+        "hf_repo": hf_repo,
+        "hf_subfolder": hf_subfolder,
+        "local_dir": str(local_dir),
+        "skipped": False,
+        "message": f"Downloaded {hf_repo}{('/' + hf_subfolder) if hf_subfolder else ''} → {local_dir}",
+    }
+
+
+def _start_container(
+    *,
+    image_name: str,
+    container_name: str | None,
+    port: int,
+    volumes: dict[str, str] | None,
+    hf_token: str | None,
+    container_command: str,
+    hf_local_dir: str | None,
+    force: bool,
+) -> dict[str, Any]:
+    """``docker run -d`` the GR00T container so subsequent ``start`` actions can
+    ``docker exec`` into it.
+
+    Idempotent: when a container with ``container_name`` is already
+    running, returns success without touching docker. When it exists but
+    is stopped, ``force=True`` removes + recreates it (otherwise returns
+    an error that names the recovery flag).
+    """
+    name = container_name or "gr00t"
+    state = _container_state(name)
+    if state == "running" and not force:
+        return {
+            "status": "success",
+            "container_name": name,
+            "image_name": image_name,
+            "state": state,
+            "skipped": True,
+            "message": f"Container {name!r} already running; skipping (use force=True to recreate)",
+        }
+    if state not in ("absent", "running") and not force:
+        return {
+            "status": "error",
+            "message": (f"Container {name!r} exists in state {state!r}; pass force=True to remove + recreate"),
+        }
+    if state != "absent":
+        # force=True OR running-but-force-set: remove first.
+        _remove_container(name=name, remove_volumes=False)
+
+    # Build the docker-run argv.
+    cmd: list[str] = [
+        "docker",
+        "run",
+        "-d",
+        "--gpus",
+        "all",
+        "--ipc=host",
+        "--name",
+        name,
+        "-p",
+        f"{port}:{port}",
+    ]
+
+    # Default volume layout: mount the checkpoint dir into /data/checkpoints
+    # and the host's HF cache so `huggingface_hub` reuses already-downloaded
+    # snapshots. Override with explicit ``volumes={...}`` to customise.
+    effective_volumes = dict(volumes) if volumes is not None else {}
+    if not volumes:
+        if hf_local_dir:
+            effective_volumes[str(Path(hf_local_dir).expanduser())] = "/data/checkpoints"
+        else:
+            effective_volumes[str(_checkpoints_dir())] = "/data/checkpoints"
+        hf_cache = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+        effective_volumes[hf_cache] = "/root/.cache/huggingface"
+
+    for host_path, container_path in effective_volumes.items():
+        cmd.extend(["-v", f"{host_path}:{container_path}"])
+
+    token = hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if token:
+        cmd.extend(["-e", f"HF_TOKEN={token}"])
+
+    cmd.append(image_name)
+    # Split on whitespace to support both string + list-style commands while
+    # keeping the simple "tail -f /dev/null" default working.
+    if container_command:
+        cmd.extend(container_command.split())
+
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        return {"status": "error", "message": f"docker run failed: {e.stderr or e}"}
+
+    return {
+        "status": "success",
+        "container_name": name,
+        "image_name": image_name,
+        "port": port,
+        "volumes": effective_volumes,
+        "skipped": False,
+        "message": f"Started container {name!r} from {image_name!r}",
+    }
+
+
+def _remove_container(*, name: str, remove_volumes: bool) -> dict[str, Any]:
+    """``docker rm -f`` the container; optionally also remove its volumes.
+
+    Tolerant of missing containers - returns success with ``skipped=True``
+    when the name is unknown so ``lifecycle="teardown"`` is safe to call
+    multiple times.
+    """
+    state = _container_state(name)
+    if state == "absent":
+        return {
+            "status": "success",
+            "container_name": name,
+            "skipped": True,
+            "message": f"Container {name!r} not present; nothing to remove",
+        }
+
+    cmd = ["docker", "rm", "-f"]
+    if remove_volumes:
+        cmd.append("-v")
+    cmd.append(name)
+
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        return {"status": "error", "message": f"docker rm failed: {e.stderr or e}"}
+
+    return {
+        "status": "success",
+        "container_name": name,
+        "skipped": False,
+        "remove_volumes": remove_volumes,
+        "message": f"Removed container {name!r}" + (" (with volumes)" if remove_volumes else ""),
+    }
+
+
+def _lifecycle(
+    *,
+    phase: str,
+    # build_image kwargs
+    repo_url: str,
+    repo_tag: str,
+    source_dir: str | None,
+    image_name: str,
+    # download_checkpoint kwargs
+    hf_repo: str | None,
+    hf_subfolder: str | None,
+    hf_local_dir: str | None,
+    hf_token: str | None,
+    # start_container kwargs
+    container_name: str | None,
+    volumes: dict[str, str] | None,
+    container_command: str,
+    # teardown
+    remove_volumes: bool,
+    # shared
+    force: bool,
+    # start kwargs (for phase="full" tail)
+    checkpoint_path: str | None,
+    policy_name: str | None,
+    port: int,
+    data_config: str,
+    embodiment_tag: str,
+    denoising_steps: int,
+    host: str,
+    timeout: int,
+    use_tensorrt: bool,
+    trt_engine_path: str,
+    vit_dtype: str,
+    llm_dtype: str,
+    dit_dtype: str,
+    http_server: bool,
+    api_token: str | None,
+    protocol: str,
+    use_sim_policy_wrapper: bool,
+) -> dict[str, Any]:
+    """Orchestrate the four-step setup or tear down a previously-started container.
+
+    ``phase="full"``: ``build_image`` → ``download_checkpoint`` →
+    ``start_container`` → ``start`` → wait-for-port. Each sub-step is
+    idempotent so re-runs after a crash resume from the failed step.
+
+    ``phase="teardown"``: ``_remove_container`` (with optional volume
+    removal). The image and downloaded checkpoint are preserved -
+    teardown is intentionally cheap to re-run.
+    """
+    if phase not in ("full", "teardown"):
+        return {"status": "error", "message": f"Unknown lifecycle phase {phase!r}. Valid: ['full', 'teardown']"}
+
+    steps: list[dict[str, Any]] = []
+
+    if phase == "teardown":
+        rm_result = _remove_container(name=container_name or "gr00t", remove_volumes=remove_volumes)
+        steps.append({"step": "remove_container", "result": rm_result})
+        return {
+            "status": rm_result["status"],
+            "phase": phase,
+            "steps": steps,
+            "message": rm_result["message"],
+        }
+
+    # phase == "full"
+    if hf_repo is None:
+        return {
+            "status": "error",
+            "message": "lifecycle='full' requires 'hf_repo' so the checkpoint can be downloaded",
+        }
+
+    build_result = _build_image(
+        repo_url=repo_url,
+        repo_tag=repo_tag,
+        source_dir=source_dir,
+        image_name=image_name,
+        force=force,
+    )
+    steps.append({"step": "build_image", "result": build_result})
+    if build_result["status"] != "success":
+        return {"status": "error", "phase": phase, "steps": steps, "message": "lifecycle aborted: build_image failed"}
+
+    download_result = _download_checkpoint(
+        hf_repo=hf_repo,
+        hf_subfolder=hf_subfolder,
+        hf_local_dir=hf_local_dir,
+        hf_token=hf_token,
+        force=force,
+    )
+    steps.append({"step": "download_checkpoint", "result": download_result})
+    if download_result["status"] != "success":
+        return {
+            "status": "error",
+            "phase": phase,
+            "steps": steps,
+            "message": "lifecycle aborted: download_checkpoint failed",
+        }
+
+    # The container needs to mount the just-downloaded checkpoint. If the
+    # caller didn't pre-resolve ``hf_local_dir``, propagate the path the
+    # download step actually used so the container can see the files.
+    resolved_local_dir = download_result.get("local_dir") or hf_local_dir
+
+    container_result = _start_container(
+        image_name=image_name,
+        container_name=container_name,
+        port=port,
+        volumes=volumes,
+        hf_token=hf_token,
+        container_command=container_command,
+        hf_local_dir=resolved_local_dir,
+        force=force,
+    )
+    steps.append({"step": "start_container", "result": container_result})
+    if container_result["status"] != "success":
+        return {
+            "status": "error",
+            "phase": phase,
+            "steps": steps,
+            "message": "lifecycle aborted: start_container failed",
+        }
+
+    # The inference service expects to see the checkpoint mounted under
+    # /data/checkpoints (the default volume mapping). Translate the host
+    # path the user / download step gave us into the in-container path.
+    mounted_checkpoint = checkpoint_path
+    if mounted_checkpoint is None and hf_subfolder:
+        mounted_checkpoint = f"/data/checkpoints/{hf_subfolder}"
+    if mounted_checkpoint is None:
+        return {
+            "status": "error",
+            "phase": phase,
+            "steps": steps,
+            "message": (
+                "lifecycle='full' needs either 'checkpoint_path' (in-container path) or "
+                "'hf_subfolder' (auto-resolved to /data/checkpoints/<subfolder>) so the inference "
+                "service knows where to load the model from"
+            ),
+        }
+
+    start_result = _start_service(
+        checkpoint_path=mounted_checkpoint,
+        port=port,
+        data_config=data_config,
+        embodiment_tag=embodiment_tag,
+        denoising_steps=denoising_steps,
+        host=host,
+        container_name=container_result["container_name"],
+        policy_name=policy_name,
+        timeout=timeout,
+        use_tensorrt=use_tensorrt,
+        trt_engine_path=trt_engine_path,
+        vit_dtype=vit_dtype,
+        llm_dtype=llm_dtype,
+        dit_dtype=dit_dtype,
+        http_server=http_server,
+        api_token=api_token,
+        protocol=protocol,
+        use_sim_policy_wrapper=use_sim_policy_wrapper,
+    )
+    steps.append({"step": "start", "result": start_result})
+
+    return {
+        "status": start_result["status"],
+        "phase": phase,
+        "steps": steps,
+        "message": start_result.get("message", "lifecycle complete"),
+    }
 
 
 if __name__ == "__main__":
