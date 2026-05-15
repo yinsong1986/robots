@@ -78,16 +78,19 @@ class _FakeRobot:
 class _FakeWorld:
     def __init__(self, robots: dict[str, _FakeRobot]):
         self.robots = dict(robots)
+        self.cameras: dict[str, dict[str, Any]] = {}
 
 
 class FakeSim(SimEngine):
-    """Minimal ``SimEngine`` with get_body_state / get_contacts / move_object."""
+    """Minimal ``SimEngine`` with get_body_state / get_contacts / move_object / add_camera."""
 
     def __init__(
         self,
         bodies: dict[str, dict[str, Any]] | None = None,
         contacts: list[dict[str, str]] | None = None,
         data_config: str = "panda",
+        preexisting_cameras: list[str] | None = None,
+        add_camera_fail: bool = False,
     ):
         self._bodies = dict(bodies or {})
         self._contacts = list(contacts or [])
@@ -95,6 +98,10 @@ class FakeSim(SimEngine):
         self._move_calls: list[tuple[str, list[float]]] = []
         self._world = _FakeWorld({"fake_panda": _FakeRobot(data_config)})
         self._scenes_loaded: list[str] = []
+        self._add_camera_calls: list[tuple[str, dict[str, Any]]] = []
+        self._add_camera_fail = add_camera_fail
+        for cam in preexisting_cameras or []:
+            self._world.cameras[cam] = {"position": [0, 0, 0], "target": [0, 0, 0]}
 
     def create_world(self, timestep=None, gravity=None, ground_plane=True):
         return {"status": "success"}
@@ -177,6 +184,33 @@ class FakeSim(SimEngine):
     def load_scene(self, scene_path: str) -> dict[str, Any]:
         self._scenes_loaded.append(scene_path)
         return {"status": "success"}
+
+    def add_camera(
+        self,
+        name: str,
+        position: list[float] | None = None,
+        target: list[float] | None = None,
+        fov: float = 60.0,
+        width: int = 640,
+        height: int = 480,
+    ) -> dict[str, Any]:
+        kwargs = {
+            "position": position,
+            "target": target,
+            "fov": fov,
+            "width": width,
+            "height": height,
+        }
+        self._add_camera_calls.append((name, dict(kwargs)))
+        if self._add_camera_fail:
+            return {"status": "error", "content": [{"text": "fake injection failed"}]}
+        if name in self._world.cameras:
+            return {
+                "status": "error",
+                "content": [{"text": f"add_camera: camera '{name}' already exists. Remove it first."}],
+            }
+        self._world.cameras[name] = kwargs
+        return {"status": "success", "content": [{"text": f"📷 Camera '{name}' added"}]}
 
 
 # Construction
@@ -325,6 +359,120 @@ class TestOnEpisodeStart:
             adapter.on_episode_start(sim, random.Random(0))
         assert exc.value.supported == ["panda"]
         assert exc.value.data_config == "so100"
+
+
+# LIBERO camera installation (#148 / Failure 1)
+
+
+class TestLiberoCameraInstall:
+    def test_default_cameras_installed(self):
+        """``image`` and ``wrist_image`` cameras must be installed so the
+        ``libero_panda`` Gr00tDataConfig finds them in the observation."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, init_jitter=0.0)
+        sim = FakeSim(data_config="panda")
+        adapter.on_episode_start(sim, random.Random(0))
+
+        installed_names = {name for name, _ in sim._add_camera_calls}
+        assert installed_names == {"image", "wrist_image"}
+        assert "image" in sim._world.cameras
+        assert "wrist_image" in sim._world.cameras
+
+    def test_camera_install_happens_after_robot_load(self):
+        """Camera install must run AFTER super().on_episode_start so it
+        installs into a populated scene rather than an empty world."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, init_jitter=0.0)
+
+        events: list[str] = []
+
+        class TrackingFakeSim(FakeSim):
+            def add_robot(self, name, **kw):
+                events.append("add_robot")
+                return super().add_robot(name, **kw)
+
+            def add_camera(self, name, **kw):
+                events.append(f"add_camera:{name}")
+                return super().add_camera(name, **kw)
+
+        sim = TrackingFakeSim(data_config="panda")
+        # Empty world so super() triggers add_robot for default_robot.
+        sim._world.robots.clear()
+        adapter.on_episode_start(sim, random.Random(0))
+
+        # add_robot must come before any add_camera call.
+        first_camera_idx = next(i for i, e in enumerate(events) if e.startswith("add_camera:"))
+        first_robot_idx = events.index("add_robot")
+        assert first_robot_idx < first_camera_idx
+
+    def test_install_cameras_disabled(self):
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, init_jitter=0.0, install_cameras=False)
+        sim = FakeSim(data_config="panda")
+        adapter.on_episode_start(sim, random.Random(0))
+        assert sim._add_camera_calls == []
+
+    def test_custom_cameras_override_defaults(self):
+        custom = {
+            "wide_view": {
+                "position": [2.0, 2.0, 2.0],
+                "target": [0.0, 0.0, 0.0],
+                "fov": 90.0,
+                "width": 128,
+                "height": 128,
+            }
+        }
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, init_jitter=0.0, cameras=custom)
+        sim = FakeSim(data_config="panda")
+        adapter.on_episode_start(sim, random.Random(0))
+
+        installed_names = {name for name, _ in sim._add_camera_calls}
+        # Defaults are completely replaced - only the custom camera is installed.
+        assert installed_names == {"wide_view"}
+
+    def test_existing_cameras_skipped(self):
+        """A scene MJCF that already declares ``image`` should beat us to it -
+        the adapter must not error out when the camera already exists."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, init_jitter=0.0)
+        sim = FakeSim(data_config="panda", preexisting_cameras=["image"])
+        adapter.on_episode_start(sim, random.Random(0))
+
+        # ``image`` was preexisting - we must not call add_camera for it.
+        installed_names = {name for name, _ in sim._add_camera_calls}
+        assert installed_names == {"wrist_image"}
+
+    def test_camera_install_failures_are_logged_not_fatal(self, caplog):
+        """A backend that refuses every add_camera shouldn't kill the eval.
+
+        The adapter's contract: log at WARNING and continue so other
+        cameras + the rollout itself still run.
+        """
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, init_jitter=0.0)
+        sim = FakeSim(data_config="panda", add_camera_fail=True)
+        with caplog.at_level("WARNING"):
+            # Must not raise.
+            adapter.on_episode_start(sim, random.Random(0))
+        # Both cameras attempted; both reported as warning.
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) >= 2
+
+    def test_default_camera_keys_match_libero_panda_data_config(self):
+        """Regression: the adapter's camera names MUST match the bare keys of
+        the ``libero_panda`` Gr00tDataConfig's video_keys, otherwise
+        ``_build_service_observation`` won't find them in the observation."""
+        # Bare keys after removeprefix("video.").
+        expected = {"image", "wrist_image"}
+        assert set(LiberoAdapter.LIBERO_CAMERAS.keys()) == expected
+
+    def test_sim_without_add_camera_silently_skipped(self):
+        """Backends that don't expose add_camera (future engines) shouldn't
+        crash the adapter - it falls back to "no camera install"."""
+
+        class BareSim(FakeSim):
+            # Override add_camera to ``None`` so getattr returns falsy at runtime.
+            add_camera = None  # type: ignore[assignment]
+
+        sim = BareSim(data_config="panda")
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, init_jitter=0.0)
+        # Must not raise even though sim.add_camera is None.
+        adapter.on_episode_start(sim, random.Random(0))
 
 
 # Step semantics

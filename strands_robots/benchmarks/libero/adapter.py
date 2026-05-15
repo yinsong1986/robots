@@ -84,6 +84,38 @@ class LiberoAdapter(BenchmarkProtocol):
     supported_robots_list: list[str] = ["panda"]
     default_robot_name: str = "panda"
 
+    #: Cameras the ``libero_panda`` ``Gr00tDataConfig`` expects to find on the
+    #: sim. Names match the bare keys of its ``video_keys`` (``video.image``
+    #: → ``image``, ``video.wrist_image`` → ``wrist_image``) so the policy's
+    #: ``_build_service_observation`` picks them up directly without an
+    #: explicit ``observation_mapping``.
+    #:
+    #: Poses are world-fixed approximations of LIBERO's RoboSuite-conventional
+    #: views (third-person "agentview" + wrist view). The real LIBERO setup
+    #: parents ``robot0_eye_in_hand_image`` to the gripper body; that requires
+    #: a proper LIBERO scene MJCF (which the upstream pip package does NOT
+    #: ship). Until those scene XMLs are wired in via ``scene_path=``, the
+    #: wrist camera here is a *static* top-down workspace view - the model
+    #: still gets *an* image, but it doesn't track the end-effector. Override
+    #: by passing ``cameras={"wrist_image": {"position": [...], ...}}`` to
+    #: the constructor.
+    LIBERO_CAMERAS: dict[str, dict[str, Any]] = {
+        "image": {
+            "position": [1.0, 0.0, 1.5],
+            "target": [0.0, 0.0, 0.85],
+            "fov": 60.0,
+            "width": 256,
+            "height": 256,
+        },
+        "wrist_image": {
+            "position": [0.0, 0.0, 1.4],
+            "target": [0.0, 0.0, 0.85],
+            "fov": 60.0,
+            "width": 256,
+            "height": 256,
+        },
+    }
+
     def __init__(
         self,
         problem: BDDLProblem,
@@ -91,6 +123,8 @@ class LiberoAdapter(BenchmarkProtocol):
         scene_path: str | None = None,
         max_steps: int | None = None,
         init_jitter: float = 0.02,
+        install_cameras: bool = True,
+        cameras: dict[str, dict[str, Any]] | None = None,
     ):
         """Construct from a pre-parsed :class:`BDDLProblem`.
 
@@ -102,6 +136,16 @@ class LiberoAdapter(BenchmarkProtocol):
             init_jitter: Per-episode ±jitter (metres) applied to xy of every
                 object referenced by ``(:init (on A B))`` clauses. Set to 0
                 to disable jitter.
+            install_cameras: When ``True`` (default), install the cameras
+                in :attr:`LIBERO_CAMERAS` (or ``cameras`` override) on
+                episode start. Set to ``False`` if your scene MJCF already
+                declares the cameras the policy needs - the adapter will
+                skip the install step entirely.
+            cameras: Override / extend :attr:`LIBERO_CAMERAS`. Keyed by
+                camera name, each value is forwarded as ``**kwargs`` to
+                :meth:`Simulation.add_camera`. Passing an empty dict
+                disables camera installation regardless of
+                ``install_cameras``.
 
         Raises:
             ValueError: If ``problem.goal`` is ``None``.
@@ -115,6 +159,14 @@ class LiberoAdapter(BenchmarkProtocol):
             raise ValueError(f"init_jitter must be >= 0, got {init_jitter}")
         if max_steps is not None:
             self.max_steps = int(max_steps)
+        self._install_cameras = bool(install_cameras)
+        # Snapshot the camera config at construction time so subsequent
+        # mutations to LIBERO_CAMERAS don't leak across instances.
+        self._cameras: dict[str, dict[str, Any]] = (
+            {k: dict(v) for k, v in cameras.items()}
+            if cameras is not None
+            else {k: dict(v) for k, v in self.LIBERO_CAMERAS.items()}
+        )
         self._success_fn: Callable[[SimEngine], bool] = compile_goal(problem.goal)
 
     # Construction helpers
@@ -127,6 +179,8 @@ class LiberoAdapter(BenchmarkProtocol):
         scene_path: str | None = None,
         max_steps: int | None = None,
         init_jitter: float = 0.02,
+        install_cameras: bool = True,
+        cameras: dict[str, dict[str, Any]] | None = None,
     ) -> LiberoAdapter:
         """Parse a ``.bddl`` file from disk and build an adapter.
 
@@ -140,6 +194,8 @@ class LiberoAdapter(BenchmarkProtocol):
             scene_path=scene_path,
             max_steps=max_steps,
             init_jitter=init_jitter,
+            install_cameras=install_cameras,
+            cameras=cameras,
         )
 
     @classmethod
@@ -150,6 +206,8 @@ class LiberoAdapter(BenchmarkProtocol):
         scene_path: str | None = None,
         max_steps: int | None = None,
         init_jitter: float = 0.02,
+        install_cameras: bool = True,
+        cameras: dict[str, dict[str, Any]] | None = None,
     ) -> LiberoAdapter:
         """Parse a BDDL string directly - useful in tests."""
         problem = parse_bddl(bddl_text)
@@ -158,6 +216,8 @@ class LiberoAdapter(BenchmarkProtocol):
             scene_path=scene_path,
             max_steps=max_steps,
             init_jitter=init_jitter,
+            install_cameras=install_cameras,
+            cameras=cameras,
         )
 
     # BenchmarkProtocol interface
@@ -176,11 +236,21 @@ class LiberoAdapter(BenchmarkProtocol):
         return self.problem.language or ""
 
     def on_episode_start(self, sim: SimEngine, rng: random.Random) -> None:
-        """Load the declared scene (if any), validate Panda, then apply init jitter.
+        """Load the declared scene (if any), validate Panda, install cameras, then jitter.
 
-        Order matters: load_scene MUST happen before ``super().on_episode_start``
-        so the base compatibility check sees the scene's Panda robot rather
-        than reporting "sim is empty → load default_robot".
+        Order matters:
+
+        1. ``load_scene`` (if ``scene_path`` set) - so the base
+           compatibility check sees the scene's Panda rather than reporting
+           "sim is empty → load default_robot".
+        2. ``super().on_episode_start`` - base compat check + auto-load
+           ``default_robot`` if the sim is empty.
+        3. ``_install_libero_cameras`` - inject the cameras the
+           ``libero_panda`` ``Gr00tDataConfig`` expects (``image`` /
+           ``wrist_image``). MUST happen after the robot is loaded so the
+           cameras render against a populated scene.
+        4. ``_apply_init_jitter`` - per-episode RNG-seeded ±jitter to
+           init-subject bodies.
         """
         if self.scene_path:
             load_scene = getattr(sim, "load_scene", None)
@@ -195,6 +265,8 @@ class LiberoAdapter(BenchmarkProtocol):
                     msg = (result.get("content") or [{}])[0].get("text", "")
                     raise RuntimeError(f"LiberoAdapter: load_scene({self.scene_path!r}) failed: {msg}")
         super().on_episode_start(sim, rng)
+        if self._install_cameras:
+            self._install_libero_cameras(sim)
         if self._init_jitter > 0:
             self._apply_init_jitter(sim, rng)
 
@@ -212,6 +284,52 @@ class LiberoAdapter(BenchmarkProtocol):
         return bool(self._success_fn(sim))
 
     # Internals
+
+    def _install_libero_cameras(self, sim: SimEngine) -> None:
+        """Inject the cameras the ``libero_panda`` data_config expects.
+
+        Best-effort: the LIBERO ``Gr00tDataConfig`` declares
+        ``video_keys = ["video.image", "video.wrist_image"]`` and the policy's
+        ``_build_service_observation`` reads those from the robot observation
+        as ``obs["image"]`` / ``obs["wrist_image"]``. Without these cameras
+        in the sim, every direct-client call to a LIBERO server fails with
+        ``Video key 'video.image' must be in observation`` (#148, Failure 1).
+
+        Cameras already present in the sim (declared by a loaded scene MJCF
+        that beats us to the name) are skipped silently. Other failures are
+        logged at WARNING but never fatal - one missing camera shouldn't
+        kill the whole eval.
+        """
+        add_camera = getattr(sim, "add_camera", None)
+        if add_camera is None:
+            logger.debug("LiberoAdapter: sim has no add_camera(); skipping camera install")
+            return
+
+        # Cheap check for already-installed cameras: most backends expose a
+        # ``_world.cameras`` dict. If we can't see it, just try add_camera
+        # and let it return its own "already exists" error.
+        existing: set[str] = set()
+        world = getattr(sim, "_world", None)
+        cameras_attr = getattr(world, "cameras", None) if world is not None else None
+        if isinstance(cameras_attr, dict):
+            existing = set(cameras_attr.keys())
+
+        for cam_name, cam_kwargs in self._cameras.items():
+            if cam_name in existing:
+                logger.debug("LiberoAdapter: camera %r already in sim; skipping install", cam_name)
+                continue
+            try:
+                result = add_camera(name=cam_name, **cam_kwargs)
+            except Exception as e:  # noqa: BLE001 - one bad camera shouldn't kill the eval
+                logger.warning("LiberoAdapter: add_camera(%r) raised: %s", cam_name, e)
+                continue
+            if isinstance(result, dict) and result.get("status") == "error":
+                msg = (result.get("content") or [{}])[0].get("text", "")
+                # "already exists" is benign - the scene XML beat us to it.
+                if "already exists" in msg.lower():
+                    logger.debug("LiberoAdapter: camera %r already declared by scene", cam_name)
+                else:
+                    logger.warning("LiberoAdapter: add_camera(%r) failed: %s", cam_name, msg)
 
     def _apply_init_jitter(self, sim: SimEngine, rng: random.Random) -> None:
         """Apply ±jitter to xy of every body referenced by ``(:init (on A B))``.
