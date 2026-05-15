@@ -34,6 +34,8 @@ def gr00t_inference(
     dit_dtype: str = "fp8",
     http_server: bool = False,
     api_token: str | None = None,
+    protocol: str = "n1.5",
+    use_sim_policy_wrapper: bool = False,
 ) -> dict[str, Any]:
     """Manage GR00T N1 inference services in Docker containers.
 
@@ -104,15 +106,34 @@ def gr00t_inference(
         The ``api_token`` parameter authenticates with the inference service. If omitted,
         falls back to the ``GROOT_API_TOKEN`` environment variable.
 
+    Server protocol versions:
+        Isaac-GR00T's inference-service entrypoint and flag set changed between
+        N1.6 and N1.7. The ``protocol`` parameter selects which command to
+        ``docker exec``:
+
+        - ``"n1.5"`` (default) and ``"n1.6"``: ``python /opt/Isaac-GR00T/scripts/inference_service.py``
+          with ``--data-config`` + ``--denoising-steps`` flags. Matches the
+          script that ships with images built before the N1.7 release.
+        - ``"n1.7"``: ``python -m gr00t.eval.run_gr00t_server``. Drops
+          ``--data-config`` and ``--denoising-steps`` (the server reads them
+          from the model's metadata.json instead). Adds optional
+          ``--use-sim-policy-wrapper`` for sim eval (LIBERO, RoboCasa, …)
+          - pass ``use_sim_policy_wrapper=True`` to enable.
+
+        The default stays ``"n1.5"`` for back-compat. N1.7 users must opt in
+        explicitly: ``gr00t_inference(action="start", ..., protocol="n1.7")``.
+
     Args:
         action: Action to perform (see Actions above).
         checkpoint_path: Path to model checkpoint directory (required for ``start``/``restart``).
         policy_name: Optional name for the policy service (for registration/tracking).
         port: Port for the inference service. Defaults to 5555 (ZMQ) or auto-switches
             to 8000 when ``http_server=True``.
-        data_config: Embodiment data config name (see Data configs above).
-        embodiment_tag: Embodiment tag for the model (e.g., ``gr1``, ``so100``).
+        data_config: Embodiment data config name (see Data configs above). N1.5/N1.6 only.
+        embodiment_tag: Embodiment tag for the model (e.g., ``gr1``, ``so100``,
+            ``libero_sim``).
         denoising_steps: Number of denoising steps for action generation (default: 4).
+            N1.5/N1.6 only - the N1.7 server reads this from the checkpoint.
         host: Host address to bind the service to (default: ``0.0.0.0``).
         container_name: Specific Docker container name. Auto-detected if omitted.
         timeout: Seconds to wait for service startup (default: 60).
@@ -123,6 +144,14 @@ def gr00t_inference(
         dit_dtype: DiT precision with TensorRT - ``fp16`` or ``fp8`` (default: ``fp8``).
         http_server: Use HTTP REST API instead of ZMQ (default: False).
         api_token: API token for authentication. Falls back to ``GROOT_API_TOKEN`` env var.
+        protocol: Server protocol version - ``"n1.5"`` (default), ``"n1.6"``, or ``"n1.7"``.
+            Determines which inference-service entrypoint and flag set is exec'd in
+            the container. See "Server protocol versions" above.
+        use_sim_policy_wrapper: When ``protocol="n1.7"``, append
+            ``--use-sim-policy-wrapper`` to the server command. Required for sim
+            evaluation (LIBERO, RoboCasa, …) - the wrapper translates
+            simulator-side observations into the format the policy expects.
+            Ignored for N1.5 / N1.6 (no equivalent flag).
 
     Returns:
         Dict with operation results. Common fields:
@@ -181,6 +210,15 @@ def gr00t_inference(
     if api_token is None:
         api_token = os.environ.get("GROOT_API_TOKEN")
 
+    # Validate protocol up-front so users get a friendly error rather than
+    # an opaque docker-exec failure inside _start_service.
+    valid_protocols = ("n1.5", "n1.6", "n1.7")
+    if protocol not in valid_protocols:
+        return {
+            "status": "error",
+            "message": f"Unknown protocol {protocol!r}. Valid: {list(valid_protocols)}",
+        }
+
     if action == "find_containers":
         return _find_gr00t_containers()
     elif action == "list":
@@ -212,6 +250,8 @@ def gr00t_inference(
             dit_dtype=dit_dtype,
             http_server=http_server,
             api_token=api_token,
+            protocol=protocol,
+            use_sim_policy_wrapper=use_sim_policy_wrapper,
         )
     elif action == "restart":
         if checkpoint_path is None:
@@ -236,6 +276,8 @@ def gr00t_inference(
             dit_dtype=dit_dtype,
             http_server=http_server,
             api_token=api_token,
+            protocol=protocol,
+            use_sim_policy_wrapper=use_sim_policy_wrapper,
         )
     else:
         return {"status": "error", "message": f"Unknown action: {action}"}
@@ -390,39 +432,64 @@ def _stop_service(port: int) -> dict[str, Any]:
         return {"status": "error", "message": f"Failed to stop service: {e}"}
 
 
-def _start_service(
+def _build_inference_command(
+    *,
+    container_name: str,
     checkpoint_path: str,
     port: int,
+    host: str,
     data_config: str,
     embodiment_tag: str,
     denoising_steps: int,
-    host: str,
-    container_name: str | None,
-    policy_name: str | None,
-    timeout: int,
+    http_server: bool,
     use_tensorrt: bool,
     trt_engine_path: str,
     vit_dtype: str,
     llm_dtype: str,
     dit_dtype: str,
-    http_server: bool,
     api_token: str | None,
-) -> dict[str, Any]:
-    """Start GR00T inference service using Isaac-GR00T's native inference service."""
-    try:
-        # Find container if not specified
-        if container_name is None:
-            containers = _find_gr00t_containers()
-            if containers["status"] == "error":
-                return containers
+    protocol: str,
+    use_sim_policy_wrapper: bool,
+) -> list[str]:
+    """Build the ``docker exec`` argv for the inference service.
 
-            running_containers = [c for c in containers["containers"] if "Up" in c["status"]]
-            if not running_containers:
-                return {"status": "error", "message": "No running GR00T containers found"}
+    Two entrypoint scripts ship with Isaac-GR00T:
 
-            container_name = running_containers[0]["name"]
+    * ``/opt/Isaac-GR00T/scripts/inference_service.py`` (N1.5, N1.6) -
+      standalone server with embodiment data-config + denoising-steps
+      flags.
+    * ``python -m gr00t.eval.run_gr00t_server`` (N1.7) - rewritten
+      entrypoint that reads data-config + denoising-steps from the
+      checkpoint metadata and adds an optional ``--use-sim-policy-wrapper``
+      flag for sim eval (LIBERO, RoboCasa, …).
 
-        # Build Isaac-GR00T inference service command
+    Both share ``--server``, ``--model-path``, ``--port``, ``--host``,
+    ``--embodiment-tag``, ``--api-token``, and the TensorRT flag set.
+    The split keeps the ``protocol`` branch shallow - one ``if`` per
+    diverging flag rather than two parallel command-builder functions.
+    """
+    if protocol == "n1.7":
+        cmd = [
+            "docker",
+            "exec",
+            "-d",
+            container_name,
+            "python",
+            "-m",
+            "gr00t.eval.run_gr00t_server",
+            "--server",
+            "--model-path",
+            checkpoint_path,
+            "--port",
+            str(port),
+            "--host",
+            host,
+            "--embodiment-tag",
+            embodiment_tag,
+        ]
+        if use_sim_policy_wrapper:
+            cmd.append("--use-sim-policy-wrapper")
+    else:  # n1.5 / n1.6
         cmd = [
             "docker",
             "exec",
@@ -445,50 +512,111 @@ def _start_service(
             str(denoising_steps),
         ]
 
-        # Add HTTP server flag if requested
-        if http_server:
-            cmd.append("--http-server")
+    # Shared optional flags - apply to every protocol.
+    if http_server:
+        cmd.append("--http-server")
 
-        # Add TensorRT flags if enabled
-        if use_tensorrt:
-            cmd.extend(
-                [
-                    "--use-tensorrt",
-                    "--trt-engine-path",
-                    trt_engine_path,
-                    "--vit-dtype",
-                    vit_dtype,
-                    "--llm-dtype",
-                    llm_dtype,
-                    "--dit-dtype",
-                    dit_dtype,
-                ]
-            )
+    if use_tensorrt:
+        cmd.extend(
+            [
+                "--use-tensorrt",
+                "--trt-engine-path",
+                trt_engine_path,
+                "--vit-dtype",
+                vit_dtype,
+                "--llm-dtype",
+                llm_dtype,
+                "--dit-dtype",
+                dit_dtype,
+            ]
+        )
 
-        # Add API token if provided
-        if api_token:
-            cmd.extend(["--api-token", api_token])
+    if api_token:
+        cmd.extend(["--api-token", api_token])
+
+    return cmd
+
+
+def _start_service(
+    checkpoint_path: str,
+    port: int,
+    data_config: str,
+    embodiment_tag: str,
+    denoising_steps: int,
+    host: str,
+    container_name: str | None,
+    policy_name: str | None,
+    timeout: int,
+    use_tensorrt: bool,
+    trt_engine_path: str,
+    vit_dtype: str,
+    llm_dtype: str,
+    dit_dtype: str,
+    http_server: bool,
+    api_token: str | None,
+    protocol: str = "n1.5",
+    use_sim_policy_wrapper: bool = False,
+) -> dict[str, Any]:
+    """Start GR00T inference service using Isaac-GR00T's native inference service."""
+    try:
+        # Find container if not specified
+        if container_name is None:
+            containers = _find_gr00t_containers()
+            if containers["status"] == "error":
+                return containers
+
+            running_containers = [c for c in containers["containers"] if "Up" in c["status"]]
+            if not running_containers:
+                return {"status": "error", "message": "No running GR00T containers found"}
+
+            container_name = running_containers[0]["name"]
+
+        cmd = _build_inference_command(
+            container_name=container_name,
+            checkpoint_path=checkpoint_path,
+            port=port,
+            host=host,
+            data_config=data_config,
+            embodiment_tag=embodiment_tag,
+            denoising_steps=denoising_steps,
+            http_server=http_server,
+            use_tensorrt=use_tensorrt,
+            trt_engine_path=trt_engine_path,
+            vit_dtype=vit_dtype,
+            llm_dtype=llm_dtype,
+            dit_dtype=dit_dtype,
+            api_token=api_token,
+            protocol=protocol,
+            use_sim_policy_wrapper=use_sim_policy_wrapper,
+        )
 
         # Start service
         subprocess.run(cmd, capture_output=True, text=True, check=True)
 
         # Wait for service to start
-        protocol = "HTTP" if http_server else "ZMQ"
+        wire_protocol = "HTTP" if http_server else "ZMQ"
         start_time = time.time()
         while time.time() - start_time < timeout:
             if _is_service_running(port):
-                response = {
+                response: dict[str, Any] = {
                     "status": "success",
                     "port": port,
                     "checkpoint_path": checkpoint_path,
                     "container_name": container_name,
                     "policy_name": policy_name,
-                    "protocol": protocol,
-                    "data_config": data_config,
+                    "protocol": wire_protocol,
+                    "server_protocol": protocol,
                     "embodiment_tag": embodiment_tag,
-                    "denoising_steps": denoising_steps,
-                    "message": f"GR00T {protocol} service started on port {port}",
+                    "message": f"GR00T {wire_protocol} service started on port {port} (server: {protocol})",
                 }
+                # Server flags that only apply to the legacy entrypoint -
+                # surface them only when actually used so the response
+                # accurately reflects what was passed.
+                if protocol != "n1.7":
+                    response["data_config"] = data_config
+                    response["denoising_steps"] = denoising_steps
+                else:
+                    response["use_sim_policy_wrapper"] = use_sim_policy_wrapper
                 if use_tensorrt:
                     response["tensorrt"] = {
                         "enabled": True,
@@ -502,7 +630,7 @@ def _start_service(
                 return response
             time.sleep(1)
 
-        return {"status": "error", "message": f"{protocol} service failed to start within {timeout} seconds"}
+        return {"status": "error", "message": f"{wire_protocol} service failed to start within {timeout} seconds"}
 
     except subprocess.CalledProcessError as e:
         return {"status": "error", "message": f"Failed to start service: {e.stderr or e}"}
