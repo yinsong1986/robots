@@ -660,23 +660,68 @@ class Gr00tPolicy(Policy):
         return self._unpack_service_actions(action_chunk)
 
     def _build_service_observation(self, robot_obs: dict[str, Any], instruction: str) -> dict:
-        """Build flat-key observation for legacy service servers."""
+        """Build flat-key observation for legacy service servers.
+
+        Wire-format dimensions differ across server versions:
+
+        * **N1.5 / N1.6** (default): video tensors are ``(B, H, W, C)`` and
+          state tensors are ``(B, D)``. Single observation step per call,
+          so leading ``B=1`` is sufficient.
+        * **N1.7** (``self._groot_version == "n1.7"``): the
+          ``gr00t.eval.run_gr00t_server`` entrypoint adds an explicit time
+          axis, so video must be ``(B, T, H, W, C)`` and state must be
+          ``(B, T, D)`` with ``T=1`` for one observation step. State
+          tensors must additionally be ``np.float32`` (the server rejects
+          ``float64``).
+
+        Language values stay a ``list[str]`` of length ``B`` regardless of
+        protocol version - the server matches it against the batch axis,
+        not a time axis.
+
+        Versioning is opt-in via the ``groot_version=`` constructor kwarg
+        (or auto-detected from the *client*-side ``gr00t`` import). Service
+        mode cannot introspect the remote server's version, so users
+        targeting an N1.7 server must pass ``groot_version="n1.7"``
+        explicitly when constructing the policy.
+        """
         obs: dict = {}
+        # Track which keys are video vs. state vs. other (language) so the
+        # newaxis-fanout below stays type-safe per category.
+        video_keys: list[str] = []
+        state_keys: list[str] = []
+
         for vk in self.data_config.video_keys:
             bare = vk.removeprefix("video.")
             if bare in robot_obs:
                 obs[vk] = robot_obs[bare]
+                video_keys.append(vk)
         for sk in self.data_config.state_keys:
             bare = sk.removeprefix("state.")
             if bare in robot_obs:
-                obs[sk] = np.asarray(robot_obs[bare], dtype=np.float32)
+                arr = np.asarray(robot_obs[bare], dtype=np.float32)
+                # Scalars (joint readings, gripper pose components, …)
+                # arrive as 0-D arrays. Promote to (D=1,) so the newaxis
+                # loop below produces the canonical (B, [T,] D) shape
+                # rather than (B, [T,]) that breaks the n1.7 server.
+                if arr.ndim == 0:
+                    arr = arr[np.newaxis]
+                obs[sk] = arr
+                state_keys.append(sk)
         if self.data_config.language_keys:
             obs[self.data_config.language_keys[0]] = instruction
-        for k in obs:
-            if isinstance(obs[k], np.ndarray):
-                obs[k] = obs[k][np.newaxis, ...]
+
+        # Add the leading batch (and time, for n1.7) axes. Language and any
+        # non-ndarray values stay as B-length list[str] regardless of
+        # version - the server matches them against batch, not time.
+        n_lead = 2 if self._groot_version == "n1.7" else 1
+        for k in list(obs.keys()):
+            v = obs[k]
+            if isinstance(v, np.ndarray):
+                for _ in range(n_lead):
+                    v = v[np.newaxis, ...]
+                obs[k] = v
             else:
-                obs[k] = [obs[k]]
+                obs[k] = [v]
         return obs
 
     def _unpack_service_actions(self, action_chunk: dict) -> list[dict[str, Any]]:

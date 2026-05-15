@@ -613,6 +613,68 @@ class TestServiceObs:
         obs = Gr00tPolicy(data_config="so100")._build_service_observation({}, "t")
         assert "annotation.human.task_description" in obs
 
+    # GH #148 / Failure 2 - regressions for the N1.7 wire format.
+    #
+    # The N1.5 / N1.6 inference servers accept (B, ...) tensors. The N1.7
+    # ``run_gr00t_server`` entrypoint adds an explicit time axis and rejects
+    # float64 state, so video must be (B, T, H, W, C) and state must be
+    # (B, T, D) float32.
+
+    def test_n15_default_video_shape_is_4d(self):
+        """Pre-fix behaviour preserved when groot_version != 'n1.7' (back-compat)."""
+        p = Gr00tPolicy(data_config="so100_dualcam", host="localhost", port=19999)
+        p._groot_version = None  # mimic env where gr00t isn't installed
+        obs = p._build_service_observation({"front": np.zeros((64, 64, 3), dtype=np.uint8)}, "t")
+        # (B=1, H=64, W=64, C=3) - no T axis.
+        assert obs["video.front"].shape == (1, 64, 64, 3)
+
+    def test_n17_video_shape_is_5d_with_T(self):
+        """N1.7 servers require (B, T, H, W, C) - one extra leading axis."""
+        p = Gr00tPolicy(data_config="so100_dualcam", host="localhost", port=19999)
+        p._groot_version = "n1.7"
+        obs = p._build_service_observation({"front": np.zeros((64, 64, 3), dtype=np.uint8)}, "t")
+        # (B=1, T=1, H=64, W=64, C=3).
+        assert obs["video.front"].shape == (1, 1, 64, 64, 3)
+
+    def test_n17_state_is_float32_and_3d(self):
+        """N1.7 server rejects float64 state and requires (B, T, D) shape."""
+        p = Gr00tPolicy(data_config="so100", host="localhost", port=19999)
+        p._groot_version = "n1.7"
+        # ``state.single_arm`` is on so100; provide a Python float so the
+        # promotion-to-float32 path is exercised (not just np.float32 input).
+        obs = p._build_service_observation({"single_arm": [0.1, 0.2, 0.3]}, "t")
+        arr = obs["state.single_arm"]
+        assert arr.dtype == np.float32
+        # (B=1, T=1, D=3).
+        assert arr.shape == (1, 1, 3)
+
+    def test_n17_scalar_state_promoted_to_3d(self):
+        """A 0-D / scalar joint reading must surface as (B=1, T=1, D=1) in n1.7."""
+        p = Gr00tPolicy(data_config="so100", host="localhost", port=19999)
+        p._groot_version = "n1.7"
+        obs = p._build_service_observation({"gripper": 0.5}, "t")
+        arr = obs["state.gripper"]
+        assert arr.dtype == np.float32
+        assert arr.shape == (1, 1, 1)
+
+    def test_n17_language_remains_b_length_list_str(self):
+        """Language is matched against the batch axis - same shape as N1.5/6."""
+        p = Gr00tPolicy(data_config="so100", host="localhost", port=19999)
+        p._groot_version = "n1.7"
+        obs = p._build_service_observation({}, "pick the cube")
+        v = obs["annotation.human.task_description"]
+        assert v == ["pick the cube"]
+
+    def test_n15_state_remains_2d(self):
+        """Pre-fix shape preserved: (B, D), no T axis. Float32 dtype unchanged."""
+        p = Gr00tPolicy(data_config="so100", host="localhost", port=19999)
+        p._groot_version = "n1.6"
+        obs = p._build_service_observation({"gripper": 0.5}, "t")
+        arr = obs["state.gripper"]
+        assert arr.dtype == np.float32
+        # (B=1, D=1) - no T axis on n1.6.
+        assert arr.shape == (1, 1)
+
 
 class TestServiceUnpackWithMapping:
     """_unpack_service_actions should apply _action_mapping when available."""
