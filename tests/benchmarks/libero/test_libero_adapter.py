@@ -478,6 +478,167 @@ class TestLiberoCameraInstall:
         adapter.on_episode_start(sim, random.Random(0))
 
 
+# Camera-install model-side detection (#166)
+
+
+class TestSceneSuppliedCamerasNoOp:
+    """When a loaded scene MJCF declares the cameras the LIBERO data_config
+    needs, ``_install_libero_cameras`` MUST detect them via the compiled
+    model and skip its static-fallback install. Otherwise the install
+    fights the scene's training-distribution cameras (#166 root cause #1).
+    """
+
+    def test_model_side_camera_blocks_static_install(self):
+        """A scene whose compiled model declares ``image`` / ``wrist_image``
+        must shadow the adapter's static fallbacks - no add_camera calls."""
+
+        class _FakeMjModel:
+            ncam = 2
+
+        class _FakeMjEnum:
+            mjOBJ_CAMERA = 7
+
+        class _FakeMjModule:
+            mjtObj = _FakeMjEnum()
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                return ["image", "wrist_image"][idx]
+
+        sim = FakeSim(data_config="panda")
+        # Inject a fake compiled model into the world so the model-side
+        # enumeration finds the scene-supplied cameras.
+        sim._world._model = _FakeMjModel()  # type: ignore[attr-defined]
+
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, init_jitter=0.0, auto_generate_scene=False)
+
+        with patch.dict("sys.modules", {"mujoco": _FakeMjModule()}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # Both LIBERO cameras were detected as already-present in the
+        # model; the static install never reached add_camera.
+        assert sim._add_camera_calls == []
+
+    def test_partial_model_side_camera_still_fills_missing(self):
+        """If the scene declares ONLY ``image`` (not ``wrist_image``), the
+        adapter must still install the missing one but skip the existing."""
+
+        class _FakeMjModel:
+            ncam = 1
+
+        class _FakeMjEnum:
+            mjOBJ_CAMERA = 7
+
+        class _FakeMjModule:
+            mjtObj = _FakeMjEnum()
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                return ["image"][idx]
+
+        sim = FakeSim(data_config="panda")
+        sim._world._model = _FakeMjModel()  # type: ignore[attr-defined]
+
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, init_jitter=0.0, auto_generate_scene=False)
+
+        with patch.dict("sys.modules", {"mujoco": _FakeMjModule()}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        installed_names = {name for name, _ in sim._add_camera_calls}
+        assert installed_names == {"wrist_image"}
+
+    def test_falls_back_to_registry_check_when_mujoco_not_importable(self):
+        """Backends without mujoco installed (future engines) keep the
+        pre-#166 behaviour: only the registry is checked."""
+        sim = FakeSim(data_config="panda", preexisting_cameras=["image"])
+        # Don't inject a model - simulates a non-MuJoCo engine.
+        sim._world._model = None  # type: ignore[attr-defined]
+
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, init_jitter=0.0, auto_generate_scene=False)
+        adapter.on_episode_start(sim, random.Random(0))
+
+        # ``image`` blocked by registry; ``wrist_image`` installed.
+        installed_names = {name for name, _ in sim._add_camera_calls}
+        assert installed_names == {"wrist_image"}
+
+    def test_static_method_existing_camera_names_unions_both_sources(self):
+        """Direct exercise of ``_existing_camera_names`` - it returns the
+        union of registry-side and model-side camera names."""
+
+        class _FakeMjModel:
+            ncam = 1
+
+        class _FakeMjEnum:
+            mjOBJ_CAMERA = 7
+
+        class _FakeMjModule:
+            mjtObj = _FakeMjEnum()
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                return "agentview"
+
+        sim = FakeSim(data_config="panda", preexisting_cameras=["topdown"])
+        sim._world._model = _FakeMjModel()  # type: ignore[attr-defined]
+
+        with patch.dict("sys.modules", {"mujoco": _FakeMjModule()}):
+            names = LiberoAdapter._existing_camera_names(sim)
+
+        assert names == {"topdown", "agentview"}
+
+
+# init_jitter default (#166)
+
+
+class TestInitJitterDefault:
+    """``init_jitter`` defaults to 0.0 to match LIBERO's deterministic-reset
+    convention (#166 root cause #3). The GR00T-LIBERO checkpoint trains
+    against fixed init states per (task, seed); 2cm of randomization on
+    every reset puts the policy slightly out-of-distribution from t=0.
+    """
+
+    def test_default_is_zero(self):
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        assert adapter._init_jitter == 0.0
+
+    def test_default_is_zero_via_from_file(self, tmp_path):
+        p = tmp_path / "task.bddl"
+        p.write_text(PICK_CUBE_BDDL)
+        adapter = LiberoAdapter.from_file(p)
+        assert adapter._init_jitter == 0.0
+
+    def test_default_is_zero_via_direct_constructor(self):
+        from strands_robots.benchmarks.libero.bddl_parser import parse_bddl
+
+        problem = parse_bddl(PICK_CUBE_BDDL)
+        adapter = LiberoAdapter(problem)
+        assert adapter._init_jitter == 0.0
+
+    def test_explicit_value_still_works(self):
+        """Setting ``init_jitter=0.02`` still works for users who want
+        per-episode randomization (e.g. evaluating *generalization*)."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, init_jitter=0.02)
+        assert adapter._init_jitter == 0.02
+
+    def test_default_skips_apply_init_jitter(self):
+        """With the new default, no move_object call should fire on reset."""
+        adapter = LiberoAdapter.from_text(
+            """
+            (define (problem p)
+              (:init (on cube_1 table_1))
+              (:goal (on cube_1 plate_1)))
+            """,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(
+            bodies={"cube_1": {"position": [0, 0, 0.1]}, "table_1": {"position": [0, 0, 0]}},
+            data_config="panda",
+        )
+        adapter.on_episode_start(sim, random.Random(42))
+        assert sim._move_calls == []
+
+
 # Step semantics
 
 

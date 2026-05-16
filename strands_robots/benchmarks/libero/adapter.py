@@ -125,7 +125,7 @@ class LiberoAdapter(BenchmarkProtocol):
         *,
         scene_path: str | None = None,
         max_steps: int | None = None,
-        init_jitter: float = 0.02,
+        init_jitter: float = 0.0,
         install_cameras: bool = True,
         cameras: dict[str, dict[str, Any]] | None = None,
         eef_body_name: str = "hand",
@@ -146,8 +146,15 @@ class LiberoAdapter(BenchmarkProtocol):
                 if enabled (see below).
             max_steps: Override the class-level 300.
             init_jitter: Per-episode ±jitter (metres) applied to xy of every
-                object referenced by ``(:init (on A B))`` clauses. Set to 0
-                to disable jitter.
+                object referenced by ``(:init (on A B))`` clauses. Default
+                ``0.0`` matches LIBERO's deterministic-reset convention -
+                the upstream training data is generated with fixed init
+                states per ``(task, seed)`` and the GR00T-LIBERO checkpoint
+                expects to see those exact poses (#166). Pass a positive
+                value (e.g. ``0.02``) to layer per-episode randomization
+                on top - useful for evaluating *generalization*, but
+                expect lower nominal success rates because the policy is
+                operating slightly out-of-distribution.
             install_cameras: When ``True`` (default), install the cameras
                 in :attr:`LIBERO_CAMERAS` (or ``cameras`` override) on
                 episode start. Set to ``False`` if your scene MJCF already
@@ -262,7 +269,7 @@ class LiberoAdapter(BenchmarkProtocol):
         *,
         scene_path: str | None = None,
         max_steps: int | None = None,
-        init_jitter: float = 0.02,
+        init_jitter: float = 0.0,
         install_cameras: bool = True,
         cameras: dict[str, dict[str, Any]] | None = None,
         eef_body_name: str = "hand",
@@ -302,7 +309,7 @@ class LiberoAdapter(BenchmarkProtocol):
         *,
         scene_path: str | None = None,
         max_steps: int | None = None,
-        init_jitter: float = 0.02,
+        init_jitter: float = 0.0,
         install_cameras: bool = True,
         cameras: dict[str, dict[str, Any]] | None = None,
         eef_body_name: str = "hand",
@@ -645,24 +652,34 @@ class LiberoAdapter(BenchmarkProtocol):
         in the sim, every direct-client call to a LIBERO server fails with
         ``Video key 'video.image' must be in observation`` (#148, Failure 1).
 
-        Cameras already present in the sim (declared by a loaded scene MJCF
-        that beats us to the name) are skipped silently. Other failures are
-        logged at WARNING but never fatal - one missing camera shouldn't
-        kill the whole eval.
+        Cameras already present in the sim are skipped silently. "Already
+        present" means *either*:
+
+        * the runtime camera registry on ``sim._world.cameras`` (added via
+          a previous ``sim.add_camera`` call, including by this adapter on
+          a prior episode), OR
+        * the *compiled MuJoCo model* (declared via ``<camera>`` elements
+          in a scene MJCF that ``sim.load_scene`` just loaded — #166).
+
+        The model-side check matters because :meth:`Simulation.load_scene`
+        creates a fresh ``SimWorld`` whose ``cameras`` registry starts
+        empty even when the loaded MJCF declares cameras. Without the
+        model-side check the install would re-add the same cameras on top
+        of the scene's ones, either silently failing on the MJCF
+        duplicate-name compile error (best case) or — if recompile order
+        let it land — overriding the scene's training-distribution poses
+        with our generic-fallback poses, which #166 traces as a likely
+        cause of the LIBERO checkpoint reporting ``success_rate=0.00``.
+
+        Other ``add_camera`` failures are logged at WARNING but never
+        fatal - one missing camera shouldn't kill the whole eval.
         """
         add_camera = getattr(sim, "add_camera", None)
         if add_camera is None:
             logger.debug("LiberoAdapter: sim has no add_camera(); skipping camera install")
             return
 
-        # Cheap check for already-installed cameras: most backends expose a
-        # ``_world.cameras`` dict. If we can't see it, just try add_camera
-        # and let it return its own "already exists" error.
-        existing: set[str] = set()
-        world = getattr(sim, "_world", None)
-        cameras_attr = getattr(world, "cameras", None) if world is not None else None
-        if isinstance(cameras_attr, dict):
-            existing = set(cameras_attr.keys())
+        existing = self._existing_camera_names(sim)
 
         for cam_name, cam_kwargs in self._cameras.items():
             if cam_name in existing:
@@ -680,6 +697,44 @@ class LiberoAdapter(BenchmarkProtocol):
                     logger.debug("LiberoAdapter: camera %r already declared by scene", cam_name)
                 else:
                     logger.warning("LiberoAdapter: add_camera(%r) failed: %s", cam_name, msg)
+
+    @staticmethod
+    def _existing_camera_names(sim: SimEngine) -> set[str]:
+        """Union of registry-side and model-side camera names known to ``sim``.
+
+        Backends without a MuJoCo-compiled model fall back to the registry
+        check only - non-MuJoCo engines are still safe (they just lose the
+        model-side detection, which is the pre-#166 behaviour).
+        """
+        names: set[str] = set()
+        world = getattr(sim, "_world", None)
+
+        # Registry-side: cameras added via sim.add_camera() previously.
+        cameras_attr = getattr(world, "cameras", None) if world is not None else None
+        if isinstance(cameras_attr, dict):
+            names.update(cameras_attr.keys())
+
+        # Model-side: cameras declared in a loaded scene MJCF. Only relevant
+        # for MuJoCo backends - reach into world._model and enumerate via
+        # mujoco's name-by-id lookup. We import mujoco lazily to keep the
+        # adapter usable on backends that don't ship it.
+        model = getattr(world, "_model", None) if world is not None else None
+        if model is None:
+            return names
+        try:
+            import mujoco as _mj
+        except ImportError:
+            logger.debug("LiberoAdapter: mujoco not importable; skipping model-side camera check")
+            return names
+        try:
+            ncam = int(getattr(model, "ncam", 0))
+            for i in range(ncam):
+                name = _mj.mj_id2name(model, _mj.mjtObj.mjOBJ_CAMERA, i)
+                if name:
+                    names.add(name)
+        except Exception as e:  # noqa: BLE001 - never fatal during camera-existence check
+            logger.debug("LiberoAdapter: model-side camera enumeration failed: %s", e)
+        return names
 
     def _apply_init_jitter(self, sim: SimEngine, rng: random.Random) -> None:
         """Apply ±jitter to xy of every body referenced by ``(:init (on A B))``.
