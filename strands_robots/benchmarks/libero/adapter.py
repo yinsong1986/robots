@@ -389,7 +389,16 @@ class LiberoAdapter(BenchmarkProtocol):
 
         # Gripper - read from the (already collected) joint observation.
         # The Menagerie Panda's two-finger constraint mirrors finger_joint1
-        # to finger_joint2, so reading just the first one is sufficient.
+        # to finger_joint2, so reading just the first one is sufficient
+        # *as a value* — but the checkpoint was trained on
+        # ``robot0_gripper_qpos`` from LIBERO/RoboSuite which is a
+        # 2-element array (one qpos per finger), and the server
+        # boolean-masks the state vector by the per-key feature dimension.
+        # Packing ``gripper`` as a scalar fails with
+        # ``boolean index did not match indexed array along dimension 1;
+        # dimension is 1 but corresponding boolean dimension is 2``. So
+        # mirror the value into a 2-element list to match the trained
+        # shape.
         gripper_value = obs.get(self._gripper_joint_name)
         if gripper_value is None:
             # Some backends namespace joint keys; try the suffix match.
@@ -398,7 +407,7 @@ class LiberoAdapter(BenchmarkProtocol):
                     gripper_value = val
                     break
         if isinstance(gripper_value, (int, float)) and not isinstance(gripper_value, bool):
-            merged.setdefault("gripper", float(gripper_value))
+            merged.setdefault("gripper", [float(gripper_value), float(gripper_value)])
         else:
             logger.debug(
                 "LiberoAdapter: gripper joint %r not found in obs; omitting state.gripper",

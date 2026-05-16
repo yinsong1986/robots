@@ -517,8 +517,13 @@ class TestAugmentObservation:
         assert out["roll"] == pytest.approx(0.0, abs=1e-9)
         assert out["pitch"] == pytest.approx(0.0, abs=1e-9)
         assert out["yaw"] == pytest.approx(0.0, abs=1e-9)
-        # Gripper from the finger_joint1 reading.
-        assert out["gripper"] == pytest.approx(0.04)
+        # Gripper from the finger_joint1 reading. Packed as a 2-element
+        # list to match `robot0_gripper_qpos` (the LIBERO/RoboSuite
+        # 2-finger array the GR00T-N1.7-LIBERO checkpoint was trained
+        # on); both entries mirror the same finger_joint1 reading
+        # because the Menagerie Panda's MJCF equality constraint
+        # forces finger_joint1 == finger_joint2.
+        assert out["gripper"] == pytest.approx([0.04, 0.04])
         # Original keys preserved.
         assert out["finger_joint1"] == 0.04
         assert out["joint1"] == 0.0
@@ -582,8 +587,10 @@ class TestAugmentObservation:
         assert "x" not in out
         assert "y" not in out
         assert "roll" not in out
-        # Gripper still injected because finger_joint1 is in obs.
-        assert out["gripper"] == pytest.approx(0.04)
+        # Gripper still injected because finger_joint1 is in obs;
+        # mirrored into the 2-element shape the trained checkpoint
+        # expects (see test_pose_and_gripper_inject_into_obs above).
+        assert out["gripper"] == pytest.approx([0.04, 0.04])
 
     def test_missing_gripper_omits_gripper_key(self):
         adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
@@ -631,7 +638,7 @@ class TestAugmentObservation:
         sim = FakeSim(bodies={"hand": {"position": [0, 0, 0], "quaternion": [1, 0, 0, 0]}})
         out = adapter.augment_observation(sim, {"my_grip": 0.025, "finger_joint1": 9.9})
         # Reads from my_grip, not finger_joint1.
-        assert out["gripper"] == pytest.approx(0.025)
+        assert out["gripper"] == pytest.approx([0.025, 0.025])
 
     def test_namespaced_gripper_joint_resolves(self):
         """Multi-robot scenes namespace joints as ``<robot>/<joint>``. The
@@ -642,7 +649,7 @@ class TestAugmentObservation:
         # Namespaced key as it would appear in a multi-robot sim.
         obs = {"panda_arm/finger_joint1": 0.04}
         out = adapter.augment_observation(sim, obs)
-        assert out["gripper"] == pytest.approx(0.04)
+        assert out["gripper"] == pytest.approx([0.04, 0.04])
 
     def test_sim_without_get_body_state(self):
         """Backends that don't expose get_body_state (future engines)
@@ -657,7 +664,7 @@ class TestAugmentObservation:
         out = adapter.augment_observation(sim, {"finger_joint1": 0.04})  # type: ignore[arg-type]
         assert "x" not in out
         # Gripper still injected from the obs lookup.
-        assert out["gripper"] == pytest.approx(0.04)
+        assert out["gripper"] == pytest.approx([0.04, 0.04])
 
 
 class TestQuaternionToEuler:
