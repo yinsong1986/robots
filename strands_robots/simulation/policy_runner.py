@@ -708,6 +708,21 @@ class PolicyRunner:
 
             for _ in range(max_steps):
                 observation = self.sim.get_observation(robot_name=robot_name, skip_images=_skip_images)
+                # Hook: benchmarks may bridge the sim's observation schema
+                # (typically joint-space) to whatever the policy was trained
+                # on (e.g. LIBERO's Cartesian state.x/y/z/roll/pitch/yaw/gripper).
+                # Default impl on BenchmarkProtocol is identity. Failures
+                # surface as structured errors rather than silent fall-through
+                # since "policy got the wrong obs schema" is a common bug
+                # source.
+                try:
+                    observation = spec.augment_observation(self.sim, observation)
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("augment_observation failed in %s", spec_name)
+                    return {
+                        "status": "error",
+                        "content": [{"text": f"augment_observation failed in {spec_name}: {e}"}],
+                    }
                 coro_or_result = policy.get_actions(observation, instruction)
                 actions = _resolve_coroutine(coro_or_result)
 
