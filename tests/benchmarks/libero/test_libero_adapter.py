@@ -486,6 +486,229 @@ class TestOnStep:
         assert info.done is False
 
 
+# augment_observation - LIBERO state bridge (#156)
+
+
+class TestAugmentObservation:
+    """``LiberoAdapter.augment_observation`` injects ``x`` / ``y`` / ``z`` /
+    ``roll`` / ``pitch`` / ``yaw`` / ``gripper`` so the ``libero_panda``
+    Gr00tDataConfig finds them in the per-step observation."""
+
+    def test_default_panda_layout(self):
+        """Identity quaternion ⇒ all Euler angles are zero."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        sim = FakeSim(
+            bodies={
+                "hand": {
+                    "position": [0.5, -0.1, 0.3],
+                    "quaternion": [1.0, 0.0, 0.0, 0.0],  # identity
+                },
+            }
+        )
+        # Provide finger_joint1 in the input obs (the runner gets it from
+        # sim.get_observation; here we simulate that contract directly).
+        obs = {"finger_joint1": 0.04, "joint1": 0.0}
+        out = adapter.augment_observation(sim, obs)
+        # Cartesian
+        assert out["x"] == pytest.approx(0.5)
+        assert out["y"] == pytest.approx(-0.1)
+        assert out["z"] == pytest.approx(0.3)
+        # Euler - identity quat → all zeros.
+        assert out["roll"] == pytest.approx(0.0, abs=1e-9)
+        assert out["pitch"] == pytest.approx(0.0, abs=1e-9)
+        assert out["yaw"] == pytest.approx(0.0, abs=1e-9)
+        # Gripper from the finger_joint1 reading.
+        assert out["gripper"] == pytest.approx(0.04)
+        # Original keys preserved.
+        assert out["finger_joint1"] == 0.04
+        assert out["joint1"] == 0.0
+
+    def test_quaternion_to_euler_z_rotation(self):
+        """90° rotation about Z ⇒ yaw = π/2, roll = pitch = 0."""
+        import math
+
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        # MuJoCo quat (w,x,y,z) for 90° about Z: (cos(45°), 0, 0, sin(45°))
+        quat = [math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4)]
+        sim = FakeSim(bodies={"hand": {"position": [0, 0, 0], "quaternion": quat}})
+        out = adapter.augment_observation(sim, {})
+        assert out["roll"] == pytest.approx(0.0, abs=1e-9)
+        assert out["pitch"] == pytest.approx(0.0, abs=1e-9)
+        assert out["yaw"] == pytest.approx(math.pi / 2, abs=1e-9)
+
+    def test_quaternion_to_euler_x_rotation(self):
+        """90° rotation about X ⇒ roll = π/2, pitch = yaw = 0."""
+        import math
+
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        quat = [math.cos(math.pi / 4), math.sin(math.pi / 4), 0.0, 0.0]
+        sim = FakeSim(bodies={"hand": {"position": [0, 0, 0], "quaternion": quat}})
+        out = adapter.augment_observation(sim, {})
+        assert out["roll"] == pytest.approx(math.pi / 2, abs=1e-9)
+        assert out["pitch"] == pytest.approx(0.0, abs=1e-9)
+        assert out["yaw"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_quaternion_gimbal_lock_does_not_crash(self):
+        """90° rotation about Y is gimbal-locked; the resolution may
+        push roll into yaw, but pitch must equal π/2 and the call MUST
+        return without raising."""
+        import math
+
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        quat = [math.cos(math.pi / 4), 0.0, math.sin(math.pi / 4), 0.0]
+        sim = FakeSim(bodies={"hand": {"position": [0, 0, 0], "quaternion": quat}})
+        out = adapter.augment_observation(sim, {})
+        assert out["pitch"] == pytest.approx(math.pi / 2, abs=1e-6)
+
+    def test_eef_state_keys_match_libero_panda_data_config(self):
+        """Regression: keys MUST exactly equal the bare names of the
+        ``libero_panda`` data_config's state_keys, otherwise the policy
+        won't find them."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        sim = FakeSim(bodies={"hand": {"position": [0, 0, 0], "quaternion": [1, 0, 0, 0]}})
+        out = adapter.augment_observation(sim, {"finger_joint1": 0.0})
+        # libero_panda state_keys.removeprefix("state.") = bare names below.
+        for required in ("x", "y", "z", "roll", "pitch", "yaw", "gripper"):
+            assert required in out, f"missing {required!r} in augmented obs"
+
+    def test_missing_body_drops_pose_keys_silently(self):
+        """If the EEF body isn't in the sim, the adapter must NOT raise -
+        the missing keys are simply omitted so the policy surfaces a
+        clearer 'state.x must be in observation' error than a Python
+        traceback."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        sim = FakeSim(bodies={})  # no "hand" body
+        out = adapter.augment_observation(sim, {"finger_joint1": 0.04})
+        assert "x" not in out
+        assert "y" not in out
+        assert "roll" not in out
+        # Gripper still injected because finger_joint1 is in obs.
+        assert out["gripper"] == pytest.approx(0.04)
+
+    def test_missing_gripper_omits_gripper_key(self):
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        sim = FakeSim(bodies={"hand": {"position": [0, 0, 0], "quaternion": [1, 0, 0, 0]}})
+        out = adapter.augment_observation(sim, {})  # no finger_joint1
+        assert "gripper" not in out
+
+    def test_inject_eef_state_false_disables_hook(self):
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, inject_eef_state=False)
+        sim = FakeSim(bodies={"hand": {"position": [1, 2, 3], "quaternion": [1, 0, 0, 0]}})
+        obs = {"finger_joint1": 0.04, "joint1": 0.0}
+        out = adapter.augment_observation(sim, obs)
+        # Returned obs is unchanged - no x/y/z/roll/pitch/yaw/gripper.
+        for key in ("x", "y", "z", "roll", "pitch", "yaw", "gripper"):
+            assert key not in out
+        assert out["finger_joint1"] == 0.04
+
+    def test_does_not_overwrite_keys_already_in_obs(self):
+        """If a backend already supplies x/y/..., the adapter must NOT
+        clobber them - users may have configured an observation_mapping."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        sim = FakeSim(bodies={"hand": {"position": [9.9, 9.9, 9.9], "quaternion": [1, 0, 0, 0]}})
+        obs = {"x": 0.0, "finger_joint1": 0.04}
+        out = adapter.augment_observation(sim, obs)
+        # User's x wins over the FK lookup.
+        assert out["x"] == 0.0
+        # But fields the user didn't supply still get filled in.
+        assert out["y"] == pytest.approx(9.9)
+
+    def test_custom_eef_body_name(self):
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, eef_body_name="custom_eef")
+        sim = FakeSim(
+            bodies={
+                "hand": {"position": [9, 9, 9], "quaternion": [1, 0, 0, 0]},
+                "custom_eef": {"position": [0.5, 0.5, 0.5], "quaternion": [1, 0, 0, 0]},
+            }
+        )
+        out = adapter.augment_observation(sim, {})
+        assert out["x"] == pytest.approx(0.5)
+        # Default "hand" body NOT used.
+        assert out["x"] != 9
+
+    def test_custom_gripper_joint_name(self):
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, gripper_joint_name="my_grip")
+        sim = FakeSim(bodies={"hand": {"position": [0, 0, 0], "quaternion": [1, 0, 0, 0]}})
+        out = adapter.augment_observation(sim, {"my_grip": 0.025, "finger_joint1": 9.9})
+        # Reads from my_grip, not finger_joint1.
+        assert out["gripper"] == pytest.approx(0.025)
+
+    def test_namespaced_gripper_joint_resolves(self):
+        """Multi-robot scenes namespace joints as ``<robot>/<joint>``. The
+        adapter must accept a suffix match so users don't have to set
+        ``gripper_joint_name='panda_arm/finger_joint1'`` manually."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        sim = FakeSim(bodies={"hand": {"position": [0, 0, 0], "quaternion": [1, 0, 0, 0]}})
+        # Namespaced key as it would appear in a multi-robot sim.
+        obs = {"panda_arm/finger_joint1": 0.04}
+        out = adapter.augment_observation(sim, obs)
+        assert out["gripper"] == pytest.approx(0.04)
+
+    def test_sim_without_get_body_state(self):
+        """Backends that don't expose get_body_state (future engines)
+        must skip pose injection silently rather than crash."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+
+        class BareSim:
+            pass
+
+        sim = BareSim()
+        # Must not raise.
+        out = adapter.augment_observation(sim, {"finger_joint1": 0.04})  # type: ignore[arg-type]
+        assert "x" not in out
+        # Gripper still injected from the obs lookup.
+        assert out["gripper"] == pytest.approx(0.04)
+
+
+class TestQuaternionToEuler:
+    """Pure-math regression tests for ``_quat_wxyz_to_rpy_xyz`` so future
+    refactors to the helper don't silently rotate the LIBERO state by π."""
+
+    def test_identity(self):
+        from strands_robots.benchmarks.libero.adapter import _quat_wxyz_to_rpy_xyz
+
+        roll, pitch, yaw = _quat_wxyz_to_rpy_xyz([1.0, 0.0, 0.0, 0.0])
+        assert abs(roll) < 1e-12
+        assert abs(pitch) < 1e-12
+        assert abs(yaw) < 1e-12
+
+    @pytest.mark.parametrize(
+        "quat,expected",
+        [
+            # 90° about X
+            ([0.7071067811865476, 0.7071067811865475, 0.0, 0.0], (1.5707963267948966, 0.0, 0.0)),
+            # 90° about Z
+            ([0.7071067811865476, 0.0, 0.0, 0.7071067811865475], (0.0, 0.0, 1.5707963267948966)),
+            # 180° about X - atan2(±0, -1) may return ±π, both are correct.
+            ([0.0, 1.0, 0.0, 0.0], (3.141592653589793, 0.0, 0.0)),
+            # 180° about Z
+            ([0.0, 0.0, 0.0, 1.0], (0.0, 0.0, 3.141592653589793)),
+        ],
+    )
+    def test_principal_axis_rotations(self, quat, expected):
+        """Compare modulo 2π so atan2's ±π ambiguity at 180° rotations
+        doesn't make the test brittle to floating-point sign-of-zero."""
+        import math
+
+        from strands_robots.benchmarks.libero.adapter import _quat_wxyz_to_rpy_xyz
+
+        out = _quat_wxyz_to_rpy_xyz(quat)
+        for actual, want in zip(out, expected, strict=True):
+            diff = ((actual - want + math.pi) % (2 * math.pi)) - math.pi
+            assert abs(diff) < 1e-9, f"got {out}, want {expected} (mod 2π)"
+
+    def test_gimbal_lock_pitch_pi_over_2(self):
+        """90° about Y is the canonical gimbal-lock case; pitch must
+        still come out as π/2 even though roll/yaw absorb each other."""
+        import math
+
+        from strands_robots.benchmarks.libero.adapter import _quat_wxyz_to_rpy_xyz
+
+        quat = [math.cos(math.pi / 4), 0.0, math.sin(math.pi / 4), 0.0]
+        _roll, pitch, _yaw = _quat_wxyz_to_rpy_xyz(quat)
+        assert pitch == pytest.approx(math.pi / 2, abs=1e-6)
+
+
 # PolicyRunner + evaluate_benchmark integration
 
 

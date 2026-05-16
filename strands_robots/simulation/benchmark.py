@@ -182,6 +182,39 @@ class BenchmarkProtocol(ABC):
         non-terminal step.
         """
 
+    def augment_observation(
+        self,
+        sim: SimEngine,
+        obs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Hook to enrich the per-step observation with benchmark-specific keys.
+
+        Called by :meth:`PolicyRunner._evaluate_with_spec` between
+        ``sim.get_observation(...)`` and ``policy.get_actions(...)``. The
+        returned dict is what the policy actually sees - so this is the
+        place to bridge a sim's observation schema (typically joint-space)
+        to whatever shape the benchmark's policy was trained on
+        (Cartesian end-effector pose, dataset-specific encodings, …).
+
+        Default implementation is identity (no-op). Subclasses MUST return
+        a dict; mutating ``obs`` in place and returning it is allowed but
+        returning a new merged dict is preferred to avoid surprising
+        downstream code that retained a reference to the pre-augmented
+        observation.
+
+        Side-effect contract: implementations MUST be safe to call N times
+        per step (the eval loop guarantees one call per step today, but
+        future replay / preview features may call it more often). Do not
+        send actions, do not step physics, do not mutate the registry.
+
+        Errors are caught by the eval loop and surfaced as a structured
+        error dict; raising here aborts the episode without further policy
+        calls. See :class:`~strands_robots.benchmarks.libero.LiberoAdapter`
+        for an example that injects ``x`` / ``y`` / ``z`` / ``roll`` / ``pitch``
+        / ``yaw`` / ``gripper`` for the LIBERO ``state.*`` schema.
+        """
+        return obs
+
     @abstractmethod
     def is_success(self, sim: SimEngine) -> bool:
         """Terminal success predicate.

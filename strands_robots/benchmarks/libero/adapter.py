@@ -125,6 +125,9 @@ class LiberoAdapter(BenchmarkProtocol):
         init_jitter: float = 0.02,
         install_cameras: bool = True,
         cameras: dict[str, dict[str, Any]] | None = None,
+        eef_body_name: str = "hand",
+        gripper_joint_name: str = "finger_joint1",
+        inject_eef_state: bool = True,
     ):
         """Construct from a pre-parsed :class:`BDDLProblem`.
 
@@ -146,6 +149,26 @@ class LiberoAdapter(BenchmarkProtocol):
                 :meth:`Simulation.add_camera`. Passing an empty dict
                 disables camera installation regardless of
                 ``install_cameras``.
+            eef_body_name: MuJoCo body name whose pose is read for the
+                LIBERO ``state.x/y/z/roll/pitch/yaw`` keys. Default
+                ``"hand"`` matches MuJoCo Menagerie's Panda. Use
+                ``"<robot_name>/hand"`` in multi-Panda scenes (the
+                lookup goes through the namespace-aware
+                :meth:`Simulation.get_body_state`, so the bare name is
+                usually fine).
+            gripper_joint_name: Joint name whose ``qpos`` is read for the
+                LIBERO ``state.gripper`` key. Default ``"finger_joint1"``
+                matches the Menagerie Panda; the second finger
+                (``finger_joint2``) mirrors via an MJCF equality
+                constraint, so reading just one is sufficient.
+            inject_eef_state: When ``True`` (default), the adapter's
+                :meth:`augment_observation` injects ``x`` / ``y`` / ``z``
+                / ``roll`` / ``pitch`` / ``yaw`` / ``gripper`` keys
+                into the per-step observation so the ``libero_panda``
+                ``Gr00tDataConfig`` finds them. Set to ``False`` when the
+                sim already exposes those keys (e.g. via a custom
+                ``observation_mapping`` on the policy or a backend that
+                returns Cartesian state natively).
 
         Raises:
             ValueError: If ``problem.goal`` is ``None``.
@@ -167,6 +190,9 @@ class LiberoAdapter(BenchmarkProtocol):
             if cameras is not None
             else {k: dict(v) for k, v in self.LIBERO_CAMERAS.items()}
         )
+        self._eef_body_name = str(eef_body_name)
+        self._gripper_joint_name = str(gripper_joint_name)
+        self._inject_eef_state = bool(inject_eef_state)
         self._success_fn: Callable[[SimEngine], bool] = compile_goal(problem.goal)
 
     # Construction helpers
@@ -181,6 +207,9 @@ class LiberoAdapter(BenchmarkProtocol):
         init_jitter: float = 0.02,
         install_cameras: bool = True,
         cameras: dict[str, dict[str, Any]] | None = None,
+        eef_body_name: str = "hand",
+        gripper_joint_name: str = "finger_joint1",
+        inject_eef_state: bool = True,
     ) -> LiberoAdapter:
         """Parse a ``.bddl`` file from disk and build an adapter.
 
@@ -196,6 +225,9 @@ class LiberoAdapter(BenchmarkProtocol):
             init_jitter=init_jitter,
             install_cameras=install_cameras,
             cameras=cameras,
+            eef_body_name=eef_body_name,
+            gripper_joint_name=gripper_joint_name,
+            inject_eef_state=inject_eef_state,
         )
 
     @classmethod
@@ -208,6 +240,9 @@ class LiberoAdapter(BenchmarkProtocol):
         init_jitter: float = 0.02,
         install_cameras: bool = True,
         cameras: dict[str, dict[str, Any]] | None = None,
+        eef_body_name: str = "hand",
+        gripper_joint_name: str = "finger_joint1",
+        inject_eef_state: bool = True,
     ) -> LiberoAdapter:
         """Parse a BDDL string directly - useful in tests."""
         problem = parse_bddl(bddl_text)
@@ -218,6 +253,9 @@ class LiberoAdapter(BenchmarkProtocol):
             init_jitter=init_jitter,
             install_cameras=install_cameras,
             cameras=cameras,
+            eef_body_name=eef_body_name,
+            gripper_joint_name=gripper_joint_name,
+            inject_eef_state=inject_eef_state,
         )
 
     # BenchmarkProtocol interface
@@ -279,6 +317,95 @@ class LiberoAdapter(BenchmarkProtocol):
         """Sparse step: zero reward, never ``done``. Success is detected by
         :meth:`is_success` at the outer eval loop."""
         return StepInfo(reward=0.0, done=False)
+
+    def augment_observation(
+        self,
+        sim: SimEngine,
+        obs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Inject ``x`` / ``y`` / ``z`` / ``roll`` / ``pitch`` / ``yaw`` / ``gripper``
+        for the ``libero_panda`` ``Gr00tDataConfig`` schema.
+
+        The ``libero_panda`` data_config declares
+        ``state_keys = ["state.x", "state.y", "state.z", "state.roll",
+        "state.pitch", "state.yaw", "state.gripper"]``. The policy's
+        ``_build_service_observation`` strips the ``state.`` prefix and
+        looks up bare keys (``x``, ``y``, …) directly in the robot
+        observation. ``Simulation.get_observation()`` only returns
+        joint-space readings, so without this hook the server rejects
+        every request with ``Server error: State key 'state.x' must be
+        in observation``.
+
+        Implementation:
+
+        1. Read end-effector pose via ``sim.get_body_state(self._eef_body_name)``
+           (default body ``"hand"`` for MuJoCo Menagerie's Panda).
+        2. Convert MuJoCo's ``(w, x, y, z)`` quaternion to extrinsic XYZ
+           Euler ``(roll, pitch, yaw)`` to match the LIBERO/RoboSuite
+           ``mat2euler(..., axes='sxyz')`` convention the dataset and
+           policy were trained on.
+        3. Read gripper opening from ``obs[self._gripper_joint_name]``
+           (already populated by ``Simulation.get_observation``; default
+           ``"finger_joint1"`` matches Menagerie Panda).
+
+        Best-effort: if any source is missing (sim doesn't expose
+        ``get_body_state``, body name unknown, gripper joint absent),
+        the corresponding key is omitted with a debug log. The original
+        observation is returned with the resolved keys merged in - we
+        never delete or overwrite an obs key the sim already provided
+        (so a backend that natively returns Cartesian state wins).
+
+        Disable this entirely with ``inject_eef_state=False`` on the
+        constructor.
+        """
+        if not self._inject_eef_state:
+            return obs
+
+        merged = dict(obs)
+
+        # End-effector pose - via get_body_state which is namespace-aware
+        # (the `panda_arm/hand` form works in multi-robot scenes).
+        get_body_state = getattr(sim, "get_body_state", None)
+        if get_body_state is not None:
+            try:
+                state_result = get_body_state(body_name=self._eef_body_name)
+            except Exception as e:  # noqa: BLE001 - never abort eval on a state lookup
+                logger.debug("LiberoAdapter: get_body_state(%r) raised: %s", self._eef_body_name, e)
+                state_result = None
+            position, quat = _extract_pose(state_result)
+            if position is not None:
+                # Don't overwrite if a backend already supplied these
+                # (e.g. via a custom mapping).
+                merged.setdefault("x", float(position[0]))
+                merged.setdefault("y", float(position[1]))
+                merged.setdefault("z", float(position[2]))
+            if quat is not None:
+                roll, pitch, yaw = _quat_wxyz_to_rpy_xyz(quat)
+                merged.setdefault("roll", roll)
+                merged.setdefault("pitch", pitch)
+                merged.setdefault("yaw", yaw)
+        else:
+            logger.debug("LiberoAdapter: sim has no get_body_state(); skipping EEF state injection")
+
+        # Gripper - read from the (already collected) joint observation.
+        # The Menagerie Panda's two-finger constraint mirrors finger_joint1
+        # to finger_joint2, so reading just the first one is sufficient.
+        gripper_value = obs.get(self._gripper_joint_name)
+        if gripper_value is None:
+            # Some backends namespace joint keys; try the suffix match.
+            for key, val in obs.items():
+                if isinstance(key, str) and key.endswith("/" + self._gripper_joint_name):
+                    gripper_value = val
+                    break
+        if isinstance(gripper_value, (int, float)) and not isinstance(gripper_value, bool):
+            merged.setdefault("gripper", float(gripper_value))
+        else:
+            logger.debug(
+                "LiberoAdapter: gripper joint %r not found in obs; omitting state.gripper",
+                self._gripper_joint_name,
+            )
+
+        return merged
 
     def is_success(self, sim: SimEngine) -> bool:
         return bool(self._success_fn(sim))
@@ -407,6 +534,80 @@ def _extract_position(state: dict[str, Any]) -> list[float] | None:
             if isinstance(pos, list) and len(pos) == 3 and all(isinstance(c, (int, float)) for c in pos):
                 return [float(c) for c in pos]
     return None
+
+
+def _extract_pose(state: dict[str, Any] | None) -> tuple[list[float] | None, list[float] | None]:
+    """Pull ``(position, quaternion_wxyz)`` from a ``get_body_state`` payload.
+
+    Both fields are optional; this returns ``(None, None)`` for any
+    error / shape mismatch so the caller can selectively inject just
+    the keys it has. The MuJoCo backend always reports both, so in
+    the happy path you get both arrays back.
+    """
+    if not isinstance(state, dict) or state.get("status") != "success":
+        return (None, None)
+    pos: list[float] | None = None
+    quat: list[float] | None = None
+    for block in state.get("content", []) or []:
+        if not isinstance(block, dict):
+            continue
+        json_block = block.get("json")
+        if not isinstance(json_block, dict):
+            continue
+        raw_pos = json_block.get("position")
+        if isinstance(raw_pos, list) and len(raw_pos) == 3 and all(isinstance(c, (int, float)) for c in raw_pos):
+            pos = [float(c) for c in raw_pos]
+        raw_quat = json_block.get("quaternion")
+        if isinstance(raw_quat, list) and len(raw_quat) == 4 and all(isinstance(c, (int, float)) for c in raw_quat):
+            quat = [float(c) for c in raw_quat]
+    return (pos, quat)
+
+
+def _quat_wxyz_to_rpy_xyz(quat_wxyz: list[float]) -> tuple[float, float, float]:
+    """MuJoCo ``(w, x, y, z)`` quaternion → extrinsic XYZ Euler ``(roll, pitch, yaw)``.
+
+    Matches RoboSuite/LIBERO's ``mat2euler(..., axes='sxyz')`` convention -
+    i.e. rotations applied about the *static* world frame in the order
+    X (roll), Y (pitch), Z (yaw). This is also what
+    ``scipy.spatial.transform.Rotation.from_quat([x, y, z, w]).as_euler('xyz')``
+    returns (lowercase ``'xyz'`` = extrinsic in scipy).
+
+    Pure numpy / stdlib - **does not import scipy**, which is not a
+    declared dependency of strands_robots. Math reference:
+
+        R = R_x(roll) · R_y(pitch) · R_z(yaw)  (extrinsic XYZ)
+
+    For unit quat ``q = (w, x, y, z)``, the rotation-matrix elements
+    needed for the canonical extraction are:
+
+        R[0,2] =  2 (xz + wy)        →  sin(pitch)
+        R[0,0] =  1 - 2 (y² + z²)
+        R[0,1] = -2 (wz - xy)
+        R[1,2] = -2 (wx - yz)
+        R[2,2] =  1 - 2 (x² + y²)
+
+    Gimbal lock (``|sin(pitch)| ≥ 1 - 1e-6``) collapses roll into yaw;
+    we use the ``atan2(R[1,0], R[1,1])`` resolution that matches scipy.
+
+    Returns:
+        ``(roll, pitch, yaw)`` in **radians**, each in the principal
+        range used by ``atan2`` / ``asin``: ``roll ∈ (-π, π]``,
+        ``pitch ∈ [-π/2, π/2]``, ``yaw ∈ (-π, π]``.
+    """
+    import math
+
+    w, x, y, z = quat_wxyz
+    # Clamp argument to asin to handle minor numerical drift on unit quats.
+    sin_pitch = max(-1.0, min(1.0, 2.0 * (x * z + w * y)))
+    pitch = math.asin(sin_pitch)
+    if abs(sin_pitch) >= 1.0 - 1e-6:
+        # Gimbal-lock branch: roll absorbed into yaw.
+        roll = 0.0
+        yaw = math.atan2(2.0 * (x * y + w * z), 1.0 - 2.0 * (y * y + z * z))
+    else:
+        roll = math.atan2(-2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y))
+        yaw = math.atan2(-2.0 * (x * y - w * z), 1.0 - 2.0 * (y * y + z * z))
+    return (roll, pitch, yaw)
 
 
 __all__ = [

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -318,6 +319,70 @@ class TestRobotCompatibility:
         assert "compatibility" in text.lower() or "supported" in text.lower()
         assert "so100" in text  # shows the offending data_config
         assert "panda" in text  # shows the allowed list
+
+
+# augment_observation hook integration (#156)
+
+
+class TestAugmentObservationHook:
+    """The eval loop must call ``spec.augment_observation`` between
+    ``sim.get_observation()`` and ``policy.get_actions()`` and feed the
+    augmented obs to the policy.
+    """
+
+    def test_hook_output_reaches_policy(self):
+        """The augmented observation - not the raw sim obs - is what
+        ``policy.get_actions(observation, instruction)`` sees."""
+
+        captured: list[dict[str, Any]] = []
+
+        class _CapturePolicy:
+            requires_images = False
+
+            def __init__(self):
+                self.robot_state_keys: list[str] = []
+
+            def set_robot_state_keys(self, keys):
+                self.robot_state_keys = list(keys)
+
+            def get_actions(self, obs, instruction):
+                captured.append(dict(obs))
+                return [{"j0": 0.0, "j1": 0.0}]
+
+        class _AugSpec(_CountingBenchmark):
+            def augment_observation(self, sim, obs):  # type: ignore[override]
+                merged = dict(obs)
+                merged["x"] = 0.42  # injected key
+                return merged
+
+        sim = FakeSim()
+        policy = _CapturePolicy()
+        policy.set_robot_state_keys(sim.robot_joint_names("fake_robot"))
+
+        result = PolicyRunner(sim).evaluate("fake_robot", policy, spec=_AugSpec(), n_episodes=1)
+        assert result["status"] == "success"
+        # Every step in the episode ran augment_observation.
+        assert all(o.get("x") == 0.42 for o in captured)
+        # The raw sim obs (joints only) is still in the dict too.
+        assert all("j0" in o for o in captured)
+
+    def test_hook_failure_aborts_with_structured_error(self):
+        """If the spec's augment_observation raises, the eval loop returns
+        a structured error rather than letting the exception bubble out."""
+
+        class _BoomSpec(_CountingBenchmark):
+            def augment_observation(self, sim, obs):  # type: ignore[override]
+                raise RuntimeError("intentional failure")
+
+        sim = FakeSim()
+        policy = MockPolicy()
+        policy.set_robot_state_keys(sim.robot_joint_names("fake_robot"))
+
+        result = PolicyRunner(sim).evaluate("fake_robot", policy, spec=_BoomSpec(), n_episodes=1)
+        assert result["status"] == "error"
+        text = result["content"][0]["text"]
+        assert "augment_observation failed" in text
+        assert "intentional failure" in text
 
 
 # Legacy success_fn path still works

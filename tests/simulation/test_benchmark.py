@@ -154,6 +154,33 @@ class TestBenchmarkProtocolContract:
         assert sim.add_robot_calls[0]["data_config"] == "so100"
 
 
+# augment_observation hook (#156)
+
+
+class TestAugmentObservation:
+    def test_default_is_pass_through(self):
+        bench = _MinimalBenchmark()
+        obs = {"j0": 1.0, "j1": 2.0, "image": "fake_array"}
+        # Default impl returns the same dict (or an equivalent dict) without
+        # mutating it. Identity by value, not by reference, is the contract.
+        out = bench.augment_observation(None, obs)  # type: ignore[arg-type]
+        assert out == obs
+
+    def test_subclass_can_inject_keys(self):
+        """A subclass override is the supported extension point."""
+
+        class _AugBench(_MinimalBenchmark):
+            def augment_observation(self, sim, obs):  # type: ignore[override]
+                merged = dict(obs)
+                merged["x"] = 1.5
+                return merged
+
+        bench = _AugBench()
+        out = bench.augment_observation(None, {"j0": 0.0})  # type: ignore[arg-type]
+        assert out["x"] == 1.5
+        assert out["j0"] == 0.0
+
+
 # Robot compatibility
 
 
