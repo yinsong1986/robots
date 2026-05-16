@@ -621,6 +621,12 @@ def _build_inference_command(
     diverging flag rather than two parallel command-builder functions.
     """
     if protocol == "n1.7":
+        # The N1.7 entrypoint (``python -m gr00t.eval.run_gr00t_server``)
+        # does NOT accept a ``--server`` flag — passing it makes ``tyro``
+        # reject the invocation with ``Unrecognized options: --server``
+        # and the inference process exits before binding the port. The
+        # legacy N1.5/N1.6 ``inference_service.py`` did take ``--server``;
+        # keeping the flag there preserves back-compat for older images.
         cmd = [
             "docker",
             "exec",
@@ -629,7 +635,6 @@ def _build_inference_command(
             "python",
             "-m",
             "gr00t.eval.run_gr00t_server",
-            "--server",
             "--model-path",
             checkpoint_path,
             "--port",

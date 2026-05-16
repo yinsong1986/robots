@@ -97,6 +97,18 @@ class TestBuildInferenceCommand:
         assert "--denoising-steps" not in cmd
         # Sim policy wrapper is opt-in.
         assert "--use-sim-policy-wrapper" not in cmd
+        # Regression: the n1.7 entrypoint does NOT take ``--server``.
+        # Passing it makes ``tyro`` reject the invocation with
+        # "Unrecognized options: --server" and the inference process
+        # exits before binding the port. See discussion on #148-F3.
+        assert "--server" not in cmd
+
+    def test_n15_keeps_server_flag(self):
+        """Conversely, the legacy entrypoint *does* require ``--server``."""
+        cmd = _build_inference_command(**_common_kwargs(protocol="n1.5"))
+        assert "--server" in cmd
+        cmd = _build_inference_command(**_common_kwargs(protocol="n1.6"))
+        assert "--server" in cmd
 
     def test_n17_with_sim_policy_wrapper(self):
         cmd = _build_inference_command(**_common_kwargs(protocol="n1.7", use_sim_policy_wrapper=True))
@@ -110,7 +122,12 @@ class TestBuildInferenceCommand:
     def test_shared_required_flags_present_on_all_protocols(self):
         for protocol in ("n1.5", "n1.6", "n1.7"):
             cmd = _build_inference_command(**_common_kwargs(protocol=protocol))
-            assert "--server" in cmd, protocol
+            # ``--server`` is N1.5/N1.6-only — see test_n17_module_entrypoint
+            # for the regression detail.
+            if protocol in ("n1.5", "n1.6"):
+                assert "--server" in cmd, protocol
+            else:
+                assert "--server" not in cmd, protocol
             assert "--model-path" in cmd, protocol
             assert "/data/checkpoints/model" in cmd, protocol
             assert "--port" in cmd, protocol
