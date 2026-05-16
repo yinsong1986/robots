@@ -17,8 +17,11 @@ Covers:
 
 from __future__ import annotations
 
+import hashlib
 import random
+from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -714,6 +717,337 @@ class TestQuaternionToEuler:
         quat = [math.cos(math.pi / 4), 0.0, math.sin(math.pi / 4), 0.0]
         _roll, pitch, _yaw = _quat_wxyz_to_rpy_xyz(quat)
         assert pitch == pytest.approx(math.pi / 2, abs=1e-6)
+
+
+# Scene auto-generation from BDDL (#164)
+
+
+class TestSceneGeneration:
+    """``LiberoAdapter._generate_scene_from_bddl`` builds the per-task MJCF
+    via the upstream ``libero`` package's procedural generator, with
+    SHA256-keyed disk caching and a graceful fallback when ``libero``
+    isn't installed."""
+
+    def test_explicit_scene_path_skips_generation(self, tmp_path):
+        """``scene_path=...`` set on the constructor wins over auto-gen.
+        The generator must NOT be called when an explicit path is given."""
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=str(tmp_path / "explicit.xml"),
+            init_jitter=0.0,
+            install_cameras=False,
+        )
+
+        with patch.object(adapter, "_generate_scene_from_bddl") as mock_gen:
+            sim = FakeSim(data_config="panda")
+            # The explicit path doesn't exist; load_scene returns success
+            # only because FakeSim's load_scene is canned. Real Simulation
+            # would error - that's the test's purpose: confirm we never
+            # touched the generator.
+            adapter.on_episode_start(sim, random.Random(0))
+
+        mock_gen.assert_not_called()
+        assert sim._scenes_loaded == [str(tmp_path / "explicit.xml")]
+
+    def test_auto_generate_scene_false_falls_back_to_bare_panda(self):
+        """Pre-#164 behavior preserved: with auto_generate_scene=False
+        and no scene_path, the adapter goes straight to the bare-Panda
+        path without trying to generate."""
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            auto_generate_scene=False,
+            init_jitter=0.0,
+            install_cameras=False,
+        )
+
+        with patch.object(adapter, "_generate_scene_from_bddl") as mock_gen:
+            sim = FakeSim(data_config="panda")
+            adapter.on_episode_start(sim, random.Random(0))
+
+        mock_gen.assert_not_called()
+        assert sim._scenes_loaded == []
+        assert adapter.scene_path is None
+
+    def test_libero_missing_falls_back_with_warning(self, caplog, tmp_path):
+        """If ``libero`` isn't installed, the adapter must log a warning
+        and continue with the legacy bare-Panda path - eval still runs,
+        just against the wrong world."""
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(tmp_path / "cache"),
+            init_jitter=0.0,
+            install_cameras=False,
+        )
+
+        # Simulate a missing pip package - require_optional raises ImportError.
+        with patch(
+            "strands_robots.benchmarks.libero.adapter.require_optional",
+            side_effect=ImportError("'libero' is required"),
+        ):
+            with caplog.at_level("WARNING"):
+                sim = FakeSim(data_config="panda")
+                adapter.on_episode_start(sim, random.Random(0))
+
+        # Eval continues without a scene loaded.
+        assert sim._scenes_loaded == []
+        assert adapter.scene_path is None
+        # User gets a clear hint about [benchmark-libero].
+        assert any(
+            "scene auto-generation failed" in rec.message and "[benchmark-libero]" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_cache_hit_skips_libero_import(self, tmp_path):
+        """If the SHA-keyed cache file already exists, the adapter must
+        return its path without importing libero at all."""
+        cache_dir = tmp_path / "scene_cache"
+        cache_dir.mkdir()
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            init_jitter=0.0,
+            install_cameras=False,
+        )
+
+        # Pre-populate the cache file at the SHA the adapter computes.
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        assert bddl_path is not None
+        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        cache_path = cache_dir / f"{sha}.xml"
+        cache_path.write_text("<mujoco/>")
+
+        # Sentinel: any libero import attempt would fail this test.
+        with patch(
+            "strands_robots.benchmarks.libero.adapter.require_optional",
+            side_effect=AssertionError("require_optional should not be called on cache hit"),
+        ):
+            generated = adapter._generate_scene_from_bddl()
+
+        assert generated == str(cache_path)
+
+    def test_cache_miss_invokes_libero_and_writes_xml(self, tmp_path):
+        """Cache miss path: libero is imported, ControlEnv is constructed
+        with rendering disabled, the compiled MJCF is extracted, cameras
+        are renamed, and the result is written to the cache."""
+        cache_dir = tmp_path / "scene_cache"
+
+        # Mock the entire libero.libero.envs.env_wrapper module surface.
+        fake_xml = (
+            '<mujoco model="libero_pick"><worldbody>'
+            '<camera name="agentview" pos="1 0 1"/>'
+            '<camera name="robot0_eye_in_hand_image" pos="0 0 0.5"/>'
+            "</worldbody></mujoco>"
+        )
+
+        fake_env = MagicMock()
+        fake_env.env.sim.model.get_xml.return_value = fake_xml
+        fake_module = MagicMock()
+        fake_module.ControlEnv.return_value = fake_env
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            init_jitter=0.0,
+            install_cameras=False,
+        )
+
+        with patch(
+            "strands_robots.benchmarks.libero.adapter.require_optional",
+            return_value=fake_module,
+        ):
+            generated = adapter._generate_scene_from_bddl()
+
+        assert generated is not None
+        # ControlEnv must have been constructed with rendering disabled
+        # so we don't need a GL context.
+        construct_kwargs = fake_module.ControlEnv.call_args.kwargs
+        assert construct_kwargs["has_offscreen_renderer"] is False
+        assert construct_kwargs["has_renderer"] is False
+        assert construct_kwargs["use_camera_obs"] is False
+        # The compiled XML was extracted from env.env.sim.model.get_xml().
+        fake_env.env.sim.model.get_xml.assert_called_once()
+        # Cameras renamed to libero_panda data_config bare keys.
+        text = Path(generated).read_text()
+        assert 'name="image"' in text
+        assert 'name="wrist_image"' in text
+        assert 'name="agentview"' not in text
+        assert 'name="robot0_eye_in_hand_image"' not in text
+        # env was closed after extraction.
+        fake_env.close.assert_called_once()
+
+    def test_camera_rename_disabled_with_empty_aliases(self, tmp_path):
+        """Passing ``scene_camera_aliases={}`` keeps the LIBERO-canonical
+        camera names verbatim - useful for users who want to manage the
+        camera-name mapping themselves via the policy's
+        observation_mapping."""
+        cache_dir = tmp_path / "scene_cache"
+
+        fake_xml = '<mujoco><worldbody><camera name="agentview" pos="1 0 1"/></worldbody></mujoco>'
+
+        fake_env = MagicMock()
+        fake_env.env.sim.model.get_xml.return_value = fake_xml
+        fake_module = MagicMock()
+        fake_module.ControlEnv.return_value = fake_env
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            scene_camera_aliases={},  # disable
+            init_jitter=0.0,
+            install_cameras=False,
+        )
+
+        with patch(
+            "strands_robots.benchmarks.libero.adapter.require_optional",
+            return_value=fake_module,
+        ):
+            generated = adapter._generate_scene_from_bddl()
+
+        text = Path(generated).read_text()
+        # agentview retained verbatim.
+        assert 'name="agentview"' in text
+        assert 'name="image"' not in text
+
+    def test_cache_key_is_sha256_of_bddl(self, tmp_path):
+        """Two adapters built from the SAME BDDL share a cached XML.
+        Two adapters with DIFFERENT BDDL get distinct cache files."""
+        cache_dir = tmp_path / "scene_cache"
+
+        a1 = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            init_jitter=0.0,
+        )
+        a2 = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            init_jitter=0.0,
+        )
+        a3 = LiberoAdapter.from_text(
+            COMPOUND_BDDL,
+            scene_cache_dir=str(cache_dir),
+            init_jitter=0.0,
+        )
+
+        path1 = a1._resolve_bddl_path_for_libero()
+        path2 = a2._resolve_bddl_path_for_libero()
+        path3 = a3._resolve_bddl_path_for_libero()
+        assert path1 is not None and path2 is not None and path3 is not None
+        sha1 = hashlib.sha256(path1.read_bytes()).hexdigest()
+        sha2 = hashlib.sha256(path2.read_bytes()).hexdigest()
+        sha3 = hashlib.sha256(path3.read_bytes()).hexdigest()
+        assert sha1 == sha2  # same BDDL → same key
+        assert sha1 != sha3  # different BDDL → different key
+
+    def test_resolve_bddl_path_uses_existing_file_when_set(self, tmp_path):
+        """``from_file`` constructed adapters reuse the original BDDL path
+        instead of writing a new temp file."""
+        bddl_file = tmp_path / "task.bddl"
+        bddl_file.write_text(PICK_CUBE_BDDL)
+        adapter = LiberoAdapter.from_file(
+            bddl_file,
+            scene_cache_dir=str(tmp_path / "cache"),
+            init_jitter=0.0,
+        )
+        resolved = adapter._resolve_bddl_path_for_libero()
+        assert resolved == bddl_file
+
+    def test_resolve_bddl_path_returns_none_for_unsourced_problem(self, tmp_path):
+        """Adapters built from a pre-parsed ``BDDLProblem`` without
+        ``bddl_source`` / ``bddl_path`` can't auto-generate a scene -
+        the resolver returns None and the generator surfaces that as
+        a no-op."""
+        from strands_robots.benchmarks.libero.bddl_parser import parse_bddl
+
+        problem = parse_bddl(PICK_CUBE_BDDL)
+        # Construct directly, bypassing from_file / from_text.
+        adapter = LiberoAdapter(
+            problem,
+            scene_cache_dir=str(tmp_path / "cache"),
+            init_jitter=0.0,
+        )
+        resolved = adapter._resolve_bddl_path_for_libero()
+        assert resolved is None
+
+        # The generator must return None (not raise) so the on_episode_start
+        # fallback path stays alive.
+        assert adapter._generate_scene_from_bddl() is None
+
+    def test_on_episode_start_loads_generated_scene(self, tmp_path):
+        """End-to-end: scene_path=None, auto_generate_scene=True ⇒
+        on_episode_start generates the scene, mutates self.scene_path,
+        and calls sim.load_scene with the cached path."""
+        cache_dir = tmp_path / "scene_cache"
+        cache_dir.mkdir()
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            init_jitter=0.0,
+            install_cameras=False,
+        )
+
+        # Pre-populate the cache so we don't need a fake libero env.
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        assert bddl_path is not None
+        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        cache_path = cache_dir / f"{sha}.xml"
+        cache_path.write_text("<mujoco/>")
+
+        sim = FakeSim(data_config="panda")
+        adapter.on_episode_start(sim, random.Random(0))
+
+        assert adapter.scene_path == str(cache_path)
+        assert sim._scenes_loaded == [str(cache_path)]
+
+
+class TestRenameMjcfCameras:
+    """``_rename_mjcf_cameras`` helper - targeted regex, doesn't touch
+    non-camera elements."""
+
+    def test_renames_camera_by_name(self):
+        from strands_robots.benchmarks.libero.adapter import _rename_mjcf_cameras
+
+        xml = '<camera name="agentview" pos="1 0 1"/>'
+        out = _rename_mjcf_cameras(xml, {"agentview": "image"})
+        assert 'name="image"' in out
+        assert 'name="agentview"' not in out
+
+    def test_passes_through_unmapped_cameras(self):
+        from strands_robots.benchmarks.libero.adapter import _rename_mjcf_cameras
+
+        xml = '<camera name="other_cam" fovy="60"/>'
+        out = _rename_mjcf_cameras(xml, {"agentview": "image"})
+        assert out == xml
+
+    def test_does_not_touch_material_named_after_camera(self):
+        """Targeted regex: only ``<camera ... name="X" ...>`` is rewritten,
+        not e.g. ``<material name="agentview">`` (a contrived case but it
+        guards against future false-positives)."""
+        from strands_robots.benchmarks.libero.adapter import _rename_mjcf_cameras
+
+        xml = '<material name="agentview" rgba="1 0 0 1"/><camera name="agentview" pos="1 0 1"/>'
+        out = _rename_mjcf_cameras(xml, {"agentview": "image"})
+        # Material name unchanged.
+        assert '<material name="agentview"' in out
+        # Camera name renamed.
+        assert '<camera name="image"' in out
+
+    def test_empty_aliases_is_noop(self):
+        from strands_robots.benchmarks.libero.adapter import _rename_mjcf_cameras
+
+        xml = '<camera name="agentview"/>'
+        assert _rename_mjcf_cameras(xml, {}) == xml
+
+    def test_handles_attributes_before_name(self):
+        """Real LIBERO MJCFs put pose attributes before ``name="..."``."""
+        from strands_robots.benchmarks.libero.adapter import _rename_mjcf_cameras
+
+        xml = '<camera pos="1 0 1" fovy="60" name="agentview"/>'
+        out = _rename_mjcf_cameras(xml, {"agentview": "image"})
+        assert 'name="image"' in out
 
 
 # PolicyRunner + evaluate_benchmark integration

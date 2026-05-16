@@ -30,7 +30,9 @@ the one that pulls in the upstream package to discover task files.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -44,6 +46,7 @@ from strands_robots.benchmarks.libero.bddl_parser import (
     parse_bddl_file,
 )
 from strands_robots.simulation.benchmark import BenchmarkProtocol, StepInfo
+from strands_robots.utils import get_base_dir, require_optional
 
 if TYPE_CHECKING:
     import random
@@ -128,13 +131,19 @@ class LiberoAdapter(BenchmarkProtocol):
         eef_body_name: str = "hand",
         gripper_joint_name: str = "finger_joint1",
         inject_eef_state: bool = True,
+        auto_generate_scene: bool = True,
+        scene_cache_dir: str | None = None,
+        scene_camera_aliases: dict[str, str] | None = None,
+        bddl_source: str | None = None,
+        bddl_path: str | None = None,
     ):
         """Construct from a pre-parsed :class:`BDDLProblem`.
 
         Args:
             problem: Parsed BDDL problem with a non-``None`` ``goal``.
             scene_path: Optional MJCF to ``sim.load_scene()`` on each
-                episode start. ``None`` → assume scene is pre-loaded.
+                episode start. ``None`` triggers ``auto_generate_scene``
+                if enabled (see below).
             max_steps: Override the class-level 300.
             init_jitter: Per-episode ±jitter (metres) applied to xy of every
                 object referenced by ``(:init (on A B))`` clauses. Set to 0
@@ -143,7 +152,10 @@ class LiberoAdapter(BenchmarkProtocol):
                 in :attr:`LIBERO_CAMERAS` (or ``cameras`` override) on
                 episode start. Set to ``False`` if your scene MJCF already
                 declares the cameras the policy needs - the adapter will
-                skip the install step entirely.
+                skip the install step entirely. Generated scenes have their
+                cameras renamed to ``image`` / ``wrist_image`` (see
+                ``scene_camera_aliases``), so the install step naturally
+                no-ops on auto-generated scenes.
             cameras: Override / extend :attr:`LIBERO_CAMERAS`. Keyed by
                 camera name, each value is forwarded as ``**kwargs`` to
                 :meth:`Simulation.add_camera`. Passing an empty dict
@@ -169,6 +181,36 @@ class LiberoAdapter(BenchmarkProtocol):
                 sim already exposes those keys (e.g. via a custom
                 ``observation_mapping`` on the policy or a backend that
                 returns Cartesian state natively).
+            auto_generate_scene: When ``True`` (default) AND ``scene_path``
+                is ``None``, :meth:`on_episode_start` calls
+                :meth:`_generate_scene_from_bddl` to build the scene MJCF
+                via the upstream ``libero`` package's procedural
+                generator. The generated XML is cached on disk so
+                subsequent episodes / processes reuse it without
+                re-running ``libero``. Set to ``False`` to keep the
+                pre-#164 behaviour of running against a bare Panda when
+                no ``scene_path`` is provided.
+            scene_cache_dir: Filesystem location for the generated-scene
+                cache. Defaults to ``$STRANDS_BASE_DIR/scene_cache/libero/``
+                (typically ``~/.strands_robots/scene_cache/libero/``).
+                Cache key is SHA256 of the BDDL source so two adapters
+                built from the same BDDL share a cached XML.
+            scene_camera_aliases: Mapping from MJCF camera name (as
+                emitted by LIBERO) to the policy-side observation key
+                expected by the ``libero_panda`` data_config. Default
+                ``{"agentview": "image", "robot0_eye_in_hand_image": "wrist_image"}``
+                renames RoboSuite/LIBERO's two canonical cameras so
+                ``Gr00tPolicy._build_service_observation`` finds them by
+                bare-key lookup. Pass an empty dict to disable renaming.
+            bddl_source: Original BDDL text - stored on the adapter so
+                the scene generator can pass it back to ``libero`` (which
+                only accepts a *file* path). Set automatically by
+                :meth:`from_text`. Tests may set it explicitly when
+                building from a pre-parsed :class:`BDDLProblem` and they
+                want auto-generation to work.
+            bddl_path: Original BDDL file path - same purpose as
+                ``bddl_source`` but lets the scene generator skip the
+                temp-file step. Set automatically by :meth:`from_file`.
 
         Raises:
             ValueError: If ``problem.goal`` is ``None``.
@@ -193,6 +235,22 @@ class LiberoAdapter(BenchmarkProtocol):
         self._eef_body_name = str(eef_body_name)
         self._gripper_joint_name = str(gripper_joint_name)
         self._inject_eef_state = bool(inject_eef_state)
+        self._auto_generate_scene = bool(auto_generate_scene)
+        self._scene_cache_dir = scene_cache_dir
+        # Default camera-name alias map matches RoboSuite/LIBERO's two
+        # canonical camera names to the bare keys (``image`` /
+        # ``wrist_image``) that ``libero_panda``'s Gr00tDataConfig
+        # expects. Passing an empty dict disables renaming.
+        self._scene_camera_aliases: dict[str, str] = (
+            dict(scene_camera_aliases)
+            if scene_camera_aliases is not None
+            else {
+                "agentview": "image",
+                "robot0_eye_in_hand_image": "wrist_image",
+            }
+        )
+        self._bddl_source = bddl_source
+        self._bddl_path = bddl_path
         self._success_fn: Callable[[SimEngine], bool] = compile_goal(problem.goal)
 
     # Construction helpers
@@ -210,6 +268,9 @@ class LiberoAdapter(BenchmarkProtocol):
         eef_body_name: str = "hand",
         gripper_joint_name: str = "finger_joint1",
         inject_eef_state: bool = True,
+        auto_generate_scene: bool = True,
+        scene_cache_dir: str | None = None,
+        scene_camera_aliases: dict[str, str] | None = None,
     ) -> LiberoAdapter:
         """Parse a ``.bddl`` file from disk and build an adapter.
 
@@ -228,6 +289,10 @@ class LiberoAdapter(BenchmarkProtocol):
             eef_body_name=eef_body_name,
             gripper_joint_name=gripper_joint_name,
             inject_eef_state=inject_eef_state,
+            auto_generate_scene=auto_generate_scene,
+            scene_cache_dir=scene_cache_dir,
+            scene_camera_aliases=scene_camera_aliases,
+            bddl_path=str(bddl_path),
         )
 
     @classmethod
@@ -243,6 +308,9 @@ class LiberoAdapter(BenchmarkProtocol):
         eef_body_name: str = "hand",
         gripper_joint_name: str = "finger_joint1",
         inject_eef_state: bool = True,
+        auto_generate_scene: bool = True,
+        scene_cache_dir: str | None = None,
+        scene_camera_aliases: dict[str, str] | None = None,
     ) -> LiberoAdapter:
         """Parse a BDDL string directly - useful in tests."""
         problem = parse_bddl(bddl_text)
@@ -256,6 +324,10 @@ class LiberoAdapter(BenchmarkProtocol):
             eef_body_name=eef_body_name,
             gripper_joint_name=gripper_joint_name,
             inject_eef_state=inject_eef_state,
+            auto_generate_scene=auto_generate_scene,
+            scene_cache_dir=scene_cache_dir,
+            scene_camera_aliases=scene_camera_aliases,
+            bddl_source=bddl_text,
         )
 
     # BenchmarkProtocol interface
@@ -274,22 +346,44 @@ class LiberoAdapter(BenchmarkProtocol):
         return self.problem.language or ""
 
     def on_episode_start(self, sim: SimEngine, rng: random.Random) -> None:
-        """Load the declared scene (if any), validate Panda, install cameras, then jitter.
+        """Auto-generate scene (if needed), load it, validate Panda, install cameras, then jitter.
 
         Order matters:
 
-        1. ``load_scene`` (if ``scene_path`` set) - so the base
+        1. **Scene resolution.** When ``scene_path`` is ``None`` and
+           ``auto_generate_scene`` is true, build the scene MJCF from the
+           BDDL via the upstream ``libero`` package's procedural generator
+           and cache it on disk. Subsequent episodes / processes reuse the
+           cached XML without re-running ``libero``.
+        2. ``load_scene`` (if a path is now set) - so the base
            compatibility check sees the scene's Panda rather than reporting
            "sim is empty → load default_robot".
-        2. ``super().on_episode_start`` - base compat check + auto-load
+        3. ``super().on_episode_start`` - base compat check + auto-load
            ``default_robot`` if the sim is empty.
-        3. ``_install_libero_cameras`` - inject the cameras the
+        4. ``_install_libero_cameras`` - inject the cameras the
            ``libero_panda`` ``Gr00tDataConfig`` expects (``image`` /
-           ``wrist_image``). MUST happen after the robot is loaded so the
-           cameras render against a populated scene.
-        4. ``_apply_init_jitter`` - per-episode RNG-seeded ±jitter to
+           ``wrist_image``). The auto-generator renames LIBERO's canonical
+           cameras (``agentview`` → ``image``, ``robot0_eye_in_hand_image``
+           → ``wrist_image``) so the install step naturally no-ops on
+           generated scenes - the static-pose fallbacks only fire when the
+           scene didn't supply LIBERO-named cameras.
+        5. ``_apply_init_jitter`` - per-episode RNG-seeded ±jitter to
            init-subject bodies.
         """
+        if self.scene_path is None and self._auto_generate_scene:
+            try:
+                generated = self._generate_scene_from_bddl()
+            except Exception as e:  # noqa: BLE001 - never abort eval on a setup-time error
+                logger.warning(
+                    "LiberoAdapter: scene auto-generation failed (%s); falling back to bare Panda. "
+                    "Install the [benchmark-libero] extra (pip install 'strands-robots[benchmark-libero]') "
+                    "or pass scene_path= explicitly to silence this warning.",
+                    e,
+                )
+                generated = None
+            if generated is not None:
+                self.scene_path = generated
+
         if self.scene_path:
             load_scene = getattr(sim, "load_scene", None)
             if load_scene is None:
@@ -420,6 +514,126 @@ class LiberoAdapter(BenchmarkProtocol):
         return bool(self._success_fn(sim))
 
     # Internals
+
+    def _generate_scene_from_bddl(self) -> str | None:
+        """Build the LIBERO scene MJCF from the BDDL via the upstream ``libero`` package.
+
+        Returns the absolute path to a cached MJCF file, or ``None`` when
+        the BDDL source isn't recoverable (the adapter was constructed
+        from a pre-parsed :class:`BDDLProblem` without ``bddl_source`` /
+        ``bddl_path``). Raises on any other failure path so callers in
+        :meth:`on_episode_start` can decide whether to abort or fall back
+        to bare-Panda.
+
+        Procedure:
+
+        1. Locate (or write) a ``.bddl`` file on disk - ``libero`` only
+           accepts a path. Existing ``bddl_path`` is reused as-is.
+        2. Compute SHA256 of the BDDL bytes; cache key is
+           ``<scene_cache_dir>/<sha>.xml``. Cache hit → return path
+           without touching ``libero`` at all (no GPU / robosuite import).
+        3. Cache miss → ``require_optional("libero")`` lazy-imports the
+           upstream package, then ``libero.libero.envs.env_wrapper.ControlEnv(
+           bddl_file_name=..., has_offscreen_renderer=False, has_renderer=False,
+           use_camera_obs=False)`` constructs a robosuite env without
+           opening a GL context. Robosuite's ``env.sim.model.get_xml()``
+           returns the compiled MJCF as a string.
+        4. Apply :attr:`_scene_camera_aliases` via a targeted XML
+           rename so the policy-side cameras (``image`` / ``wrist_image``)
+           resolve to the LIBERO-canonical viewpoints.
+        5. Write the renamed XML to the cache and return the path.
+
+        The LIBERO env is closed after extraction; no robosuite state
+        survives this method.
+        """
+        bddl_path = self._resolve_bddl_path_for_libero()
+        if bddl_path is None:
+            logger.debug(
+                "LiberoAdapter: no BDDL source available for scene generation - "
+                "constructed from a pre-parsed BDDLProblem without bddl_source / bddl_path"
+            )
+            return None
+
+        bddl_bytes = bddl_path.read_bytes()
+        sha = hashlib.sha256(bddl_bytes).hexdigest()
+        cache_dir = Path(self._scene_cache_dir).expanduser() if self._scene_cache_dir else _default_scene_cache_dir()
+        cache_path = cache_dir / f"{sha}.xml"
+        if cache_path.exists():
+            logger.debug("LiberoAdapter: scene cache hit %s", cache_path)
+            return str(cache_path)
+
+        # Cache miss - lazy-import libero, build the scene.
+        env_wrapper = require_optional(
+            "libero.libero.envs.env_wrapper",
+            pip_install="libero",
+            extra="benchmark-libero",
+            purpose="LIBERO scene generation from BDDL",
+        )
+        ControlEnv = env_wrapper.ControlEnv  # type: ignore[attr-defined]
+
+        # ``has_offscreen_renderer=False`` + ``has_renderer=False`` skip
+        # the GL-context bring-up that ``OffScreenRenderEnv`` would
+        # otherwise require - we only need the *compiled* model, not
+        # rendered frames. ``use_camera_obs=False`` further disables
+        # camera observation collection during reset, which would also
+        # touch the renderer.
+        env = ControlEnv(
+            bddl_file_name=str(bddl_path),
+            has_offscreen_renderer=False,
+            has_renderer=False,
+            use_camera_obs=False,
+        )
+        try:
+            xml = _extract_compiled_mjcf(env)
+        finally:
+            try:
+                env.close()
+            except Exception as e:  # noqa: BLE001 - close errors are non-fatal
+                logger.debug("LiberoAdapter: env.close() raised after extraction: %s", e)
+
+        if self._scene_camera_aliases:
+            xml = _rename_mjcf_cameras(xml, self._scene_camera_aliases)
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(xml)
+        logger.info(
+            "LiberoAdapter: generated scene MJCF for %s -> %s",
+            self.problem.name,
+            cache_path,
+        )
+        return str(cache_path)
+
+    def _resolve_bddl_path_for_libero(self) -> Path | None:
+        """Return a ``Path`` to a ``.bddl`` file libero can open, or ``None``.
+
+        - If the adapter was constructed via :meth:`from_file`,
+          ``self._bddl_path`` already points at a real file - reuse it.
+        - If constructed via :meth:`from_text`, write the source text to
+          a stable temp file (keyed by SHA256 of the text) so libero has
+          a real path. The temp file lives under
+          ``<scene_cache_dir>/.bddl/`` so it's cleaned up alongside the
+          scene cache.
+        - If neither is set, return ``None``.
+        """
+        if self._bddl_path is not None:
+            p = Path(self._bddl_path).expanduser()
+            if p.is_file():
+                return p
+            logger.debug(
+                "LiberoAdapter: bddl_path=%s not on disk; falling back to bddl_source",
+                p,
+            )
+        if self._bddl_source is None:
+            return None
+
+        cache_dir = Path(self._scene_cache_dir).expanduser() if self._scene_cache_dir else _default_scene_cache_dir()
+        bddl_dir = cache_dir / ".bddl"
+        bddl_dir.mkdir(parents=True, exist_ok=True)
+        sha = hashlib.sha256(self._bddl_source.encode("utf-8")).hexdigest()
+        tmp = bddl_dir / f"{sha}.bddl"
+        if not tmp.exists():
+            tmp.write_text(self._bddl_source)
+        return tmp
 
     def _install_libero_cameras(self, sim: SimEngine) -> None:
         """Inject the cameras the ``libero_panda`` data_config expects.
@@ -617,6 +831,80 @@ def _quat_wxyz_to_rpy_xyz(quat_wxyz: list[float]) -> tuple[float, float, float]:
         roll = math.atan2(-2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y))
         yaw = math.atan2(-2.0 * (x * y - w * z), 1.0 - 2.0 * (y * y + z * z))
     return (roll, pitch, yaw)
+
+
+# Scene-generation helpers (#164)
+
+
+def _default_scene_cache_dir() -> Path:
+    """Filesystem location for cached LIBERO scene MJCFs.
+
+    Uses :func:`strands_robots.utils.get_base_dir` so the cache lives
+    under ``$STRANDS_BASE_DIR`` (typically ``~/.strands_robots/``)
+    alongside other strands-robots state. Created on demand by
+    :meth:`LiberoAdapter._generate_scene_from_bddl` - this helper just
+    returns the path.
+    """
+    return get_base_dir() / "scene_cache" / "libero"
+
+
+def _extract_compiled_mjcf(env: Any) -> str:
+    """Pull the compiled MJCF XML out of a ``libero`` ControlEnv.
+
+    ``ControlEnv.env`` is the underlying robosuite manipulation env;
+    its ``.sim.model.get_xml()`` returns the merged / compiled MJCF as
+    a string (with all ``<include>``s resolved and assets inlined).
+    Robosuite renamed this accessor over the years, so we try a small
+    set of fallbacks before giving up - and we never look at any
+    non-public attributes.
+    """
+    accessors = (
+        # Newer robosuite (>=1.4) - canonical path through the env's MjSim.
+        lambda: env.env.sim.model.get_xml(),
+        # Older robosuite (<1.4) - sometimes exposes the model directly.
+        lambda: env.env.model.get_xml(),
+        # Fallback: ManipulationEnv subclasses sometimes expose the
+        # compiled XML via an explicit ``model.get_model_xml`` helper.
+        lambda: env.env.model.get_model_xml(),  # type: ignore[attr-defined]
+    )
+    last_err: Exception | None = None
+    for accessor in accessors:
+        try:
+            xml = accessor()
+        except Exception as e:  # noqa: BLE001 - try the next accessor
+            last_err = e
+            continue
+        if isinstance(xml, str) and xml.strip():
+            return xml
+    raise RuntimeError(f"could not extract compiled MJCF from libero env (last error: {last_err!r})")
+
+
+# Match a complete ``<camera ... name="OLD" ...>`` declaration so the
+# rename only touches camera definitions, not e.g. material names that
+# happen to share a string. Anchored on the ``camera`` element name and
+# guarded by ``\s+`` to avoid partial-word matches.
+_CAMERA_NAME_RE = re.compile(r'(<camera\b[^>]*\bname=")([^"]+)(")')
+
+
+def _rename_mjcf_cameras(xml: str, aliases: dict[str, str]) -> str:
+    """Rename ``<camera name="OLD"...>`` → ``<camera name="NEW"...>`` per ``aliases``.
+
+    Targeted regex only - we don't parse the whole MJCF. The rename is
+    safe because MuJoCo doesn't allow duplicate ``<camera>`` names within
+    a model, and camera references from external code (e.g.
+    ``sim.render(camera_name=...)``) come from outside the XML so they
+    aren't affected.
+
+    Names not in ``aliases`` pass through unchanged.
+    """
+    if not aliases:
+        return xml
+
+    def _sub(match: re.Match[str]) -> str:
+        head, name, tail = match.group(1), match.group(2), match.group(3)
+        return head + aliases.get(name, name) + tail
+
+    return _CAMERA_NAME_RE.sub(_sub, xml)
 
 
 __all__ = [
