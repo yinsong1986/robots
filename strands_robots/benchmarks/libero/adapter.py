@@ -2815,15 +2815,21 @@ class _LiberoOSCController:
         self.controller.update()
 
         # Pack 6-dim Cartesian delta: (dx, dy, dz, droll, dpitch, dyaw).
-        # Missing keys default to 0 (no-op delta).
+        # Missing keys default to 0 (no-op delta). Each per-key value
+        # may be either a scalar or a 2-element list / array - GR00T-
+        # LIBERO packs ALL action channels (x/y/z/roll/pitch/yaw/gripper)
+        # to match the training-data shape, same convention PR #162
+        # introduced for state.gripper. _to_scalar handles both forms
+        # (and defensive against unexpected shapes) - round 25 only
+        # fixed gripper; round 26 applies the same fix to every key.
         delta = np.array(
             [
-                float(action_dict.get("x", 0.0)),
-                float(action_dict.get("y", 0.0)),
-                float(action_dict.get("z", 0.0)),
-                float(action_dict.get("roll", 0.0)),
-                float(action_dict.get("pitch", 0.0)),
-                float(action_dict.get("yaw", 0.0)),
+                _to_scalar(action_dict.get("x", 0.0)),
+                _to_scalar(action_dict.get("y", 0.0)),
+                _to_scalar(action_dict.get("z", 0.0)),
+                _to_scalar(action_dict.get("roll", 0.0)),
+                _to_scalar(action_dict.get("pitch", 0.0)),
+                _to_scalar(action_dict.get("yaw", 0.0)),
             ],
             dtype=np.float64,
         )
@@ -2856,43 +2862,54 @@ class _LiberoOSCController:
         # Gripper passthrough: the 7th GR00T action channel is
         # an open/close signal. Most LIBERO checkpoints output a
         # scalar in [-1, +1]; positive = close, negative = open.
-        # Write it to all gripper actuators (RoboSuite's gripper
+        # GR00T-LIBERO actually packs it as a 2-element list (PR
+        # #162's training-shape match) - same _to_scalar helper
+        # handles it correctly.
+        #
+        # Write to all gripper actuators (RoboSuite's gripper
         # config typically has 2 finger actuators tied via a
         # tendon, so this works either way).
-        #
-        # Coerce list/tuple/ndarray BEFORE attempting float() (#168
-        # round 25 fix). PR #162 packs ``state.gripper`` and
-        # ``action.gripper`` as 2-element lists to match GR00T-LIBERO's
-        # training shape (server boolean-masks state by per-key
-        # feature dimension; scalar shape fails). So GR00T's response
-        # for the ``gripper`` action key is a 2-element list, NOT a
-        # scalar. ``float([0.5, 0.5])`` raises TypeError; the
-        # round-24 code did the float() unconditionally first and
-        # never reached the list-coercion branch. Result: every
-        # apply() raised, fell through to the no-op name-lookup
-        # path, success_rate stayed at 0 (round-24 verification).
-        gripper_raw = action_dict.get("gripper", 0.0)
-        try:
-            if isinstance(gripper_raw, (list, tuple, np.ndarray)) and len(gripper_raw) > 0:
-                gripper_value = float(gripper_raw[0])
-            else:
-                gripper_value = float(gripper_raw)
-        except (TypeError, ValueError, IndexError) as e:
-            # Defensive against unexpected gripper shapes (None,
-            # empty list, dict, etc.). Treat as no-op gripper rather
-            # than crashing the entire apply() pipeline.
-            logger.warning(
-                "_LiberoOSCController.apply: could not coerce gripper value %r to float (%s); "
-                "treating as 0.0 for this step",
-                gripper_raw,
-                e,
-            )
-            gripper_value = 0.0
+        gripper_value = _to_scalar(action_dict.get("gripper", 0.0))
         for gi in self.gripper_actuator_ids:
             # Clip to actuator ctrlrange to avoid driving past limits.
             lo = float(model.actuator_ctrlrange[gi, 0])
             hi = float(model.actuator_ctrlrange[gi, 1])
             data.ctrl[gi] = max(lo, min(hi, gripper_value))
+
+
+def _to_scalar(value: Any) -> float:
+    """Coerce a GR00T-LIBERO action channel to a scalar float.
+
+    Handles GR00T's training-shape packing where each per-key
+    value may be either a scalar (legacy) or a 2-element list /
+    array / ndarray (current GR00T-LIBERO convention - same pattern
+    PR #162 introduced for ``state.gripper``, applied to every
+    action channel).
+
+    The first round-25 attempt fixed only ``gripper``; round-25
+    verification showed the same ``float(list)`` bug raises on
+    ``x/y/z/roll/pitch/yaw`` too - GR00T sends ALL keys list-shaped.
+    This helper centralises the coercion so all 7 action channels go
+    through the same code path.
+
+    * Scalar input → ``float(value)``
+    * List / tuple / ndarray (non-empty) → ``float(value[0])``
+    * Everything else (None, empty list, dict, etc.) → ``0.0`` after
+      a single WARNING log per call (caller should filter spurious
+      input shapes; here we just degrade gracefully).
+    """
+    try:
+        if isinstance(value, (list, tuple, np.ndarray)) and len(value) > 0:
+            return float(value[0])
+        return float(value)
+    except (TypeError, ValueError, IndexError) as e:
+        logger.warning(
+            "_LiberoOSCController._to_scalar: could not coerce action value %r to float (%s); "
+            "treating as 0.0 for this step",
+            value,
+            e,
+        )
+        return 0.0
 
 
 __all__ = [

@@ -2161,6 +2161,89 @@ class TestInstallActionController:
         nonzero_gripper = sum(1 for t in gripper_ctrls if abs(float(t)) > 1e-6)
         assert nonzero_gripper > 0, f"expected non-zero gripper torques for scalar gripper, got {gripper_ctrls}"
 
+    def test_apply_handles_all_list_shaped_action_keys(self, libero_scene_xml):
+        """ALL 7 GR00T-LIBERO action channels (x/y/z/roll/pitch/yaw/gripper)
+        may be packed as 2-element lists per the training-shape
+        convention introduced in PR #162. The OSC controller must
+        handle this end-to-end without raising.
+
+        Pin for #168 round-26 fix: round-25 only addressed gripper;
+        round-25 verification revealed the same float(list) bug
+        on the EEF delta keys (x, y, z, roll, pitch, yaw). The
+        ``_to_scalar`` helper centralises the coercion so all 7
+        keys go through the same path.
+
+        Test mechanism: send the worst-case shape (every key is a
+        2-element list) and verify the controller produces non-zero
+        arm torques, no exceptions raised.
+        """
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        adapter._install_action_controller(sim)
+        ctrl = sim._world._backend_state.get("action_controller")
+        if ctrl is None:
+            pytest.skip("action_controller install failed")
+
+        sim._world._data.ctrl[:] = 0  # type: ignore[attr-defined]
+
+        # ALL keys list-shaped (the actual GR00T-LIBERO format).
+        action = {
+            "x": [0.05, 0.05],
+            "y": [0.0, 0.0],
+            "z": [0.0, 0.0],
+            "roll": [0.0, 0.0],
+            "pitch": [0.0, 0.0],
+            "yaw": [0.0, 0.0],
+            "gripper": [0.5, 0.5],
+        }
+        # Must NOT raise.
+        ctrl.apply(action, sim._world._model, sim._world._data, "robot")  # type: ignore[attr-defined]
+
+        # Arm torques produced.
+        arm_torques = [sim._world._data.ctrl[i] for i in ctrl.arm_actuator_ids]  # type: ignore[attr-defined]
+        nonzero_arm = sum(1 for t in arm_torques if abs(float(t)) > 1e-6)
+        assert nonzero_arm > 0, (
+            f"expected non-zero arm torques after apply with all-list action, got {arm_torques}. "
+            f"_to_scalar may not be applied to all 6 EEF delta keys."
+        )
+
+    def test_to_scalar_helper_handles_all_input_shapes(self):
+        """Direct unit test of the ``_to_scalar`` helper. Pin the
+        contract: scalar / list / tuple / ndarray / None / empty / dict
+        all produce a sensible float without raising."""
+        pytest.importorskip("mujoco")
+        from strands_robots.benchmarks.libero.adapter import _to_scalar
+
+        # Scalar inputs.
+        assert _to_scalar(0.5) == 0.5
+        assert _to_scalar(1) == 1.0
+        assert _to_scalar(0.0) == 0.0
+
+        # List/tuple/ndarray (non-empty) - takes first element.
+        assert _to_scalar([0.5, 0.5]) == 0.5
+        assert _to_scalar((1.5, 2.5)) == 1.5
+        assert _to_scalar(np.array([0.7, 0.8, 0.9])) == 0.7
+
+        # Edge cases - degrade to 0.0 with WARNING log (non-fatal).
+        assert _to_scalar(None) == 0.0
+        assert _to_scalar([]) == 0.0
+        assert _to_scalar(()) == 0.0
+        assert _to_scalar({"key": "value"}) == 0.0
+        assert _to_scalar("not a number") == 0.0
+
 
 class TestPrewarmFreshEpisodeZero:
     """Round 17: ``on_episode_start`` detects the prewarm-fresh ep0
