@@ -1995,6 +1995,233 @@ class TestPreRegisterDefaultRobot:
         # Wrapper name is the canonical "robot" key.
         assert wrapper.name == "robot"
 
+    def test_module_helper_build_scene_robot_wrapper_includes_gripper_prefix(self):
+        """``_build_scene_robot_wrapper`` with ``gripper_prefix=`` includes
+        joints / actuators from BOTH namespaces. Pin for #168 round-5
+        bug G: RoboSuite uses ``robot0_*`` for arm joints and
+        ``gripper0_*`` for gripper finger joints; previously the wrapper
+        scoped to ``robot0_`` only and silently dropped
+        ``gripper0_finger_joint{1,2}`` from ``wrapper.joint_names``,
+        causing ``obs.get('gripper0_finger_joint1')`` to return None and
+        the GR00T server to reject every observation with
+        ``State key 'state.gripper' must be in observation``."""
+        from strands_robots.benchmarks.libero.adapter import _build_scene_robot_wrapper
+
+        body_names = ["world", "robot0_base", "robot0_link0", "robot0_right_hand", "gripper0_eef"]
+        # Mix arm + gripper joints in a realistic interleaved order.
+        joint_names = [
+            "robot0_joint1",
+            "robot0_joint2",
+            "robot0_joint7",
+            "gripper0_finger_joint1",
+            "gripper0_finger_joint2",
+            "table_joint",  # unrelated; must NOT be included
+        ]
+        actuator_names = [
+            "robot0_act1",
+            "robot0_act7",
+            "gripper0_finger_act",
+            "table_act",  # unrelated
+        ]
+
+        class _Mj:
+            class mjtObj:
+                mjOBJ_BODY = 1
+                mjOBJ_JOINT = 3
+                mjOBJ_ACTUATOR = 5
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                if obj_type == 1:
+                    return body_names[idx] if idx < len(body_names) else None
+                if obj_type == 3:
+                    return joint_names[idx] if idx < len(joint_names) else None
+                if obj_type == 5:
+                    return actuator_names[idx] if idx < len(actuator_names) else None
+                return None
+
+        class _Model:
+            nbody = len(body_names)
+            njnt = len(joint_names)
+            nu = len(actuator_names)
+            body_parentid = [0] * len(body_names)
+
+        wrapper = _build_scene_robot_wrapper(
+            _Mj(),
+            _Model(),
+            prefix="robot0_",
+            gripper_prefix="gripper0_",
+        )
+        assert wrapper is not None
+        # All three arm joints + both gripper joints present, in scan order.
+        assert wrapper.joint_names == [
+            "robot0_joint1",
+            "robot0_joint2",
+            "robot0_joint7",
+            "gripper0_finger_joint1",
+            "gripper0_finger_joint2",
+        ]
+        # Both arm actuators + the gripper actuator present (3 total).
+        assert len(wrapper.actuator_ids) == 3
+        # Namespace remains the arm prefix - the gripper prefix is a
+        # filtering hint, not a namespace replacement.
+        assert wrapper.namespace == "robot0_"
+
+    def test_module_helper_build_scene_robot_wrapper_no_gripper_prefix_drops_gripper_joints(self):
+        """Default ``gripper_prefix=None`` keeps the legacy single-prefix
+        behaviour - gripper joints are NOT included. Pin for backwards
+        compat: callers passing only ``prefix=`` get exactly the same
+        wrapper as before #168 round 6."""
+        from strands_robots.benchmarks.libero.adapter import _build_scene_robot_wrapper
+
+        body_names = ["world", "robot0_base", "robot0_right_hand"]
+        joint_names = ["robot0_joint1", "gripper0_finger_joint1"]
+        actuator_names = ["robot0_act1", "gripper0_finger_act"]
+
+        class _Mj:
+            class mjtObj:
+                mjOBJ_BODY = 1
+                mjOBJ_JOINT = 3
+                mjOBJ_ACTUATOR = 5
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                if obj_type == 1:
+                    return body_names[idx] if idx < len(body_names) else None
+                if obj_type == 3:
+                    return joint_names[idx] if idx < len(joint_names) else None
+                if obj_type == 5:
+                    return actuator_names[idx] if idx < len(actuator_names) else None
+                return None
+
+        class _Model:
+            nbody = len(body_names)
+            njnt = len(joint_names)
+            nu = len(actuator_names)
+            body_parentid = [0] * len(body_names)
+
+        wrapper = _build_scene_robot_wrapper(_Mj(), _Model(), prefix="robot0_")
+        assert wrapper is not None
+        # Only the arm joint included.
+        assert wrapper.joint_names == ["robot0_joint1"]
+        # Only the arm actuator.
+        assert len(wrapper.actuator_ids) == 1
+
+    def test_module_helper_build_scene_robot_wrapper_empty_gripper_prefix_drops_gripper(self):
+        """Explicit ``gripper_prefix=""`` (falsy) is treated the same as
+        ``None`` - no gripper joints included. Required because some
+        callers may want to disable the dual-prefix path while leaving
+        ``scene_gripper_prefix`` set on the adapter for use by the
+        eef/gripper auto-resolver only."""
+        from strands_robots.benchmarks.libero.adapter import _build_scene_robot_wrapper
+
+        body_names = ["world", "robot0_base", "robot0_right_hand"]
+        joint_names = ["robot0_joint1", "gripper0_finger_joint1"]
+        actuator_names = ["robot0_act1", "gripper0_finger_act"]
+
+        class _Mj:
+            class mjtObj:
+                mjOBJ_BODY = 1
+                mjOBJ_JOINT = 3
+                mjOBJ_ACTUATOR = 5
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                if obj_type == 1:
+                    return body_names[idx] if idx < len(body_names) else None
+                if obj_type == 3:
+                    return joint_names[idx] if idx < len(joint_names) else None
+                if obj_type == 5:
+                    return actuator_names[idx] if idx < len(actuator_names) else None
+                return None
+
+        class _Model:
+            nbody = len(body_names)
+            njnt = len(joint_names)
+            nu = len(actuator_names)
+            body_parentid = [0] * len(body_names)
+
+        wrapper = _build_scene_robot_wrapper(
+            _Mj(),
+            _Model(),
+            prefix="robot0_",
+            gripper_prefix="",
+        )
+        assert wrapper is not None
+        assert wrapper.joint_names == ["robot0_joint1"]
+        assert len(wrapper.actuator_ids) == 1
+
+    def test_register_default_robot_forwards_scene_gripper_prefix(self, tmp_path):
+        """End-to-end: ``LiberoAdapter`` with default
+        ``scene_gripper_prefix='gripper0_'`` produces a wrapper whose
+        ``joint_names`` includes BOTH the arm and gripper joints. Pin
+        for the actual round-6 fix path: previously the adapter's
+        ``_register_default_robot`` only forwarded ``scene_robot_prefix``
+        and the wrapper silently dropped gripper joints."""
+        adapter = self._scene_path_setup(tmp_path)
+        # Build a model with arm + gripper joints (the realistic LIBERO layout)
+        body_names = ["world", "robot0_base", "robot0_right_hand"]
+        joint_names = [f"robot0_joint{i}" for i in range(1, 8)] + [
+            "gripper0_finger_joint1",
+            "gripper0_finger_joint2",
+        ]
+        actuator_names = [f"robot0_act{i}" for i in range(1, 8)] + ["gripper0_finger_act"]
+
+        class _FakeMjEnum:
+            mjOBJ_BODY = 1
+            mjOBJ_JOINT = 3
+            mjOBJ_ACTUATOR = 5
+
+        class _Model:
+            nbody = len(body_names)
+            njnt = len(joint_names)
+            nu = len(actuator_names)
+            body_parentid: list[int] = []
+
+        model = _Model()
+        model.body_parentid = [0] * len(body_names)
+
+        class _Mj:
+            mjtObj = _FakeMjEnum()
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                if obj_type == 1:
+                    return body_names[idx] if 0 <= idx < len(body_names) else None
+                if obj_type == 3:
+                    return joint_names[idx] if 0 <= idx < len(joint_names) else None
+                if obj_type == 5:
+                    return actuator_names[idx] if 0 <= idx < len(actuator_names) else None
+                return None
+
+            @staticmethod
+            def mj_name2id(model, obj_type, name):  # noqa: ARG004
+                pool = {1: body_names, 3: joint_names, 5: actuator_names}.get(obj_type, [])
+                try:
+                    return pool.index(name)
+                except ValueError:
+                    return -1
+
+        sim = FakeSim(data_config="panda")
+        sim._world.robots.clear()
+        sim._world._model = model  # type: ignore[attr-defined]
+
+        with patch.dict("sys.modules", {"mujoco": _Mj()}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        wrapper = sim._world.robots["robot"]
+        # Critical assertion: gripper finger joints must be in the wrapper's
+        # observation surface so the upstream get_observation populates them.
+        assert "gripper0_finger_joint1" in wrapper.joint_names
+        assert "gripper0_finger_joint2" in wrapper.joint_names
+        # Plus all 7 arm joints.
+        for i in range(1, 8):
+            assert f"robot0_joint{i}" in wrapper.joint_names
+        # Total: 7 arm + 2 gripper = 9 joints.
+        assert len(wrapper.joint_names) == 9
+        # Total: 7 arm actuators + 1 gripper actuator = 8 actuators.
+        assert len(wrapper.actuator_ids) == 8
+
 
 class TestResolveSceneEefAndGripper:
     """``LiberoAdapter._resolve_scene_eef_and_gripper`` overrides the

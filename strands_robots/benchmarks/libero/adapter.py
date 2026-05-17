@@ -892,7 +892,12 @@ class LiberoAdapter(BenchmarkProtocol):
             return
 
         try:
-            wrapper = _build_scene_robot_wrapper(_mj, model, prefix=self._scene_robot_prefix)
+            wrapper = _build_scene_robot_wrapper(
+                _mj,
+                model,
+                prefix=self._scene_robot_prefix,
+                gripper_prefix=self._scene_gripper_prefix,
+            )
         except Exception as e:  # noqa: BLE001 - never abort eval on a discovery failure
             logger.warning(
                 "LiberoAdapter: scene-Panda discovery failed: %s; super() will fall back to its add_robot path",
@@ -910,8 +915,10 @@ class LiberoAdapter(BenchmarkProtocol):
         # list_robots() check finds it.
         world.robots["robot"] = wrapper
         logger.debug(
-            "LiberoAdapter: registered scene-supplied Panda %r as 'robot' (joints=%d, actuators=%d)",
+            "LiberoAdapter: registered scene-supplied Panda (arm prefix=%r, gripper prefix=%r) as 'robot' "
+            "(joints=%d, actuators=%d)",
             self._scene_robot_prefix,
+            self._scene_gripper_prefix,
             len(wrapper.joint_names),
             len(wrapper.actuator_ids),
         )
@@ -1525,20 +1532,48 @@ def _rename_mjcf_cameras(xml: str, aliases: dict[str, str]) -> str:
     return _CAMERA_NAME_RE.sub(_sub, xml)
 
 
-def _build_scene_robot_wrapper(mj: Any, model: Any, *, prefix: str) -> SimRobot | None:
+def _build_scene_robot_wrapper(
+    mj: Any,
+    model: Any,
+    *,
+    prefix: str,
+    gripper_prefix: str | None = None,
+) -> SimRobot | None:
     """Construct a :class:`SimRobot` for an existing scene-supplied Panda.
 
     Walks the compiled MuJoCo ``model`` looking for bodies / joints /
     actuators whose names start with ``prefix`` (default ``"robot0_"``,
-    matching RoboSuite / LIBERO's canonical naming). Returns a
-    :class:`SimRobot` whose IDs and namespace are filled in from the
-    discovered names, or ``None`` when no body matches.
+    matching RoboSuite / LIBERO's canonical naming for the arm). When
+    ``gripper_prefix`` is non-empty, joints AND actuators starting with
+    *either* prefix are included in the wrapper - this is critical for
+    RoboSuite-emitted scenes because the gripper has its own namespace
+    (``gripper0_``) separate from the arm's (``robot0_``). Without the
+    gripper prefix, ``gripper0_finger_joint{1,2}`` and the gripper
+    actuator would be silently dropped from ``wrapper.joint_names`` and
+    ``wrapper.actuator_ids``, the upstream observation pipeline would
+    omit them from ``obs``, and downstream code looking up
+    ``obs.get("gripper0_finger_joint1")`` (e.g.
+    :meth:`LiberoAdapter.augment_observation` after
+    :meth:`_resolve_scene_eef_and_gripper` resolves the gripper joint)
+    would silently get ``None``. That manifests as
+    ``state.gripper`` being omitted from the GR00T request and the
+    server rejecting with ``State key 'state.gripper' must be in
+    observation`` (#168 round-5 bug G).
+
+    Body discovery uses ``prefix`` only - in RoboSuite/LIBERO MJCFs the
+    gripper is mounted as a child body of the arm's last link, not a
+    root-level body, so its bodies don't need to be in the joint-pool
+    filter. We just need the joints / actuators that move it.
+
+    Returns a :class:`SimRobot` whose IDs and namespace are filled in
+    from the discovered names, or ``None`` when no body matches the arm
+    prefix.
 
     The returned wrapper is only useful for **populating
     ``world.robots``** so ``BenchmarkProtocol.on_episode_start``'s
     ``list_robots()`` check returns non-empty. It is NOT a substitute
     for the wrapper that ``Simulation.add_robot`` builds via
-    ``inject_robot_into_scene`` — that call also recompiles the spec
+    ``inject_robot_into_scene`` - that call also recompiles the spec
     and registers tendon / actuator side-effects we don't want here.
     The whole point of this discovery path is to avoid that recompile.
 
@@ -1588,18 +1623,30 @@ def _build_scene_robot_wrapper(mj: Any, model: Any, *, prefix: str) -> SimRobot 
     if root_body_id < 0:
         return None
 
+    # Build the prefix-set for joint/actuator filtering. RoboSuite-style
+    # scenes split the arm and gripper into TWO namespaces (e.g.
+    # ``robot0_*`` for arm joints, ``gripper0_*`` for gripper finger
+    # joints). The wrapper needs to include both so the upstream
+    # observation pipeline surfaces ``state.gripper`` to the policy.
+    joint_prefixes: tuple[str, ...] = (prefix,)
+    if gripper_prefix:
+        joint_prefixes = (prefix, gripper_prefix)
+
+    def _starts_with_any(name: object) -> bool:
+        return isinstance(name, str) and any(name.startswith(p) for p in joint_prefixes if p)
+
     joint_names: list[str] = []
     joint_ids: list[int] = []
     for i in range(njnt):
         name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT, i)
-        if isinstance(name, str) and name.startswith(prefix):
-            joint_names.append(name)
+        if _starts_with_any(name):
+            joint_names.append(name)  # type: ignore[arg-type]
             joint_ids.append(i)
 
     actuator_ids: list[int] = []
     for i in range(nu):
         name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_ACTUATOR, i)
-        if isinstance(name, str) and name.startswith(prefix):
+        if _starts_with_any(name):
             actuator_ids.append(i)
 
     return SimRobot(
