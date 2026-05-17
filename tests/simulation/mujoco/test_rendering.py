@@ -238,38 +238,51 @@ def test_render_passes_scene_option_to_renderer(tmp_path: Path) -> None:
     sim.destroy()
 
 
-# Recorder thread starts capturing immediately - no in-thread warmup
-# (#168 round-14: rounds 11/12/13 attempted to add a warmup loop here
-# to fix bug D, but the actual root cause was missing mj_forward, fixed
-# in LiberoAdapter.prewarm. The warmup loop is now removed; this test
-# pins the no-warmup contract.)
+# Recorder thread warms up its GL context before the capture loop
+# (#168 round-20: re-applies the round-13 2-pass thread-side warmup
+# now that round-15's mj_forward in load_scene + round-17's
+# prewarm-fresh-ep0 fast-path are in place. Variant-B verification
+# in round 19 confirmed thread-isolation makes main-thread warmup
+# ineffective; the recorder thread needs its own warmup to bind its
+# own mujoco.egl.GLContext.)
 
 
 @_requires_mujoco
-def test_recorder_thread_starts_capturing_immediately() -> None:
-    """The recorder thread's ``_loop`` does NOT do any pre-capture
-    warmup renders. Capture starts on iteration 1 of the timing loop.
+def test_recorder_thread_warms_up_two_passes_before_capture() -> None:
+    """The recorder thread does TWO synchronous renders per camera at
+    the start of its ``_loop`` body, BEFORE the timing loop begins
+    capturing into buffers.
 
-    Why no warmup (#168 round-14): rounds 11/12/13 added a warmup loop
-    inside ``_loop`` to fix the bug-D gradient at t=0. Round-13
-    verification revealed the actual cause was that
-    ``mj_forward(model, data)`` hadn't been called - so
-    ``data.xpos / data.xmat`` were unset and ``Renderer.update_scene``
-    returned the skybox-only gradient regardless of how many warmup
-    renders fired. The fix moved to
-    :meth:`LiberoAdapter.prewarm`, which calls ``mj_forward`` before
-    the recorder thread launches. The warmup loop in ``_loop`` was
-    obsolete and is removed in round 14.
+    Why two passes (round-13/round-20): MuJoCo's shared ``Renderer``
+    rebinds the active camera on each ``update_scene(camera=X)``
+    call. The FIRST render after a camera switch returns a
+    cold-start readback even if the GL context is otherwise warm.
+    With one pass per camera, warming ends on the LAST camera and
+    the first capture render of the FIRST camera cold-starts again,
+    producing a skybox-only gradient at t=0. Two passes guarantee
+    every camera has had two consecutive renders by the time
+    capture starts.
 
-    This test pins the no-warmup contract. If a future change re-adds
-    the warmup loop without addressing the underlying mj_forward
-    issue, this test fails (catches regression to round-13 thinking).
+    Why thread-side and not main-thread (#168 round-19 verification):
+    MuJoCo's ``mujoco.GLContext.make_current()`` is thread-bound.
+    A main-thread warmup binds only the main thread's context;
+    the daemon thread starts cold and its first ~15 renders
+    return GL clear-colour gradient until the context settles.
 
-    Test mechanism: mock ``threading.Thread`` to capture ``_loop``
-    without starting it; pre-set ``state["running"]=False`` so the
-    timing loop body is skipped immediately; invoke ``_loop``
-    synchronously. With no warmup loop, the captured render-call
-    list should be empty.
+    History: rounds 11/12/13 added thread-side warmup; round 14
+    reverted it because the load-scene-without-mj_forward bug was
+    the bigger issue. Round 15 fixed mj_forward in load_scene,
+    making warmup unnecessary in the slow path. But round 17's
+    prewarm-fresh-ep0 fast-path skips load_scene, so the warmup
+    is still needed for that path. Round 20 re-applies the
+    2-pass warmup to cover both paths.
+
+    Test mechanism: mock ``threading.Thread`` to capture
+    ``_loop`` without starting it, pre-set
+    ``state["running"]=False`` so the timing loop exits
+    immediately after warmup. Render calls accumulated during
+    the synchronous invocation are exactly the warmup renders
+    (2 per camera = 2 x n_cameras).
     """
     pytest.importorskip("mujoco")
     os.environ.setdefault("MUJOCO_GL", "glfw")
@@ -313,21 +326,74 @@ def test_recorder_thread_starts_capturing_immediately() -> None:
                 fps=20,
                 width=64,
                 height=48,
-                name="no_warmup_test",
+                name="warmup_test",
             )
             assert r["status"] == "success", r
             assert len(captured_targets) == 1
-
-            # Pre-set running=False so the timing loop body never executes.
-            # If there's no warmup loop, _loop should return without any renders.
+            # Pre-set running=False so timing loop body skipped;
+            # only warmup runs.
             sim._cams_rec_state["running"] = False
             captured_targets[0]()  # invoke _loop synchronously
 
-    # Round-14 contract: NO renders happen during _loop when
-    # running is already False. The warmup loop has been removed.
-    assert render_calls == [], (
-        f"expected no warmup renders in _loop (mj_forward in prewarm handles bug D); got {render_calls}"
+    # Round-20 contract: TWO warmup passes, in scan order:
+    # cam_a, cam_b, cam_a, cam_b - 4 total renders, alternating.
+    assert render_calls == ["cam_a", "cam_b", "cam_a", "cam_b"], (
+        f"expected two warmup passes (4 renders alternating), got {render_calls}"
     )
+
+    sim.destroy()
+
+
+@_requires_mujoco
+def test_recorder_thread_warmup_failure_does_not_abort() -> None:
+    """If the thread-side warmup render raises, the timing loop
+    still starts (and accumulates ``state['errors'][cam]`` per the
+    standard error-tracking path).
+
+    Required because warmup failure shouldn't crash the recorder
+    thread; persistent failures will surface via
+    :meth:`get_cameras_recording_status`."""
+    pytest.importorskip("mujoco")
+    os.environ.setdefault("MUJOCO_GL", "glfw")
+
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    sim.create_world()
+    sim.add_robot("arm", data_config="so101", position=[0.0, 0.0, 0.0])
+    sim.add_camera("cam", position=[0.5, 0, 0.5], target=[0, 0, 0])
+
+    def boom(camera_name: str, width=None, height=None):
+        raise RuntimeError(f"simulated warmup failure on {camera_name}")
+
+    captured_targets: list = []
+
+    class _CaptureThread:
+        def __init__(self, target=None, daemon=None) -> None:
+            self.target = target
+
+        def start(self) -> None:
+            captured_targets.append(self.target)
+
+        def is_alive(self) -> bool:
+            return False
+
+    with patch.object(sim, "render", side_effect=boom):
+        with patch("threading.Thread", _CaptureThread):
+            r = sim.start_cameras_recording(
+                cameras=["cam"],
+                output_dir="/tmp",
+                fps=20,
+                width=64,
+                height=48,
+                name="warmup_fail_test",
+            )
+            assert r["status"] == "success", r
+            assert len(captured_targets) == 1
+            # Stop the timing loop before invoking _loop.
+            sim._cams_rec_state["running"] = False
+            # Must not raise even though warmup renders all raise.
+            captured_targets[0]()
 
     sim.destroy()
 

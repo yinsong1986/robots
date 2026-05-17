@@ -762,6 +762,55 @@ class RenderingMixin:
         def _loop():
             from strands_robots.simulation.policy_runner import _extract_frame_ndarray
 
+            # Warm up the recorder thread's GL context BEFORE the
+            # timing loop starts capturing into buffers. MuJoCo's
+            # ``mujoco.GLContext.make_current()`` is thread-bound:
+            # ``mujoco.egl.GLContext`` allocates a fresh EGL context
+            # per calling thread. A main-thread ``sim.render()`` call
+            # warms only the main thread's context; this daemon
+            # thread starts cold. Without this warmup the first ~15
+            # render calls return the GL clear-colour gradient
+            # before the context settles.
+            #
+            # Two passes per camera. The first pass binds the GL
+            # context for the camera; the second pass produces the
+            # real geometry (the per-camera ``update_scene`` rebind
+            # cold-starts on a fresh thread, so single-pass leaves
+            # the FIRST rendered camera cold while subsequent ones
+            # warm — round-12 verification showed this asymmetry on
+            # multi-camera recordings, fixed by going to 2 passes
+            # in round 13).
+            #
+            # History: rounds 11/12/13 added a thread-side warmup;
+            # round 14 reverted it because the load-scene-without-
+            # mj_forward bug was the bigger issue at the time. Round
+            # 15 added ``mj_forward`` to ``Simulation.load_scene``,
+            # which made the warmup unnecessary IN THE SLOW PATH
+            # (where on_episode_start re-runs load_scene). But the
+            # round-17 prewarm-fresh-ep0 fast-path skips load_scene,
+            # leaving no per-recorder-thread render before the
+            # capture loop fires. Round 19 tried main-thread warmup;
+            # round-19 verification confirmed thread-isolation makes
+            # that ineffective. Round 20: re-apply the round-13
+            # 2-pass thread-side warmup, now in conjunction with the
+            # round-15 ``mj_forward`` and the round-17 fast-path.
+            #
+            # Cost: ``~33 ms x 2 passes x n_cameras`` at thread
+            # startup. For 2-camera LIBERO that's ~132 ms, invisible
+            # vs the 250+ s eval wall-time.
+            #
+            # Errors during warmup are swallowed at DEBUG. Persistent
+            # render failures will resurface as
+            # ``state["errors"][cam]`` accumulating in the timing
+            # loop below (visible via
+            # :meth:`get_cameras_recording_status`).
+            for _ in range(2):
+                for cam in names:
+                    try:
+                        self.render(camera_name=cam, width=width, height=height)
+                    except Exception as e:  # noqa: BLE001 - warmup failures non-fatal
+                        logger.debug("recorder thread warmup render failed for %s: %s", cam, e)
+
             interval = 1.0 / fps
             while state["running"]:
                 t0 = _time.time()
