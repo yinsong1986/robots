@@ -243,26 +243,37 @@ def test_render_passes_scene_option_to_renderer(tmp_path: Path) -> None:
 
 @_requires_mujoco
 def test_recorder_thread_warms_up_renderer_before_capture_loop() -> None:
-    """The recorder thread does one synchronous render per camera at
+    """The recorder thread does TWO synchronous renders per camera at
     the START of its ``_loop`` body, BEFORE the timing loop begins
     capturing into buffers.
 
-    Why this and not main-thread warmup: MuJoCo's
-    ``mujoco.GLContext.make_current()`` binds to the calling thread.
-    A warmup render performed in the main thread (i.e. before
-    ``state["thread"].start()``) doesn't propagate to the daemon
-    thread - the daemon thread has its own cold-start GL context on
-    its first call. Round 11 attempted main-thread warmup and
-    verification confirmed t=0 frame still rendered as a skybox-only
-    gradient (col-std 0.62) because of this thread boundary. The
-    thread-side warmup tested here is the round-12 fix.
+    Why two passes (round-13 fix): MuJoCo's shared ``Renderer``
+    rebinds the active camera on each ``update_scene(camera=X)``
+    call. The FIRST render after a camera switch returns a
+    cold-start readback even if the GL context is warm. With one
+    pass per camera (the round-12 attempt), warming ended on the
+    LAST camera and the first capture render of the FIRST camera
+    cold-started again, producing a skybox-only gradient at t=0.
+    Two passes guarantee every camera has had two consecutive
+    renders by the time capture starts; whichever camera is rendered
+    first in capture iter 1 has already been warmed twice and lands
+    on the warm path.
+
+    Why thread-side and not main-thread (round-11 vs round-12):
+    MuJoCo's ``mujoco.GLContext.make_current()`` binds to the
+    calling thread. A warmup performed in the main thread (i.e.
+    before ``state["thread"].start()``) doesn't propagate to the
+    daemon thread - the daemon has its own cold-start GL context on
+    its first call. Round 11 attempted main-thread warmup; round-11
+    verification confirmed t=0 frame still rendered as a gradient
+    because of this thread boundary.
 
     Test mechanism: mock ``threading.Thread`` to capture the
     ``_loop`` target without starting it, then invoke ``_loop``
     directly with ``state["running"]`` pre-set to False so the
     timing loop exits immediately after warmup. Render calls
     accumulated during the synchronous invocation are exactly the
-    warmup renders (one per camera).
+    warmup renders (two per camera = 2 x n_cameras).
     """
     pytest.importorskip("mujoco")
     os.environ.setdefault("MUJOCO_GL", "glfw")
@@ -310,7 +321,7 @@ def test_recorder_thread_warms_up_renderer_before_capture_loop() -> None:
             )
             assert r["status"] == "success", r
             # Round 12: NO render calls have happened yet - warmup is
-            # now inside _loop, which the mocked Thread didn't start.
+            # inside _loop, which the mocked Thread didn't start.
             assert render_calls == [], f"unexpected render calls before _loop ran: {render_calls}"
             # The thread target was captured.
             assert len(captured_targets) == 1
@@ -321,9 +332,11 @@ def test_recorder_thread_warms_up_renderer_before_capture_loop() -> None:
             sim._cams_rec_state["running"] = False
             captured_targets[0]()  # invoke _loop synchronously
 
-    # Exactly one render per camera, in scan order, from the warmup
-    # at the top of _loop (no timing-loop calls because running=False).
-    assert render_calls == ["cam_a", "cam_b"], f"expected one warmup render per camera, got {render_calls}"
+    # Round 13 contract: TWO warmup passes, in scan order.
+    # cam_a, cam_b, cam_a, cam_b - 4 total renders, alternating.
+    assert render_calls == ["cam_a", "cam_b", "cam_a", "cam_b"], (
+        f"expected two warmup passes (4 renders alternating), got {render_calls}"
+    )
 
     sim.destroy()
 
