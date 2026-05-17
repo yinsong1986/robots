@@ -2828,6 +2828,251 @@ class TestInstallActionController:
         ctrl.reset()
         np.testing.assert_array_equal(ctrl._gripper_current_action, np.zeros(2))
 
+    def test_action_log_disabled_by_default(self, libero_scene_xml, monkeypatch):
+        """Round 29 (#168): ``STRANDS_LIBERO_ACTION_LOG`` is opt-in.
+        When unset (or any value other than 1/true/yes/on),
+        ``_action_log_enabled`` is False and ``apply()`` emits no
+        diagnostic INFO lines.
+
+        Pin so a future bug doesn't accidentally enable it by default
+        (which would flood production eval logs) or change the parsing
+        rules (which would break operator muscle memory)."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import mujoco
+
+        monkeypatch.delenv("STRANDS_LIBERO_ACTION_LOG", raising=False)
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        adapter._install_action_controller(sim)
+        ctrl = sim._world._backend_state.get("action_controller")
+        if ctrl is None:
+            pytest.skip("action_controller install failed")
+
+        assert ctrl._action_log_enabled is False
+        assert ctrl._action_log_step == 0
+
+    def test_action_log_enabled_emits_one_log_per_apply(self, libero_scene_xml, monkeypatch, caplog):
+        """Round 29 (#168): with ``STRANDS_LIBERO_ACTION_LOG=1`` and
+        a fresh controller, each ``apply()`` call emits exactly one
+        ``ACTION_LOG`` INFO log line containing the diagnostic
+        fields (``action_keys``, ``delta``, ``gripper_value``,
+        ``eef_pos_pre``, ``eef_pos_post``, ``arm_ctrl_pre/post``,
+        ``arm_qpos_pre/post``, ``gripper_ctrl_pre/post``,
+        ``gripper_current_pre/post``).
+
+        Pin so a future refactor that drops the structured log line
+        fails loudly here — the field set is the diagnostic contract
+        for PR #168 round-29."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import logging as _logging
+
+        import mujoco
+
+        monkeypatch.setenv("STRANDS_LIBERO_ACTION_LOG", "1")
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        adapter._install_action_controller(sim)
+        ctrl = sim._world._backend_state.get("action_controller")
+        if ctrl is None:
+            pytest.skip("action_controller install failed")
+
+        assert ctrl._action_log_enabled is True
+
+        action = {
+            "x": [0.01, 0.01],
+            "y": [0.0, 0.0],
+            "z": [0.0, 0.0],
+            "roll": [0.0, 0.0],
+            "pitch": [0.0, 0.0],
+            "yaw": [0.0, 0.0],
+            "gripper": [1.0, 1.0],
+        }
+
+        # The structured log line is emitted at INFO from
+        # ``strands_robots.benchmarks.libero.adapter`` logger.
+        with caplog.at_level(_logging.INFO, logger="strands_robots.benchmarks.libero.adapter"):
+            ctrl.apply(action, sim._world._model, sim._world._data, "robot")  # type: ignore[attr-defined]
+
+        action_log_lines = [r for r in caplog.records if "ACTION_LOG" in r.getMessage()]
+        assert len(action_log_lines) == 1, f"expected exactly 1 ACTION_LOG line, got {len(action_log_lines)}"
+
+        msg = action_log_lines[0].getMessage()
+        # Diagnostic-field contract — every name in this list must be
+        # present in every emitted log line. Reviewers grep these.
+        for field in [
+            "step=0",
+            "action_keys=",
+            "delta=",
+            "gripper_value=",
+            "eef_pos_pre=",
+            "eef_pos_post=",
+            "eef_pos_delta=",
+            "eef_quat_pre=",
+            "eef_quat_post=",
+            "arm_ctrl_pre=",
+            "arm_ctrl_post=",
+            "arm_qpos_pre=",
+            "arm_qpos_post=",
+            "gripper_ctrl_pre=",
+            "gripper_ctrl_post=",
+            "gripper_current_pre=",
+            "gripper_current_post=",
+        ]:
+            assert field in msg, f"missing field {field!r} in ACTION_LOG: {msg}"
+
+        # Step counter advanced.
+        assert ctrl._action_log_step == 1
+
+    def test_action_log_caps_at_max_steps(self, libero_scene_xml, monkeypatch, caplog):
+        """Round 29 (#168): ``STRANDS_LIBERO_ACTION_LOG_MAX`` caps how
+        many ``apply()`` calls log per episode. After the cap, ``apply``
+        runs silently. Pin so a long episode doesn't flood logs once
+        the diagnostic window has captured what's needed."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import logging as _logging
+
+        import mujoco
+
+        monkeypatch.setenv("STRANDS_LIBERO_ACTION_LOG", "1")
+        monkeypatch.setenv("STRANDS_LIBERO_ACTION_LOG_MAX", "3")
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        adapter._install_action_controller(sim)
+        ctrl = sim._world._backend_state.get("action_controller")
+        if ctrl is None:
+            pytest.skip("action_controller install failed")
+
+        assert ctrl._action_log_max == 3
+
+        action = {
+            "x": [0.0, 0.0],
+            "y": [0.0, 0.0],
+            "z": [0.0, 0.0],
+            "roll": [0.0, 0.0],
+            "pitch": [0.0, 0.0],
+            "yaw": [0.0, 0.0],
+            "gripper": [0.0, 0.0],
+        }
+
+        # Call apply 5 times; only first 3 should log.
+        with caplog.at_level(_logging.INFO, logger="strands_robots.benchmarks.libero.adapter"):
+            for _ in range(5):
+                ctrl.apply(action, sim._world._model, sim._world._data, "robot")  # type: ignore[attr-defined]
+
+        action_log_lines = [r for r in caplog.records if "ACTION_LOG" in r.getMessage()]
+        assert len(action_log_lines) == 3, f"expected 3 ACTION_LOG lines (cap=3), got {len(action_log_lines)}"
+        # Step counter at cap (each log emit increments _action_log_step)
+        assert ctrl._action_log_step == 3
+
+    def test_action_log_resets_on_episode_boundary(self, libero_scene_xml, monkeypatch):
+        """Round 29 (#168): ``reset()`` zeros the per-episode log
+        step counter so each episode logs its own first N steps.
+
+        Without this, the second episode of a multi-episode eval
+        would silently emit no diagnostic logs (counter already
+        at the cap from episode 1)."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import mujoco
+
+        monkeypatch.setenv("STRANDS_LIBERO_ACTION_LOG", "1")
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        adapter._install_action_controller(sim)
+        ctrl = sim._world._backend_state.get("action_controller")
+        if ctrl is None:
+            pytest.skip("action_controller install failed")
+
+        # Drive counter forward.
+        ctrl._action_log_step = 5
+
+        ctrl.reset()
+        assert ctrl._action_log_step == 0, "reset() must zero the per-episode log step counter"
+
+    def test_action_log_invalid_max_value_warns_and_falls_back(self, libero_scene_xml, monkeypatch, caplog):
+        """Round 29 (#168): a malformed ``STRANDS_LIBERO_ACTION_LOG_MAX``
+        (e.g. ``foo``) must log a WARNING and fall back to the
+        default (50), not silently swallow the typo. Mirrors the
+        AGENTS.md rule for ``STRANDS_*`` env vars."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import logging as _logging
+
+        import mujoco
+
+        monkeypatch.setenv("STRANDS_LIBERO_ACTION_LOG", "1")
+        monkeypatch.setenv("STRANDS_LIBERO_ACTION_LOG_MAX", "not-an-int")
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        with caplog.at_level(_logging.WARNING, logger="strands_robots.benchmarks.libero.adapter"):
+            adapter._install_action_controller(sim)
+
+        ctrl = sim._world._backend_state.get("action_controller")
+        if ctrl is None:
+            pytest.skip("action_controller install failed")
+
+        # Default fallback — 50.
+        assert ctrl._action_log_max == 50
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == _logging.WARNING and "STRANDS_LIBERO_ACTION_LOG_MAX" in r.getMessage()
+        ]
+        assert len(warnings) >= 1, "expected a WARNING about malformed STRANDS_LIBERO_ACTION_LOG_MAX"
+
 
 class TestPrewarmFreshEpisodeZero:
     """Round 17: ``on_episode_start`` detects the prewarm-fresh ep0

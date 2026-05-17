@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -2653,11 +2654,15 @@ class _LiberoOSCController:
         model: Any,
         data: Any,
         physics_substeps_per_control: int = 25,
+        eef_site_id: int = -1,
+        arm_qpos_addrs: list[int] | None = None,
     ) -> None:
         self.controller = controller
         self.sim_shim = sim_shim
         self.eef_site_name = eef_site_name
+        self.eef_site_id = int(eef_site_id)
         self.arm_actuator_ids = list(arm_actuator_ids)
+        self.arm_qpos_addrs = list(arm_qpos_addrs) if arm_qpos_addrs is not None else []
         self.gripper_actuator_ids = list(gripper_actuator_ids)
         self.model = model
         self.data = data
@@ -2693,6 +2698,29 @@ class _LiberoOSCController:
             dtype=np.float64,
         )
 
+        # Round 29 (#168) — diagnostic logging gate. Set
+        # ``STRANDS_LIBERO_ACTION_LOG=1`` to emit one structured INFO
+        # log line per ``apply()`` call for the first
+        # ``STRANDS_LIBERO_ACTION_LOG_MAX`` (default 50) calls per
+        # episode. Captures action keys, delta scale, gripper polarity,
+        # EEF tracking, and qpos/ctrl deltas — answers the diagnostic
+        # questions in PR #168 round-28 verification.
+        self._action_log_enabled = os.environ.get("STRANDS_LIBERO_ACTION_LOG", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        try:
+            self._action_log_max = int(os.environ.get("STRANDS_LIBERO_ACTION_LOG_MAX", "50"))
+        except ValueError:
+            logger.warning(
+                "STRANDS_LIBERO_ACTION_LOG_MAX=%r is not an integer; defaulting to 50",
+                os.environ.get("STRANDS_LIBERO_ACTION_LOG_MAX"),
+            )
+            self._action_log_max = 50
+        self._action_log_step: int = 0
+
     def reset(self) -> None:
         """Reset stateful per-episode controller state.
 
@@ -2704,8 +2732,13 @@ class _LiberoOSCController:
         :meth:`LiberoAdapter._install_action_controller` (which itself is
         called from ``on_episode_start``) so each episode starts with a
         canonical ``current_action = [0, 0]``.
+
+        Round 29 (#168): also resets the per-episode action-log step
+        counter so each episode logs its own first N steps when
+        ``STRANDS_LIBERO_ACTION_LOG=1`` is set.
         """
         self._gripper_current_action.fill(0.0)
+        self._action_log_step = 0
 
     @classmethod
     def from_sim(
@@ -2854,7 +2887,9 @@ class _LiberoOSCController:
             controller=controller,
             sim_shim=sim_shim,
             eef_site_name=eef_site_name,
+            eef_site_id=int(site_id),
             arm_actuator_ids=arm_actuator_ids,
+            arm_qpos_addrs=arm_qpos_addrs,
             gripper_actuator_ids=gripper_actuator_ids,
             model=model,
             data=data,
@@ -2975,6 +3010,24 @@ class _LiberoOSCController:
         gripper_sign = float(np.sign(gripper_value))
         ramp_step = np.array([-1.0, 1.0]) * self._GRIPPER_SPEED * gripper_sign
 
+        # Round 29 (#168) — capture pre-step state for diagnostic log.
+        # Gated on ``STRANDS_LIBERO_ACTION_LOG=1`` so production eval
+        # incurs zero cost (single bool check). The full diagnostic
+        # answers PR #168 round-28's "what scale, what frame, what key
+        # naming, does motion track delta" questions in one log line
+        # per step.
+        log_now = self._action_log_enabled and self._action_log_step < self._action_log_max
+        if log_now:
+            pre_eef_pos, pre_eef_quat = self._capture_eef_pose(data)
+            pre_arm_ctrl = np.array([float(data.ctrl[ai]) for ai in self.arm_actuator_ids])
+            pre_arm_qpos = (
+                np.array([float(data.qpos[adr]) for adr in self.arm_qpos_addrs])
+                if self.arm_qpos_addrs
+                else np.zeros(n_arm)
+            )
+            pre_gripper_ctrl = np.array([float(data.ctrl[gi]) for gi in self.gripper_actuator_ids])
+            pre_gripper_current = np.array(self._gripper_current_action)
+
         for _ in range(self.physics_substeps_per_control):
             # OSC: compute torques from current state (controller.update
             # is called inside run_controller via the new_update flag).
@@ -3018,6 +3071,75 @@ class _LiberoOSCController:
                 data.ctrl[gi] = float(val)
 
             mj.mj_step(model, data)
+
+        # Round 29 (#168) — emit one structured log line per apply()
+        # while inside the captured-step window. Captures everything a
+        # reviewer needs to bisect the residual bug: action key names,
+        # delta scale, gripper polarity end-to-end, EEF tracking
+        # (delta vs actual EEF motion), and qpos/ctrl deltas.
+        if log_now:
+            post_eef_pos, post_eef_quat = self._capture_eef_pose(data)
+            post_arm_ctrl = np.array([float(data.ctrl[ai]) for ai in self.arm_actuator_ids])
+            post_arm_qpos = (
+                np.array([float(data.qpos[adr]) for adr in self.arm_qpos_addrs])
+                if self.arm_qpos_addrs
+                else np.zeros(n_arm)
+            )
+            post_gripper_ctrl = np.array([float(data.ctrl[gi]) for gi in self.gripper_actuator_ids])
+            post_gripper_current = np.array(self._gripper_current_action)
+            eef_pos_delta = post_eef_pos - pre_eef_pos
+            logger.info(
+                "ACTION_LOG step=%d "
+                "action_keys=%s "
+                "delta=%s gripper_value=%.4f "
+                "eef_pos_pre=%s eef_pos_post=%s eef_pos_delta=%s "
+                "eef_quat_pre=%s eef_quat_post=%s "
+                "arm_ctrl_pre=%s arm_ctrl_post=%s "
+                "arm_qpos_pre=%s arm_qpos_post=%s "
+                "gripper_ctrl_pre=%s gripper_ctrl_post=%s "
+                "gripper_current_pre=%s gripper_current_post=%s",
+                self._action_log_step,
+                sorted(action_dict.keys()),
+                np.round(delta, 6).tolist(),
+                gripper_value,
+                np.round(pre_eef_pos, 6).tolist(),
+                np.round(post_eef_pos, 6).tolist(),
+                np.round(eef_pos_delta, 6).tolist(),
+                np.round(pre_eef_quat, 4).tolist(),
+                np.round(post_eef_quat, 4).tolist(),
+                np.round(pre_arm_ctrl, 4).tolist(),
+                np.round(post_arm_ctrl, 4).tolist(),
+                np.round(pre_arm_qpos, 4).tolist(),
+                np.round(post_arm_qpos, 4).tolist(),
+                np.round(pre_gripper_ctrl, 6).tolist(),
+                np.round(post_gripper_ctrl, 6).tolist(),
+                np.round(pre_gripper_current, 4).tolist(),
+                np.round(post_gripper_current, 4).tolist(),
+            )
+            self._action_log_step += 1
+
+    def _capture_eef_pose(self, data: Any) -> tuple[np.ndarray, np.ndarray]:
+        """Read EEF position + quaternion from ``data``.
+
+        Round 29 (#168) helper for the diagnostic log path. Returns:
+        - ``pos``: 3-vector ``data.site_xpos[eef_site_id]``
+        - ``quat``: 4-vector unit quaternion (wxyz) computed from
+          ``data.site_xmat[eef_site_id]`` via ``mju_mat2Quat``.
+
+        Returns zero-filled arrays if ``eef_site_id < 0`` (e.g.
+        controller built before the round-29 changes; backwards
+        compat for any pickled/test-injected instances).
+        """
+        if self.eef_site_id < 0:
+            return np.zeros(3), np.zeros(4)
+        pos = np.array(data.site_xpos[self.eef_site_id], dtype=np.float64)
+        xmat = np.asarray(data.site_xmat[self.eef_site_id], dtype=np.float64).reshape(9)
+        quat = np.zeros(4, dtype=np.float64)
+        # Lazy import — adapter must be importable without mujoco.
+        import mujoco as mj
+
+        mj.mju_mat2Quat(quat, xmat)
+        return pos, quat
 
 
 def _to_scalar(value: Any) -> float:
