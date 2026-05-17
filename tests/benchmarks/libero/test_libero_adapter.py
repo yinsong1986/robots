@@ -2553,6 +2553,281 @@ class TestInstallActionController:
 
         sim.destroy()
 
+    def test_gripper_state_initialized_to_zeros(self, libero_scene_xml):
+        """Round 28 (#168): ``_gripper_current_action`` initialises to
+        ``np.zeros(2)`` so the first ``apply()`` call starts from a
+        canonical neutral state. Mirrors RoboSuite's
+        ``GripperModel.__init__`` which sets
+        ``self.current_action = np.zeros(self.dof)``.
+
+        Pin so a future change to the init value (e.g. mid-range) doesn't
+        silently bias every grasp attempt."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        adapter._install_action_controller(sim)
+        ctrl = sim._world._backend_state.get("action_controller")
+        if ctrl is None:
+            pytest.skip("action_controller install failed")
+
+        np.testing.assert_array_equal(ctrl._gripper_current_action, np.zeros(2))
+
+    def test_gripper_close_command_drives_both_fingers_to_closed(self, libero_scene_xml):
+        """Round 28 (#168): ``gripper=+1`` (close) must drive BOTH finger
+        ctrl values toward their closed positions, NOT just one.
+
+        Pre-fix bug: writing the raw ``+1`` scalar to both gripper
+        actuators clipped against asymmetric ctrlranges
+        (finger1: ``[0, 0.04]`` where +1 → 0.04 = OPEN; finger2:
+        ``[-0.04, 0]`` where +1 → 0 = closed). One finger moved the
+        wrong way per grasp attempt.
+
+        Post-fix: stateful ramp + bias/weight rescale. After 25
+        substeps of ``+1`` from neutral:
+        - finger1 ctrl moves from 0.02 (mid) toward 0 (closed)
+        - finger2 ctrl moves from -0.02 (mid) toward 0 (closed)
+
+        Both fingers converge to 0 (closed); pin the per-finger sign
+        so the wrong-direction bug can't sneak back."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        adapter._install_action_controller(sim)
+        ctrl = sim._world._backend_state.get("action_controller")
+        if ctrl is None:
+            pytest.skip("action_controller install failed")
+
+        # Find LIBERO's gripper actuator ctrlrange to know what
+        # "closed" looks like per finger. PandaGripper convention:
+        # both fingers' "closed" position is 0.0 (clipped lower bound
+        # of finger1 [0, 0.04]; clipped upper bound of finger2 [-0.04, 0]).
+        gripper_ctrlrange = [
+            (
+                float(sim._world._model.actuator_ctrlrange[gi, 0]),  # type: ignore[attr-defined]
+                float(sim._world._model.actuator_ctrlrange[gi, 1]),  # type: ignore[attr-defined]
+            )
+            for gi in ctrl.gripper_actuator_ids
+        ]
+
+        # Send a close command (+1) for one policy step. Verify EACH
+        # finger's ctrl moved toward its respective closed position.
+        action = {
+            "x": [0.0, 0.0],
+            "y": [0.0, 0.0],
+            "z": [0.0, 0.0],
+            "roll": [0.0, 0.0],
+            "pitch": [0.0, 0.0],
+            "yaw": [0.0, 0.0],
+            "gripper": [1.0, 1.0],  # close
+        }
+        ctrl.apply(action, sim._world._model, sim._world._data, "robot")  # type: ignore[attr-defined]
+
+        # After one apply (25 substeps): current_action ≈ [-0.25, +0.25].
+        np.testing.assert_array_almost_equal(ctrl._gripper_current_action, np.array([-0.25, 0.25]))
+
+        # Closed position per finger:
+        #   finger1: ctrlrange=(0, 0.04) → closed=0
+        #   finger2: ctrlrange=(-0.04, 0) → closed=0
+        # We assert each ctrl moved TOWARD 0 (its closed position).
+        for gi, (lo, hi) in zip(ctrl.gripper_actuator_ids, gripper_ctrlrange, strict=True):
+            ctrl_val = float(sim._world._data.ctrl[gi])  # type: ignore[attr-defined]
+            mid = 0.5 * (hi + lo)  # neutral / "rest" position
+            # closed position is whichever endpoint corresponds to "0"
+            # in the gripper's normalized [-1, +1] frame after rescale.
+            # For PandaGripper both fingers close to 0.
+            closed = 0.0
+            # ctrl_val should be strictly between mid and closed
+            # (i.e. moved toward closed but not yet saturated).
+            assert min(mid, closed) <= ctrl_val <= max(mid, closed), (
+                f"finger ctrl {ctrl_val} not between mid={mid} and closed={closed} (ctrlrange=({lo}, {hi}))"
+            )
+            assert ctrl_val != mid, f"finger ctrl {ctrl_val} didn't move from mid={mid}"
+
+    def test_gripper_close_vs_open_produces_opposite_ctrl_directions(self, libero_scene_xml):
+        """Round 28 (#168): ``gripper=+1`` (close) and ``gripper=-1``
+        (open) must produce ctrl values that move in OPPOSITE directions
+        per finger.
+
+        Pre-fix bug: writing the raw scalar to both fingers meant
+        ``+1`` → finger1 ctrl=0.04 (OPEN, wrong direction!), finger2
+        ctrl=0 (closed). And ``-1`` → finger1 ctrl=0 (closed), finger2
+        ctrl=-0.04 (OPEN). The two commands didn't produce reversed
+        outputs — they each had one finger going wrong, making the
+        gripper effectively un-actuable.
+
+        Post-fix: opposite signs of input produce opposite-sign deltas
+        for ``current_action``, and the bias/weight rescale preserves
+        that into the ctrl values."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+
+        # Run two separate sims/controllers: one drives close, the
+        # other drives open. Then compare resulting ctrl signs.
+        def _drive(gripper_value: float) -> tuple[np.ndarray, np.ndarray]:
+            sim = FakeSim(data_config="panda")
+            sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+            sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+            mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+            adapter._install_action_controller(sim)
+            ctrl = sim._world._backend_state.get("action_controller")
+            assert ctrl is not None
+            action = {
+                "x": [0.0, 0.0],
+                "y": [0.0, 0.0],
+                "z": [0.0, 0.0],
+                "roll": [0.0, 0.0],
+                "pitch": [0.0, 0.0],
+                "yaw": [0.0, 0.0],
+                "gripper": [gripper_value, gripper_value],
+            }
+            ctrl.apply(action, sim._world._model, sim._world._data, "robot")  # type: ignore[attr-defined]
+            return (
+                np.array([float(sim._world._data.ctrl[gi]) for gi in ctrl.gripper_actuator_ids]),  # type: ignore[attr-defined]
+                np.array(ctrl._gripper_current_action),
+            )
+
+        ctrl_close, current_close = _drive(+1.0)
+        ctrl_open, current_open = _drive(-1.0)
+
+        # current_action should be opposite-signed for the two
+        # commands (since ramp = ±[-1, +1] * speed * sign(input)).
+        np.testing.assert_array_almost_equal(current_close, -current_open)
+        # And the ctrl deltas (after bias/weight rescale) too:
+        # they should be opposite-signed deltas around the neutral
+        # bias point.
+        # Bias is the same for both, so delta_close = -delta_open.
+        # We don't know bias exactly without reading ctrlrange, but
+        # we can assert ctrl_close - ctrl_open is non-zero (the
+        # commands actually differ in their effect).
+        assert not np.allclose(ctrl_close, ctrl_open), (
+            f"close and open commands produced identical ctrl values: "
+            f"close={ctrl_close}, open={ctrl_open}. The wrong-direction "
+            f"bug may be back."
+        )
+
+    def test_gripper_state_ramps_across_apply_calls(self, libero_scene_xml):
+        """Round 28 (#168): ``_gripper_current_action`` accumulates
+        across ``apply()`` calls, mirroring RoboSuite's stateful
+        ``PandaGripper.current_action`` ramp.
+
+        Pin so a future refactor that resets the gripper state
+        per-apply (instead of per-episode) silently slows ramping to
+        25 substeps regardless of how long the policy commands close.
+        Real grasps need many policy steps to fully close (8 steps to
+        saturate at 0.01 speed × 25 substeps × 0.01 ramp = 0.25 / step
+        toward unit saturation ⇒ 4 policy steps to reach ±1)."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        adapter._install_action_controller(sim)
+        ctrl = sim._world._backend_state.get("action_controller")
+        if ctrl is None:
+            pytest.skip("action_controller install failed")
+
+        action = {
+            "x": [0.0, 0.0],
+            "y": [0.0, 0.0],
+            "z": [0.0, 0.0],
+            "roll": [0.0, 0.0],
+            "pitch": [0.0, 0.0],
+            "yaw": [0.0, 0.0],
+            "gripper": [1.0, 1.0],  # sustained close
+        }
+
+        # Call apply() three times. Each call ramps current_action by
+        # ~0.25 (25 substeps × 0.01 speed × sign=+1) toward saturation.
+        ctrl.apply(action, sim._world._model, sim._world._data, "robot")  # type: ignore[attr-defined]
+        first = np.array(ctrl._gripper_current_action)
+        ctrl.apply(action, sim._world._model, sim._world._data, "robot")  # type: ignore[attr-defined]
+        second = np.array(ctrl._gripper_current_action)
+        ctrl.apply(action, sim._world._model, sim._world._data, "robot")  # type: ignore[attr-defined]
+        third = np.array(ctrl._gripper_current_action)
+
+        # State must accumulate, not reset.
+        assert np.linalg.norm(second) > np.linalg.norm(first), (
+            f"second apply state {second} not larger magnitude than first {first}; ramp may be resetting per-apply."
+        )
+        assert np.linalg.norm(third) > np.linalg.norm(second), (
+            f"third apply state {third} not larger magnitude than second {second}; ramp not accumulating."
+        )
+
+    def test_gripper_reset_zeros_state(self, libero_scene_xml):
+        """Round 28 (#168): ``reset()`` zeros ``_gripper_current_action``
+        so a new episode starts from neutral. While each
+        ``_install_action_controller`` call rebuilds the controller
+        (auto-resetting state via ``__init__``), the explicit
+        ``reset()`` method documents the contract and lets callers
+        zero state without re-discovering all the joint/actuator IDs."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        adapter._install_action_controller(sim)
+        ctrl = sim._world._backend_state.get("action_controller")
+        if ctrl is None:
+            pytest.skip("action_controller install failed")
+
+        # Drive state away from zero.
+        ctrl._gripper_current_action[:] = np.array([-0.5, 0.5])
+
+        ctrl.reset()
+        np.testing.assert_array_equal(ctrl._gripper_current_action, np.zeros(2))
+
 
 class TestPrewarmFreshEpisodeZero:
     """Round 17: ``on_episode_start`` detects the prewarm-fresh ep0

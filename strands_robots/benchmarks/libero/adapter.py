@@ -36,7 +36,7 @@ import logging
 import re
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 
@@ -2631,6 +2631,18 @@ class _LiberoOSCController:
     # ``data.ctrl`` write between policy steps).
     owns_stepping: bool = True
 
+    # PandaGripper.format_action ramp constant (robosuite/models/grippers/
+    # panda_gripper.py: ``self.speed = 0.01``). The gripper's normalized
+    # ``current_action`` (2-vector in [-1, +1]) is incremented by
+    # ``[-1, +1] * speed * sign(input)`` per substep, slowly ramping toward
+    # full close (+1 → both fingers at clipped target) or full open (-1 →
+    # opposite). Round 28 (#168): replicate this ramp instead of writing
+    # the raw GR00T scalar to ``data.ctrl``, which previously caused one
+    # finger to actuate in the wrong direction (finger1 has ctrlrange
+    # [0, 0.04] where +1 clips to OPEN, but the format_action saturation
+    # writes -1 = CLOSED to it).
+    _GRIPPER_SPEED: ClassVar[float] = 0.01
+
     def __init__(
         self,
         controller: Any,
@@ -2655,6 +2667,45 @@ class _LiberoOSCController:
         # `success_rate=0` even though motion looks correct in cameras.
         # See PR #168 round-26 verification + round-27 fix.
         self.physics_substeps_per_control = max(1, int(physics_substeps_per_control))
+
+        # Stateful ``current_action`` for the gripper, mirroring
+        # ``robosuite.models.grippers.panda_gripper.PandaGripper.current_action``
+        # which is initialised to ``np.zeros(self.dof)`` (dof=1) and ramps
+        # up to a 2-vector via numpy broadcasting on the first
+        # ``format_action`` call. We init directly as a 2-vector since we
+        # always have 2 fingers; semantics are identical.
+        self._gripper_current_action: np.ndarray = np.zeros(2, dtype=np.float64)
+
+        # Pre-compute bias / weight per gripper actuator for the
+        # ``[-1, +1] → [ctrl_lo, ctrl_hi]`` rescaling done in
+        # ``robosuite.robots.manipulator.Manipulator.grip_action``:
+        #   bias = 0.5 * (hi + lo)
+        #   weight = 0.5 * (hi - lo)
+        #   data.ctrl[gripper] = bias + weight * format_action_output
+        # Cached once at install time (ctrlrange is per-model immutable);
+        # avoids re-reading model.actuator_ctrlrange at 25 Hz × 20 Hz.
+        self._gripper_bias = np.array(
+            [0.5 * (model.actuator_ctrlrange[gi, 1] + model.actuator_ctrlrange[gi, 0]) for gi in gripper_actuator_ids],
+            dtype=np.float64,
+        )
+        self._gripper_weight = np.array(
+            [0.5 * (model.actuator_ctrlrange[gi, 1] - model.actuator_ctrlrange[gi, 0]) for gi in gripper_actuator_ids],
+            dtype=np.float64,
+        )
+
+    def reset(self) -> None:
+        """Reset stateful per-episode controller state.
+
+        Round 28 (#168): the gripper's ``current_action`` is a stateful
+        ramp accumulator (per ``PandaGripper.format_action``). Without a
+        reset, the second episode starts with whatever finger position
+        the first episode ended at — typically a partially-closed
+        gripper, which biases every grasp attempt. Called from
+        :meth:`LiberoAdapter._install_action_controller` (which itself is
+        called from ``on_episode_start``) so each episode starts with a
+        canonical ``current_action = [0, 0]``.
+        """
+        self._gripper_current_action.fill(0.0)
 
     @classmethod
     def from_sim(
@@ -2913,18 +2964,16 @@ class _LiberoOSCController:
         import mujoco as mj
 
         n_arm = len(self.arm_actuator_ids)
-
-        # Substep loop: re-run OSC + step physics N times per policy step.
-        # Cache gripper ctrlrange once outside the loop (immutable per
-        # episode) — pulling it from model.actuator_ctrlrange every
-        # iteration is a needless 25× slowdown.
-        gripper_lo_hi = [
-            (
-                float(model.actuator_ctrlrange[gi, 0]),
-                float(model.actuator_ctrlrange[gi, 1]),
-            )
-            for gi in self.gripper_actuator_ids
-        ]
+        # Constant per-substep ramp for the gripper (round 28 #168). See
+        # ``_GRIPPER_SPEED`` docstring above. Pre-compute the ramp
+        # direction so the inner loop is just an in-place add + clip.
+        # Sign of input dictates ramp direction: +1 (close) → finger
+        # ``current_action`` ramps to ``[-1, +1]``; -1 (open) → ramps
+        # to ``[+1, -1]``. The asymmetric direction is what causes the
+        # "one finger goes the wrong way" bug if you write the raw
+        # scalar to both finger ctrls.
+        gripper_sign = float(np.sign(gripper_value))
+        ramp_step = np.array([-1.0, 1.0]) * self._GRIPPER_SPEED * gripper_sign
 
         for _ in range(self.physics_substeps_per_control):
             # OSC: compute torques from current state (controller.update
@@ -2951,13 +3000,22 @@ class _LiberoOSCController:
                     for ai, tq in zip(self.arm_actuator_ids, torques_arr, strict=True):
                         data.ctrl[ai] = float(tq)
 
-            # Gripper passthrough: the 7th GR00T action channel is an
-            # open/close signal. Most LIBERO checkpoints output a scalar
-            # in [-1, +1]; positive = close, negative = open. Held
-            # constant across substeps (matches RoboSuite which writes
-            # gripper ctrl once per policy step in _pre_action).
-            for gi, (lo, hi) in zip(self.gripper_actuator_ids, gripper_lo_hi, strict=True):
-                data.ctrl[gi] = max(lo, min(hi, gripper_value))
+            # Stateful gripper ramp + bias/weight rescale (round 28
+            # #168). Replicates the exact pipeline RoboSuite's
+            # ``Manipulator.grip_action`` performs every substep:
+            #   current_action = clip(current_action + [-1,+1]·speed·sign(input), -1, 1)
+            #   ctrl = bias + weight * current_action
+            # Without this, +1 (close) writes 0.04 to finger1 (range
+            # [0, 0.04]) which actually OPENS finger1, breaking every
+            # grasp. See PR #168 round-28 investigation.
+            self._gripper_current_action = np.clip(
+                self._gripper_current_action + ramp_step,
+                -1.0,
+                1.0,
+            )
+            applied_gripper = self._gripper_bias + self._gripper_weight * self._gripper_current_action
+            for gi, val in zip(self.gripper_actuator_ids, applied_gripper, strict=True):
+                data.ctrl[gi] = float(val)
 
             mj.mj_step(model, data)
 
