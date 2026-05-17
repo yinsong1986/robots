@@ -398,6 +398,17 @@ class LiberoAdapter(BenchmarkProtocol):
             self._init_states: np.ndarray | None = init_states_array
         else:
             self._init_states = None
+        # Episode counter for deterministic init-state selection on
+        # episode 0. Matches v0.1.1 ``env_libero.py``'s pattern of
+        # ``env.set_init_state(init_states[0])`` for the first
+        # episode and per-episode RNG-sampled init states for
+        # episodes 1+. Pinning episode 0 to idx 0 makes
+        # :meth:`prewarm`'s init-state apply (which always uses
+        # idx 0) match the policy's actual starting state for
+        # episode 0 - the recorder's t=0.00 frame and the policy's
+        # first observation are then visually identical (#168
+        # round 16 bug D-residual).
+        self._episode_count: int = 0
         # Snapshot-and-restore fallback for procedurally-generated MJCFs that
         # don't ship a <keyframe> (the case the post-#168 verification
         # exposed). Captured on the first episode after super() +
@@ -755,16 +766,118 @@ class LiberoAdapter(BenchmarkProtocol):
         except Exception as e:  # noqa: BLE001
             logger.warning("LiberoAdapter.prewarm: _install_render_options raised: %s", e)
 
+        # Apply ``init_states[0]`` so the recorder's first frame
+        # captures the canonical "ready" pose the policy will see at
+        # episode 0 (#168 round-16 bug D-residual). Without this,
+        # ``data.qpos`` stays at the joint-default zeros that
+        # ``load_scene`` left behind, and the t=0.00 recorded frame
+        # shows the Panda stretched flat with mugs at MJCF defaults
+        # rather than LIBERO's canonical training-distribution start.
+        # This pairs with the episode-0-pinned-to-idx-0 logic in
+        # :meth:`_apply_init_state_branch` so prewarm + ep0
+        # observation are visually identical.
+        try:
+            self._apply_init_state_for_prewarm(sim)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("LiberoAdapter.prewarm: init-state apply failed: %s", e)
+
         # Forward the MjData so xpos/xmat are populated before the
         # recorder thread's first render call (#168 round-14 bug D
         # fix). Without this, every render between prewarm() and
         # on_episode_start's _apply_canonical_state returns the
         # skybox-only gradient because Renderer.update_scene finds
-        # body transforms unset.
+        # body transforms unset. Round 15 also moved this into
+        # Simulation.load_scene as the engine-level fix; the prewarm
+        # call here is now defense-in-depth, AND ensures ``mj_forward``
+        # runs after the init-state apply above so derived state
+        # (xpos/xmat) reflects the ready pose, not load_scene's qpos0.
         try:
             self._forward_mj_data(sim)
         except Exception as e:  # noqa: BLE001
             logger.warning("LiberoAdapter.prewarm: mj_forward failed: %s", e)
+
+    def _apply_init_state_for_prewarm(self, sim: SimEngine) -> None:
+        """Write ``init_states[0]`` to ``world._data`` (best-effort).
+
+        Mirrors :meth:`_apply_init_state_branch` but with
+        ``strict=False`` semantics:
+
+        * Width mismatch → DEBUG-log + skip (don't raise). Prewarm
+          must not crash the eval pipeline; ``on_episode_start``
+          will retry via ``_apply_canonical_state`` which has
+          ``strict=True`` and will surface the same diagnostic.
+        * No init_states → silent skip (the bare-Panda case
+          where ``LiberoAdapter`` was constructed without
+          ``init_states=``).
+        * Missing mujoco / world / model / data → DEBUG-log + skip.
+
+        Always uses ``init_states[0]``, matching the
+        episode-0-deterministic contract in
+        :meth:`_apply_init_state_branch`.
+
+        Does NOT increment ``self._episode_count`` - prewarm runs
+        BEFORE episode 0; episode 0's call into
+        ``_apply_init_state_branch`` (via on_episode_start ->
+        _apply_canonical_state) is what bumps the counter.
+        """
+        if self._init_states is None or self._init_states.shape[0] == 0:
+            logger.debug("LiberoAdapter.prewarm: no init_states; skipping init-state apply")
+            return
+
+        # Probe whether mujoco is importable so we skip cleanly on
+        # non-MuJoCo backends. The actual import is done by
+        # _forward_mj_data right after this; here we don't call any
+        # mujoco function directly. Using a try-import (vs
+        # importlib.util.find_spec) so test fixtures can patch
+        # sys.modules["mujoco"] with a stub - find_spec doesn't honour
+        # sys.modules patches and would always see the real install.
+        try:
+            import mujoco  # noqa: F401 - probe-only, real use is in _forward_mj_data
+        except ImportError:
+            logger.debug("LiberoAdapter.prewarm: mujoco not importable; skipping init-state apply")
+            return
+
+        world = getattr(sim, "_world", None)
+        if world is None:
+            return
+        model = getattr(world, "_model", None)
+        data = getattr(world, "_data", None)
+        if model is None or data is None:
+            return
+
+        nq = int(getattr(model, "nq", 0))
+        nv = int(getattr(model, "nv", 0))
+        if nq == 0 or nv == 0:
+            return
+        state = self._init_states[0]
+        expected_width = 1 + nq + nv
+        if state.shape[0] != expected_width:
+            # Best-effort: log + skip. Don't raise like the
+            # canonical-state branch does - prewarm is a hint, not a
+            # hard contract. on_episode_start's _apply_init_state_branch
+            # will surface the same width mismatch with strict=True.
+            logger.debug(
+                "LiberoAdapter.prewarm: init_state[0] width %d != 1+nq+nv=%d; skipping",
+                state.shape[0],
+                expected_width,
+            )
+            return
+
+        lock = getattr(sim, "_lock", None)
+
+        def _apply() -> None:
+            data.time = float(state[0])
+            np.copyto(data.qpos, state[1 : 1 + nq])
+            np.copyto(data.qvel, state[1 + nq :])
+            # mj_forward is called by _forward_mj_data right after
+            # this returns; intentionally not duplicated here.
+
+        if lock is not None:
+            with lock:
+                _apply()
+        else:
+            _apply()
+        logger.debug("LiberoAdapter.prewarm: applied init_state[0] (qpos[:%d] + qvel[:%d])", nq, nv)
 
     def _forward_mj_data(self, sim: SimEngine) -> None:
         """Run ``mujoco.mj_forward(model, data)`` if the sim has both available.
@@ -1617,18 +1730,36 @@ class LiberoAdapter(BenchmarkProtocol):
         a real scene-generation bug. Per AGENTS.md "no silent defaults
         on error".
 
-        Per-episode RNG-seeded selection: ``rng.randint(0, n_states-1)``.
+        Episode 0 is pinned to ``init_states[0]`` deterministically;
+        episodes 1+ are RNG-sampled. This matches v0.1.1 ``env_libero.py``'s
+        ``env.set_init_state(init_states[0])`` pattern for the first
+        episode and aligns with :meth:`prewarm`'s init-state apply
+        (which also uses idx 0). The recorder's t=0.00 frame and the
+        policy's first observation are then visually identical -
+        critical for the visual-acceptance regression suite where
+        users compare "first recorded frame" against "expected
+        starting pose" (#168 round 16 bug D-residual).
+
+        Per-episode RNG-seeded selection (episodes 1+): ``rng.randint(0, n_states-1)``.
         Re-running the same seed produces the same init state for the
         same episode index. ``rng=None`` falls back to a fresh
         ``random.Random()`` so direct calls (e.g. unit tests) still
         work.
+
+        ``self._episode_count`` increments after every successful call
+        so the next call is "episode 1+" and uses RNG sampling.
         """
         n_states = int(self._init_states.shape[0])  # type: ignore[union-attr]
         if n_states == 0:
             logger.debug("LiberoAdapter: empty init_states array; skipping init-state branch")
             return
-        rng_local = rng if rng is not None else random.Random()
-        idx = rng_local.randint(0, n_states - 1)
+        # Episode 0 = idx 0 (deterministic, matches v0.1.1 + prewarm).
+        # Episodes 1+ = RNG-sampled.
+        if self._episode_count == 0:
+            idx = 0
+        else:
+            rng_local = rng if rng is not None else random.Random()
+            idx = rng_local.randint(0, n_states - 1)
         state = self._init_states[idx]  # type: ignore[index]
 
         nq = int(model.nq)
@@ -1664,11 +1795,16 @@ class LiberoAdapter(BenchmarkProtocol):
             _apply()
 
         logger.debug(
-            "LiberoAdapter: applied init_state[%d] (1+nq+nv=%d, n_states=%d)",
+            "LiberoAdapter: applied init_state[%d] (ep=%d, 1+nq+nv=%d, n_states=%d)",
             idx,
+            self._episode_count,
             expected_width,
             n_states,
         )
+
+        # Increment after successful apply so the next call is
+        # "episode 1+" and gets RNG-sampled selection.
+        self._episode_count += 1
 
     def _apply_keyframe_branch(
         self,

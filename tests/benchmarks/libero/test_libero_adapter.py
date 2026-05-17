@@ -1668,6 +1668,152 @@ class TestPrewarm:
         # mj_forward was NOT called because world.model/data is missing.
         assert mj_forward_calls == []
 
+    def test_prewarm_applies_init_states_zero(self):
+        """``prewarm`` writes ``init_states[0]`` to ``world._data`` so the
+        recorder's first frame captures the canonical "ready" pose
+        (#168 round-16 bug D-residual fix). Without this, ``data.qpos``
+        stays at joint defaults that ``load_scene`` left behind, and
+        the t=0.00 recorded frame shows the Panda stretched flat.
+        """
+        pytest.importorskip("mujoco")
+        nq, nv = 4, 4
+        states = np.zeros((2, 1 + nq + nv), dtype=np.float64)
+        states[0, 1] = 42.0  # state 0: qpos[0] = 42
+        states[1, 1] = 99.0  # state 1: qpos[0] = 99 - prewarm should NOT pick this
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+            init_states=states,
+        )
+        sim = FakeSim(data_config="panda")
+
+        # Build minimal model/data on the FakeSim's world.
+        class _Model:
+            def __init__(self) -> None:
+                self.nq = nq
+                self.nv = nv
+                self.na = 0
+
+        class _Data:
+            def __init__(self) -> None:
+                self.qpos = np.zeros(nq)
+                self.qvel = np.zeros(nv)
+                self.time = 0.0
+
+        sim._world._model = _Model()  # type: ignore[attr-defined]
+        sim._world._data = _Data()  # type: ignore[attr-defined]
+
+        class _StubMj:
+            class mjtVisFlag:
+                mjVIS_JOINT = 0
+                mjVIS_ACTUATOR = 0
+                mjVIS_COM = 0
+
+            class MjvOption:
+                def __init__(self):
+                    self.geomgroup = [1] * 6
+                    self.sitegroup = [1] * 6
+                    self.flags = [0] * 64
+
+            @staticmethod
+            def mjv_defaultOption(opt):
+                pass
+
+            @staticmethod
+            def mj_forward(model, data):
+                pass
+
+        with patch.dict("sys.modules", {"mujoco": _StubMj}):
+            adapter.prewarm(sim)
+
+        # data.qpos[0] should match init_states[0] (42), NOT init_states[1] (99).
+        assert sim._world._data.qpos[0] == 42.0, (  # type: ignore[attr-defined]
+            f"prewarm should apply init_states[0] (qpos[0]=42), got {sim._world._data.qpos[0]}"  # type: ignore[attr-defined]
+        )
+        # Episode counter NOT incremented by prewarm (only by
+        # _apply_init_state_branch via on_episode_start).
+        assert adapter._episode_count == 0
+
+    def test_prewarm_no_init_states_skips_silently(self):
+        """When ``init_states is None``, prewarm doesn't touch ``data.qpos``.
+        Pin so the bare-Panda case (no LIBERO benchmark suite plumbing)
+        still works through prewarm without crashing."""
+        pytest.importorskip("mujoco")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+            # init_states=None (default)
+        )
+        sim = FakeSim(data_config="panda")
+        assert adapter._init_states is None
+
+        # Must not raise.
+        adapter.prewarm(sim)
+
+    def test_prewarm_init_state_width_mismatch_logs_skips(self):
+        """Width mismatch in prewarm logs DEBUG and skips (best-effort
+        semantics). Contrasts with ``_apply_init_state_branch`` which
+        raises - prewarm must not crash the eval pipeline; the next
+        ``on_episode_start`` will surface the error via the strict
+        canonical-state branch."""
+        pytest.importorskip("mujoco")
+        # Width mismatch: init_state has 5 elements, but model expects 1+4+4=9.
+        bad_state = np.zeros(5, dtype=np.float64)
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+            init_states=bad_state,
+        )
+        sim = FakeSim(data_config="panda")
+
+        class _Model:
+            nq = 4
+            nv = 4
+            na = 0
+
+        class _Data:
+            def __init__(self) -> None:
+                self.qpos = np.zeros(4)
+                self.qvel = np.zeros(4)
+                self.time = 0.0
+
+        sim._world._model = _Model()  # type: ignore[attr-defined]
+        sim._world._data = _Data()  # type: ignore[attr-defined]
+
+        class _StubMj:
+            class mjtVisFlag:
+                mjVIS_JOINT = 0
+                mjVIS_ACTUATOR = 0
+                mjVIS_COM = 0
+
+            class MjvOption:
+                def __init__(self):
+                    self.geomgroup = [1] * 6
+                    self.sitegroup = [1] * 6
+                    self.flags = [0] * 64
+
+            @staticmethod
+            def mjv_defaultOption(opt):
+                pass
+
+            @staticmethod
+            def mj_forward(model, data):
+                pass
+
+        with patch.dict("sys.modules", {"mujoco": _StubMj}):
+            # Must not raise (best-effort, unlike _apply_init_state_branch).
+            adapter.prewarm(sim)
+
+        # qpos was NOT modified due to width mismatch.
+        assert (sim._world._data.qpos == 0).all()  # type: ignore[attr-defined]
+
 
 # Scene <keyframe> application (#166 follow-up)
 
@@ -3165,12 +3311,16 @@ class TestApplyInitStateBranch:
         # mj_forward fired.
         assert len(forward_calls) == 1
 
-    def test_init_state_seeded_selection_is_deterministic(self):
-        """Same RNG seed -> same row of init_states selected. Required
-        so a re-evaluation with the same seed reproduces results
-        exactly. ``rng.randint(0, n-1)`` is the selection mechanism."""
+    def test_init_state_episode_zero_is_deterministic(self):
+        """Episode 0 always uses ``init_states[0]`` regardless of RNG.
+
+        Pin for #168 round-16 contract: matches v0.1.1
+        ``env_libero.py``'s ``env.set_init_state(init_states[0])``
+        pattern for the first episode. Aligns with
+        :meth:`prewarm`'s init-state apply (which always uses idx 0)
+        so the recorder's t=0.00 frame and the policy's first
+        observation are visually identical."""
         nq, nv = 4, 4
-        # Two states - distinguishable by their qpos[0] value.
         states = np.zeros((2, 1 + nq + nv), dtype=np.float64)
         states[0, 1] = 100.0  # state 0: qpos[0] = 100
         states[1, 1] = 200.0  # state 1: qpos[0] = 200
@@ -3180,15 +3330,48 @@ class TestApplyInitStateBranch:
             init_states=states,
         )
 
-        # Seed 0 -> deterministic index. Seed 0 + same array -> same index.
+        sim, _, data = self._make_sim_with_model(nq=nq, nv=nv)
+        mj, _ = self._make_fake_mj()
+        # Episode 0 ALWAYS uses idx=0, even with a different RNG seed.
+        # Verify by passing a seed where Random(N).randint(0, 1) would
+        # otherwise return 1 (e.g. Random(1) selects 1 first).
+        with patch.dict("sys.modules", {"mujoco": mj}):
+            adapter._apply_canonical_state(sim, random.Random(1))
+        # Episode 0 must apply state 0 (qpos[0] = 100), regardless of seed.
+        assert data.qpos[0] == 100.0, f"episode 0 should be deterministic idx=0 (qpos[0]=100), got {data.qpos[0]}"
+        # Counter incremented to 1 after ep0 apply.
+        assert adapter._episode_count == 1
+
+    def test_init_state_episode_one_uses_rng(self):
+        """Episodes 1+ use RNG-sampled selection. Required so per-episode
+        randomization is preserved for episodes after ep0 (which is
+        pinned to idx 0). Pin for the seeded-reproducibility contract:
+        same seed → same idx for the same episode index."""
+        nq, nv = 4, 4
+        states = np.zeros((2, 1 + nq + nv), dtype=np.float64)
+        states[0, 1] = 100.0
+        states[1, 1] = 200.0
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            install_cameras=False,
+            init_states=states,
+        )
+
+        # Bump episode counter past 0 to simulate "we've already done ep0".
+        adapter._episode_count = 1
+
         sim_a, _, data_a = self._make_sim_with_model(nq=nq, nv=nv)
         sim_b, _, data_b = self._make_sim_with_model(nq=nq, nv=nv)
         mj, _ = self._make_fake_mj()
         with patch.dict("sys.modules", {"mujoco": mj}):
-            adapter._apply_canonical_state(sim_a, random.Random(0))
-            adapter._apply_canonical_state(sim_b, random.Random(0))
-        # Same seed -> same selected state -> same data.qpos[0].
-        assert data_a.qpos[0] == data_b.qpos[0]
+            adapter._apply_canonical_state(sim_a, random.Random(42))
+            # Reset counter so sim_b is also "ep 1" for fair comparison.
+            adapter._episode_count = 1
+            adapter._apply_canonical_state(sim_b, random.Random(42))
+        # Same seed + same episode-counter state -> same selected state.
+        assert data_a.qpos[0] == data_b.qpos[0], (
+            f"same seed should produce same idx for ep>=1; got {data_a.qpos[0]} vs {data_b.qpos[0]}"
+        )
 
     def test_init_state_width_mismatch_raises(self):
         """Width != 1 + nq + nv must raise ``RuntimeError`` rather than
