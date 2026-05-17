@@ -2061,6 +2061,106 @@ class TestInstallActionController:
         # No controller installed.
         assert "action_controller" not in sim._world._backend_state
 
+    def test_apply_handles_list_shaped_gripper_value(self, libero_scene_xml):
+        """GR00T-LIBERO outputs ``action.gripper`` as a 2-element list
+        (deliberate per PR #162 to match training shape - server
+        boolean-masks state by per-key feature dimension; scalar shape
+        fails). The OSC controller's apply path must handle list-shaped
+        gripper without crashing.
+
+        Pin for #168 round-25 fix: round-24's apply() called
+        ``float(action_dict.get("gripper", 0.0))`` unconditionally
+        BEFORE the list-coercion branch, so every step raised
+        TypeError(``float() argument must be a string or a real
+        number, not 'list'``). The defensive try/except in
+        _apply_sim_action caught it and fell through to the no-op
+        name-lookup path - actions silently dropped despite the
+        controller being installed."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        adapter._install_action_controller(sim)
+        ctrl = sim._world._backend_state.get("action_controller")
+        if ctrl is None:
+            pytest.skip("action_controller install failed")
+
+        sim._world._data.ctrl[:] = 0  # type: ignore[attr-defined]
+
+        # GR00T's libero_panda gripper output is a 2-element list,
+        # NOT a scalar. This is the case that crashed in round 24.
+        action = {
+            "x": 0.05,
+            "y": 0.0,
+            "z": 0.0,
+            "roll": 0.0,
+            "pitch": 0.0,
+            "yaw": 0.0,
+            "gripper": [0.5, 0.5],  # ← list-shaped, NOT scalar
+        }
+        # Must NOT raise.
+        ctrl.apply(action, sim._world._model, sim._world._data, "robot")  # type: ignore[attr-defined]
+
+        # Gripper actuator ctrl[i] should be set to clip(0.5, ctrlrange).
+        # Verify at least one gripper actuator was written (non-zero).
+        gripper_ctrls = [sim._world._data.ctrl[i] for i in ctrl.gripper_actuator_ids]  # type: ignore[attr-defined]
+        nonzero_gripper = sum(1 for t in gripper_ctrls if abs(float(t)) > 1e-6)
+        assert nonzero_gripper > 0, (
+            f"expected non-zero gripper torques after apply with list-shaped gripper, got {gripper_ctrls}. "
+            f"The list-coercion path may be broken."
+        )
+
+    def test_apply_handles_scalar_gripper_value(self, libero_scene_xml):
+        """Backwards compat: scalar gripper (0.7) still works after the
+        round-25 list-coercion fix. Pin so the fix doesn't break the
+        legacy scalar path."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        adapter._install_action_controller(sim)
+        ctrl = sim._world._backend_state.get("action_controller")
+        if ctrl is None:
+            pytest.skip("action_controller install failed")
+
+        sim._world._data.ctrl[:] = 0  # type: ignore[attr-defined]
+
+        action = {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "roll": 0.0,
+            "pitch": 0.0,
+            "yaw": 0.0,
+            "gripper": 0.7,  # ← scalar, the legacy shape
+        }
+        ctrl.apply(action, sim._world._model, sim._world._data, "robot")  # type: ignore[attr-defined]
+        gripper_ctrls = [sim._world._data.ctrl[i] for i in ctrl.gripper_actuator_ids]  # type: ignore[attr-defined]
+        nonzero_gripper = sum(1 for t in gripper_ctrls if abs(float(t)) > 1e-6)
+        assert nonzero_gripper > 0, f"expected non-zero gripper torques for scalar gripper, got {gripper_ctrls}"
+
 
 class TestPrewarmFreshEpisodeZero:
     """Round 17: ``on_episode_start`` detects the prewarm-fresh ep0

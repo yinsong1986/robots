@@ -2859,11 +2859,35 @@ class _LiberoOSCController:
         # Write it to all gripper actuators (RoboSuite's gripper
         # config typically has 2 finger actuators tied via a
         # tendon, so this works either way).
-        gripper_value = float(action_dict.get("gripper", 0.0))
-        # Some GR00T checkpoints output a 2-element list; coerce.
-        gripper_raw = action_dict.get("gripper")
-        if isinstance(gripper_raw, (list, tuple, np.ndarray)) and len(gripper_raw) > 0:
-            gripper_value = float(gripper_raw[0])
+        #
+        # Coerce list/tuple/ndarray BEFORE attempting float() (#168
+        # round 25 fix). PR #162 packs ``state.gripper`` and
+        # ``action.gripper`` as 2-element lists to match GR00T-LIBERO's
+        # training shape (server boolean-masks state by per-key
+        # feature dimension; scalar shape fails). So GR00T's response
+        # for the ``gripper`` action key is a 2-element list, NOT a
+        # scalar. ``float([0.5, 0.5])`` raises TypeError; the
+        # round-24 code did the float() unconditionally first and
+        # never reached the list-coercion branch. Result: every
+        # apply() raised, fell through to the no-op name-lookup
+        # path, success_rate stayed at 0 (round-24 verification).
+        gripper_raw = action_dict.get("gripper", 0.0)
+        try:
+            if isinstance(gripper_raw, (list, tuple, np.ndarray)) and len(gripper_raw) > 0:
+                gripper_value = float(gripper_raw[0])
+            else:
+                gripper_value = float(gripper_raw)
+        except (TypeError, ValueError, IndexError) as e:
+            # Defensive against unexpected gripper shapes (None,
+            # empty list, dict, etc.). Treat as no-op gripper rather
+            # than crashing the entire apply() pipeline.
+            logger.warning(
+                "_LiberoOSCController.apply: could not coerce gripper value %r to float (%s); "
+                "treating as 0.0 for this step",
+                gripper_raw,
+                e,
+            )
+            gripper_value = 0.0
         for gi in self.gripper_actuator_ids:
             # Clip to actuator ctrlrange to avoid driving past limits.
             lo = float(model.actuator_ctrlrange[gi, 0])
