@@ -460,6 +460,7 @@ class SimEngine(ABC):
         instruction: str = "",
         n_episodes: int = 1,
         seed: int | None = None,
+        action_horizon: int = 1,
     ) -> dict[str, Any]:
         """Run a registered :class:`BenchmarkProtocol` against the current sim.
 
@@ -480,6 +481,16 @@ class SimEngine(ABC):
             instruction: Natural-language instruction for the policy.
             n_episodes: Number of episodes.
             seed: Master RNG seed for per-episode reproducibility.
+            action_horizon: How many actions to consume from each
+                ``policy.get_actions(...)`` chunk before re-querying the
+                policy. Default ``1`` (closed-loop receding-horizon: get
+                fresh observations every control step). LIBERO/OpenVLA
+                benchmarks train and eval at ``action_horizon=1`` —
+                changing this is a research / debugging knob, not
+                a performance optimisation. Values ``> 1`` skip
+                re-observation between consecutive actions in the same
+                chunk, which is open-loop and can drift on tasks
+                requiring contact-rich coordination.
 
         Returns:
             Standard status dict. On success, carries per-episode cumulative
@@ -488,6 +499,14 @@ class SimEngine(ABC):
         """
         from strands_robots.policies import create_policy
         from strands_robots.simulation.benchmark import get_benchmark
+
+        if not isinstance(action_horizon, int) or action_horizon < 1:
+            return {
+                "status": "error",
+                "content": [
+                    {"text": (f"evaluate_benchmark: action_horizon must be a positive integer, got {action_horizon!r}")}
+                ],
+            }
 
         spec = get_benchmark(benchmark_name)
         if spec is None:
@@ -545,6 +564,7 @@ class SimEngine(ABC):
             n_episodes=n_episodes,
             spec=spec,
             seed=seed,
+            action_horizon=action_horizon,
         )
 
     def list_benchmarks(self) -> dict[str, Any]:

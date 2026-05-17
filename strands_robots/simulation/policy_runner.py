@@ -516,6 +516,7 @@ class PolicyRunner:
         success_fn: SuccessFn | str | None = None,
         spec: BenchmarkProtocol | None = None,
         seed: int | None = None,
+        action_horizon: int = 1,
     ) -> dict[str, Any]:
         """Evaluate ``policy`` for ``n_episodes`` episodes.
 
@@ -573,6 +574,7 @@ class PolicyRunner:
                 instruction=instruction,
                 n_episodes=n_episodes,
                 seed=seed,
+                action_horizon=action_horizon,
             )
 
         try:
@@ -645,6 +647,7 @@ class PolicyRunner:
         instruction: str,
         n_episodes: int,
         seed: int | None,
+        action_horizon: int = 1,
     ) -> dict[str, Any]:
         """Drive a :class:`BenchmarkProtocol` for ``n_episodes`` episodes.
 
@@ -726,34 +729,73 @@ class PolicyRunner:
                 coro_or_result = policy.get_actions(observation, instruction)
                 actions = _resolve_coroutine(coro_or_result)
 
-                if actions:
-                    action_applied: dict[str, Any] = dict(actions[0])
-                    self.sim.send_action(action_applied, robot_name=robot_name)
-                else:
+                # Round 34 (#168): consume up to ``action_horizon`` actions
+                # per inference. Default ``action_horizon=1`` is closed-loop
+                # receding-horizon control (LIBERO/OpenVLA convention) — re-
+                # query the policy on every control step. Values > 1 are
+                # open-loop chunk replay; the policy commits to N actions
+                # before re-observing, faster but can drift on contact-rich
+                # tasks. ``on_step`` and success/failure checks run after
+                # EACH applied action so per-step rewards / early termination
+                # work whether action_horizon is 1 or 8.
+                action_applied: dict[str, Any] = {}
+                stop_episode = False
+                if not actions:
                     # Degenerate policy - advance physics so loop terminates.
-                    action_applied = {}
                     self.sim.step(n_steps=1)
-
-                steps += 1
-                try:
-                    info = spec.on_step(self.sim, observation, action_applied)
-                except Exception as e:  # noqa: BLE001
-                    logger.exception("on_step failed in %s", spec_name)
-                    return {
-                        "status": "error",
-                        "content": [{"text": f"on_step failed in {spec_name}: {e}"}],
-                    }
-                cumulative_reward += float(info.reward)
-                last_info = dict(info.info) if info.info else {}
-
-                if info.done:
+                else:
+                    for action_in_chunk in actions[:action_horizon]:
+                        if steps >= max_steps:
+                            break
+                        action_applied = dict(action_in_chunk)
+                        self.sim.send_action(action_applied, robot_name=robot_name)
+                        steps += 1
+                        try:
+                            info = spec.on_step(self.sim, observation, action_applied)
+                        except Exception as e:  # noqa: BLE001
+                            logger.exception("on_step failed in %s", spec_name)
+                            return {
+                                "status": "error",
+                                "content": [{"text": f"on_step failed in {spec_name}: {e}"}],
+                            }
+                        cumulative_reward += float(info.reward)
+                        last_info = dict(info.info) if info.info else {}
+                        if info.done:
+                            stop_episode = True
+                            break
+                        if spec.is_failure(self.sim):
+                            failure = True
+                            stop_episode = True
+                            break
+                        if spec.is_success(self.sim):
+                            success = True
+                            stop_episode = True
+                            break
+                if stop_episode:
                     break
-                if spec.is_failure(self.sim):
-                    failure = True
-                    break
-                if spec.is_success(self.sim):
-                    success = True
-                    break
+                if not actions:
+                    # Degenerate-policy branch already advanced steps via
+                    # sim.step(n_steps=1); count it like an applied step
+                    # so the outer loop terminates.
+                    steps += 1
+                    try:
+                        info = spec.on_step(self.sim, observation, action_applied)
+                    except Exception as e:  # noqa: BLE001
+                        logger.exception("on_step failed in %s", spec_name)
+                        return {
+                            "status": "error",
+                            "content": [{"text": f"on_step failed in {spec_name}: {e}"}],
+                        }
+                    cumulative_reward += float(info.reward)
+                    last_info = dict(info.info) if info.info else {}
+                    if info.done:
+                        break
+                    if spec.is_failure(self.sim):
+                        failure = True
+                        break
+                    if spec.is_success(self.sim):
+                        success = True
+                        break
 
             results.append(
                 {

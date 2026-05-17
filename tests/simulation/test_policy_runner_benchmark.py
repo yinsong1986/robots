@@ -525,3 +525,150 @@ class TestSimEngineFacades:
         result = sim.register_benchmark_from_file(benchmark_name="bad", spec_path=str(spec_path))
         assert result["status"] == "error"
         assert "default_robot" in result["content"][0]["text"]
+
+
+class TestActionHorizon:
+    """Round 34 (#168): ``evaluate_benchmark`` accepts ``action_horizon``
+    to control how many actions are consumed per ``policy.get_actions``
+    inference call.
+
+    Default is ``1`` — closed-loop receding-horizon control matching
+    LIBERO/OpenVLA convention. Values > 1 are open-loop chunk replay
+    used for inference-amortization or for testing whether a policy
+    was trained with chunk-replay assumptions.
+    """
+
+    def test_default_action_horizon_is_one_closed_loop(self):
+        """Round 34 (#168): default ``action_horizon=1`` consumes exactly
+        one action per ``policy.get_actions`` call regardless of how many
+        actions the policy returns in its chunk.
+
+        ``MockPolicy`` returns 8 actions per call. With ``action_horizon=1``
+        only the first is applied per inference. Pin the closed-loop
+        default so users on LIBERO/OpenVLA don't accidentally drift
+        into open-loop chunk replay."""
+        sim = FakeSim()
+        spec = _CountingBenchmark()
+        register_benchmark("default-horizon", spec)
+
+        result = sim.evaluate_benchmark(
+            benchmark_name="default-horizon",
+            robot_name="fake_robot",
+            policy_provider="mock",
+            n_episodes=1,
+            seed=3,
+        )
+        assert result["status"] == "success", result
+        payload = next(c["json"] for c in result["content"] if "json" in c)
+        # max_steps=20 ⇒ 20 single-action inferences. on_step called 20×.
+        assert spec.on_step_calls == 20
+        assert payload["episodes"][0]["steps"] == 20
+
+    def test_action_horizon_greater_than_one_consumes_chunk(self):
+        """Round 34 (#168): ``action_horizon=4`` consumes 4 actions per
+        policy.get_actions call. With ``MockPolicy`` returning 8 actions
+        per call, 4 of them get applied, then we re-query.
+
+        ``max_steps=20`` ⇒ 5 inferences × 4 actions = 20 step total.
+        ``on_step_calls`` matches because the loop calls on_step per
+        applied action, not per inference."""
+        sim = FakeSim()
+        spec = _CountingBenchmark()
+        register_benchmark("h-equals-4", spec)
+
+        result = sim.evaluate_benchmark(
+            benchmark_name="h-equals-4",
+            robot_name="fake_robot",
+            policy_provider="mock",
+            n_episodes=1,
+            seed=3,
+            action_horizon=4,
+        )
+        assert result["status"] == "success"
+        payload = next(c["json"] for c in result["content"] if "json" in c)
+        # max_steps=20 ⇒ 5 inferences × 4 actions per chunk = 20 steps
+        # (on_step still called per APPLIED action, which is 20).
+        assert spec.on_step_calls == 20
+        assert payload["episodes"][0]["steps"] == 20
+
+    def test_action_horizon_caps_at_max_steps_mid_chunk(self):
+        """Round 34 (#168): when ``max_steps`` is reached mid-chunk, the
+        remaining actions in the chunk are NOT applied. Pin so the
+        chunk-replay logic respects the spec's ``max_steps`` bound and
+        doesn't run physics past the episode budget."""
+        sim = FakeSim()
+        # max_steps=15, so 3 full chunks of 4 (12 actions) then 3 of
+        # the 4 from the 4th chunk (15 total). The 4th action of the
+        # 4th chunk should NOT fire.
+        spec = _CountingBenchmark()
+        spec.max_steps = 15  # type: ignore[misc]
+        register_benchmark("max-steps-mid-chunk", spec)
+
+        result = sim.evaluate_benchmark(
+            benchmark_name="max-steps-mid-chunk",
+            robot_name="fake_robot",
+            policy_provider="mock",
+            n_episodes=1,
+            seed=3,
+            action_horizon=4,
+        )
+        assert result["status"] == "success"
+        payload = next(c["json"] for c in result["content"] if "json" in c)
+        assert spec.on_step_calls == 15
+        assert payload["episodes"][0]["steps"] == 15
+
+    def test_action_horizon_zero_rejected(self):
+        """Round 34 (#168): ``action_horizon=0`` is invalid and rejected
+        with a structured error. Pin so a typo doesn't silently produce
+        an episode that never applies any action and exits at
+        ``max_steps`` with success_rate=0."""
+        sim = FakeSim()
+        register_benchmark("h-zero", _CountingBenchmark())
+        result = sim.evaluate_benchmark(
+            benchmark_name="h-zero",
+            robot_name="fake_robot",
+            policy_provider="mock",
+            n_episodes=1,
+            action_horizon=0,
+        )
+        assert result["status"] == "error"
+        assert "action_horizon" in result["content"][0]["text"]
+
+    def test_action_horizon_negative_rejected(self):
+        """Round 34 (#168): negative ``action_horizon`` is rejected."""
+        sim = FakeSim()
+        register_benchmark("h-neg", _CountingBenchmark())
+        result = sim.evaluate_benchmark(
+            benchmark_name="h-neg",
+            robot_name="fake_robot",
+            policy_provider="mock",
+            n_episodes=1,
+            action_horizon=-1,
+        )
+        assert result["status"] == "error"
+        assert "action_horizon" in result["content"][0]["text"]
+
+    def test_early_success_terminates_within_chunk(self):
+        """Round 34 (#168): when ``is_success`` flips mid-chunk, the
+        episode terminates and remaining chunk actions are NOT applied.
+
+        Pin so reward / step accounting reflects the actual applied
+        actions, not the full chunk that was queued."""
+        sim = FakeSim()
+        # Success after exactly 5 steps ⇒ should NOT consume the 6th.
+        spec = _CountingBenchmark(success_after=5)
+        register_benchmark("early-success-chunk", spec)
+
+        result = sim.evaluate_benchmark(
+            benchmark_name="early-success-chunk",
+            robot_name="fake_robot",
+            policy_provider="mock",
+            n_episodes=1,
+            seed=3,
+            action_horizon=8,
+        )
+        assert result["status"] == "success"
+        payload = next(c["json"] for c in result["content"] if "json" in c)
+        assert spec.on_step_calls == 5
+        assert payload["episodes"][0]["steps"] == 5
+        assert payload["episodes"][0]["success"] is True
