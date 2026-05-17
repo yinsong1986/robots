@@ -1917,7 +1917,7 @@ class TestPrewarmFreshEpisodeZero:
 
     def test_ep0_fast_path_skips_load_scene_when_prewarm_flag_matches(self, tmp_path):
         """Episode 0 with ``libero_prewarm_path`` matching ``self.scene_path``
-        skips ``sim.load_scene`` (no qpos reset)."""
+        skips ``sim.load_scene`` (avoids redundant spec recompile)."""
         pytest.importorskip("mujoco")
         scene = tmp_path / "scene.xml"
         scene.write_text("<mujoco><worldbody/></mujoco>")
@@ -1943,16 +1943,24 @@ class TestPrewarmFreshEpisodeZero:
 
         # Fast-path: load_scene was NOT called (prewarm already did it).
         assert load_scene_calls == [], f"expected ep0 fast-path to skip load_scene; got {load_scene_calls}"
-        # Episode counter bumped to 1 (ep0 consumed).
-        assert adapter._episode_count == 1
         # Flag cleared so a subsequent prewarm + ep0 detects fresh state again.
         assert "libero_prewarm_path" not in sim._world._backend_state
 
-    def test_ep0_fast_path_skips_canonical_state_apply(self, tmp_path):
-        """Episode 0 fast-path also skips ``_apply_canonical_state``;
-        prewarm already applied init_states[0]. Re-applying would
-        double-bump the episode counter (since
-        ``_apply_init_state_branch`` increments)."""
+    def test_ep0_fast_path_still_runs_canonical_state_apply(self, tmp_path):
+        """Episode 0 fast-path runs ``_apply_canonical_state`` to restore
+        qpos after PolicyRunner.sim.reset() between prewarm and
+        on_episode_start.
+
+        Pin for #168 round-22 user-flagged fix: round 17/18's fast-path
+        skipped ``_apply_canonical_state`` on the assumption that
+        prewarm had already applied init_states[0]. But
+        ``PolicyRunner._evaluate_with_spec`` calls ``sim.reset()``
+        between prewarm and on_episode_start, which resets ``data.qpos``
+        to qpos0. The skip meant ep1 ran from qpos0 for ~6.5 s of
+        recording until ep2's slow path fired. Round 22 keeps the
+        load_scene skip (the redundant-recompile concern that
+        motivated the fast-path) but always runs canonical-state
+        restoration."""
         pytest.importorskip("mujoco")
         scene = tmp_path / "scene.xml"
         scene.write_text("<mujoco><worldbody/></mujoco>")
@@ -1967,7 +1975,9 @@ class TestPrewarmFreshEpisodeZero:
         with patch.object(LiberoAdapter, "_apply_canonical_state") as mock_apply:
             adapter.on_episode_start(sim, random.Random(0))
 
-        mock_apply.assert_not_called()
+        # Fast-path STILL runs _apply_canonical_state - critical for
+        # restoring qpos after PolicyRunner.sim.reset().
+        mock_apply.assert_called_once()
 
     def test_ep1_uses_normal_lifecycle_even_with_prewarm_flag(self, tmp_path):
         """Episode 1+ runs full ``load_scene`` + ``_apply_canonical_state``

@@ -655,20 +655,42 @@ class LiberoAdapter(BenchmarkProtocol):
                         backend_state.pop("libero_prewarm_path", None)
 
         if is_prewarm_fresh_ep0:
-            # Fast-path: prewarm already loaded the scene and applied
-            # init_states[0]. Trust that state; skip load_scene +
-            # _apply_canonical_state. The wrapper, cameras, and
-            # viz_option are also already installed by prewarm.
+            # Fast-path: prewarm already loaded the scene. Trust that
+            # state; skip load_scene + _register_default_robot.
+            #
+            # IMPORTANT (#168 round 22 user-flagged fix): we
+            # intentionally do NOT skip _apply_canonical_state here.
+            # ``PolicyRunner._evaluate_with_spec`` calls ``sim.reset()``
+            # between prewarm and on_episode_start, which resets
+            # ``data.qpos`` to qpos0 - destroying prewarm's
+            # init-state apply. The fast-path used to skip
+            # _apply_canonical_state on the assumption that prewarm
+            # left qpos populated; that's wrong because of the
+            # reset(). The recorder thread captured ~6.5 s of qpos0
+            # frames during ep1 before ep2's slow path finally
+            # restored canonical state.
+            #
+            # Fix: keep the load_scene skip (avoids redundant spec
+            # recompile) and the _register_default_robot skip
+            # (idempotent; prewarm did it). But ALWAYS run
+            # _apply_canonical_state - it re-applies the init state
+            # after PolicyRunner's reset(). This costs nothing extra
+            # vs the slow path's _apply_canonical_state call; the
+            # only saved work in the fast-path is load_scene's
+            # spec recompile.
+            #
+            # Don't bump _episode_count here either - let
+            # _apply_canonical_state's _apply_init_state_branch do
+            # it via the existing increment-after-apply logic. That
+            # way ep0 still gets idx 0 (deterministic, matching
+            # prewarm) and the counter advances naturally.
             logger.debug(
                 "LiberoAdapter.on_episode_start: prewarm-fresh ep0 detected (path=%r); "
-                "skipping load_scene + canonical-state apply",
+                "skipping load_scene + _register_default_robot "
+                "(canonical-state apply still runs to restore qpos after PolicyRunner.sim.reset)",
                 self.scene_path,
             )
             scene_was_loaded = True
-            # Advance the episode counter so ep1+ uses the normal
-            # RNG-sampled init-state path. Mirrors the increment that
-            # _apply_init_state_branch would have done if it had run.
-            self._episode_count = 1
             # Clear the flag so a subsequent fresh prewarm() (e.g. user
             # re-evaluates with a different scene) is detected fresh.
             if isinstance(backend_state, dict):
@@ -713,10 +735,17 @@ class LiberoAdapter(BenchmarkProtocol):
         # else (#166 review: snapshot taken at the wrong lifecycle point
         # was the prior round's failure mode).
         #
-        # Skipped on the prewarm-fresh-ep0 fast-path: prewarm already
-        # applied init_states[0] and forwarded MjData; re-applying
-        # would just bump the episode counter incorrectly.
-        if scene_was_loaded and self._apply_canonical_state_enabled and not is_prewarm_fresh_ep0:
+        # Always runs - including on the prewarm-fresh-ep0 fast-path
+        # (#168 round 22 user-flagged fix). The fast-path used to skip
+        # this on the assumption that prewarm had already applied
+        # init_states[0]; but PolicyRunner._evaluate_with_spec calls
+        # sim.reset() between prewarm and on_episode_start, which
+        # wipes prewarm's qpos work. _apply_canonical_state restores
+        # the init state after that reset. _apply_init_state_branch
+        # itself handles the deterministic-vs-RNG selection via
+        # self._episode_count, so calling it on ep0 still picks
+        # init_states[0] (matching prewarm's choice).
+        if scene_was_loaded and self._apply_canonical_state_enabled:
             self._apply_canonical_state(sim, rng)
         super().on_episode_start(sim, rng)
         if self._install_cameras:
