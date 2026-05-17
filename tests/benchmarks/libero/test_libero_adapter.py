@@ -1691,6 +1691,172 @@ class TestInitJitterDefault:
         assert adapter._init_jitter == 0.02
 
 
+# Pre-register default robot to bypass super()'s redundant add_robot (#166 round 3)
+
+
+class TestPreRegisterDefaultRobot:
+    """``LiberoAdapter._register_default_robot`` calls ``sim.add_robot`` AFTER
+    ``load_scene`` so ``super().on_episode_start`` sees a non-empty
+    ``list_robots()`` and skips its own unconditional add. Otherwise
+    super()'s add fires every episode and recompiles the spec, jumping
+    ``model.nq`` (#166 verification: 44 → 53 on LIBERO SCENE5) and
+    invalidating any qpos snapshot.
+    """
+
+    def _scene_path_setup(self, tmp_path):
+        """Create a cached scene XML so on_episode_start hits the load_scene path."""
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            install_cameras=False,
+            apply_scene_keyframe=False,  # focus on the pre-register flow
+        )
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        assert bddl_path is not None
+        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
+        return adapter
+
+    def test_super_skips_add_when_pre_registered(self, tmp_path):
+        """The full on_episode_start path: pre-register fires, super() finds
+        ``robot`` already in ``list_robots()``, no redundant add_robot."""
+        adapter = self._scene_path_setup(tmp_path)
+        sim = FakeSim(data_config="panda")
+        # Empty registry to simulate post-load_scene state.
+        sim._world.robots.clear()
+        add_robot_calls: list[dict[str, Any]] = []
+        original_add = sim.add_robot
+
+        def tracking_add_robot(self_, name, **kw):  # noqa: ARG002
+            add_robot_calls.append({"name": name, **kw})
+            return original_add(name, **kw)
+
+        with patch.object(FakeSim, "add_robot", tracking_add_robot, create=False):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # Only the pre-register fires - super() sees the robot present and skips.
+        assert len(add_robot_calls) == 1
+        assert add_robot_calls[0]["name"] == "robot"
+        assert add_robot_calls[0]["data_config"] == "panda"
+
+    def test_pre_register_skipped_when_robot_already_present(self, tmp_path):
+        """If a previous episode left the robot registered (or the scene
+        somehow registered it pre-load), don't double-add."""
+        adapter = self._scene_path_setup(tmp_path)
+        sim = FakeSim(data_config="panda")
+        # Pre-populate as if from a prior episode.
+        # FakeSim's _FakeWorld.robots already has 'fake_panda'; add 'robot'
+        # explicitly so list_robots() returns it.
+        sim._world.robots["robot"] = _FakeRobot("panda")
+
+        add_robot_calls: list[str] = []
+
+        def tracking_add_robot(self_, name, **kw):  # noqa: ARG002
+            add_robot_calls.append(name)
+            return {"status": "success", "content": [{"text": "ok"}]}
+
+        with patch.object(FakeSim, "add_robot", tracking_add_robot, create=False):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # No add_robot calls at all - both pre-register and super() find
+        # the robot already present.
+        assert add_robot_calls == []
+
+    def test_pre_register_skipped_when_no_scene_loaded(self):
+        """Bare-Panda fallback (no scene_path): pre-register MUST NOT fire
+        because there's no scene-supplied panda to align with. Let super()
+        do its normal add_robot."""
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            install_cameras=False,
+            auto_generate_scene=False,  # no scene
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world.robots.clear()  # super() should add
+
+        add_robot_calls: list[str] = []
+
+        def tracking_add_robot(self_, name, **kw):  # noqa: ARG002
+            add_robot_calls.append(name)
+            return {"status": "success", "content": [{"text": "ok"}]}
+
+        with patch.object(FakeSim, "add_robot", tracking_add_robot, create=False):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # super() did its normal add (single call).
+        assert add_robot_calls == ["robot"]
+
+    def test_pre_register_failure_falls_through_to_super(self, tmp_path, caplog):
+        """If pre-register's add_robot fails (e.g. backend rejects), log
+        WARNING and let super() retry with the same args - we don't
+        introduce a new failure mode."""
+        adapter = self._scene_path_setup(tmp_path)
+        sim = FakeSim(data_config="panda")
+        sim._world.robots.clear()
+
+        attempt = {"n": 0}
+
+        def flaky_add_robot(self_, name, **kw):  # noqa: ARG002
+            attempt["n"] += 1
+            if attempt["n"] == 1:
+                return {"status": "error", "content": [{"text": "spec injection failed"}]}
+            # super() retries; allow it to succeed.
+            sim._world.robots[name] = _FakeRobot(kw.get("data_config", "panda"))
+            return {"status": "success", "content": [{"text": "ok"}]}
+
+        with caplog.at_level("WARNING"):
+            with patch.object(FakeSim, "add_robot", flaky_add_robot, create=False):
+                adapter.on_episode_start(sim, random.Random(0))
+
+        # Pre-register tried, failed (logged), then super() retried and succeeded.
+        assert attempt["n"] == 2
+        assert any(
+            "pre-register" in rec.message and "failed" in rec.message
+            for rec in caplog.records
+            if rec.levelname == "WARNING"
+        )
+
+    def test_pre_register_no_add_robot_method_skipped(self, tmp_path):
+        """Backends without add_robot at all (future engines) skip silently."""
+        adapter = self._scene_path_setup(tmp_path)
+
+        class _NoAddRobotSim(FakeSim):
+            add_robot = None  # type: ignore[assignment]
+
+        sim = _NoAddRobotSim(data_config="panda")
+        # Pre-register MUST NOT raise even though sim.add_robot is None.
+        # The downstream super() may or may not raise depending on its
+        # own handling; the contract here is just that pre-register's
+        # ``getattr(sim, "add_robot", None)`` short-circuits cleanly.
+        adapter._register_default_robot(sim)
+        # No exception, no crash. The robot wasn't registered (sim has no
+        # add_robot to do it), but that's super()'s problem if/when it
+        # runs - pre-register's contract is met.
+
+    def test_robot_name_matches_super_default(self, tmp_path):
+        """Pre-register MUST use ``name="robot"`` to match super()'s default,
+        otherwise super() still won't recognize the registration and will
+        add a SECOND robot."""
+        adapter = self._scene_path_setup(tmp_path)
+        sim = FakeSim(data_config="panda")
+        sim._world.robots.clear()
+
+        add_robot_names: list[str] = []
+        original_add = sim.add_robot
+
+        def tracking_add_robot(self_, name, **kw):  # noqa: ARG002
+            add_robot_names.append(name)
+            return original_add(name, **kw)
+
+        with patch.object(FakeSim, "add_robot", tracking_add_robot, create=False):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # Single call, named exactly "robot" (not "panda" or anything else).
+        assert add_robot_names == ["robot"]
+
+
 # PolicyRunner + evaluate_benchmark integration
 
 

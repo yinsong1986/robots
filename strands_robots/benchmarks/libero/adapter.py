@@ -474,11 +474,26 @@ class LiberoAdapter(BenchmarkProtocol):
                     msg = (result.get("content") or [{}])[0].get("text", "")
                     raise RuntimeError(f"LiberoAdapter: load_scene({self.scene_path!r}) failed: {msg}")
                 scene_was_loaded = True
-        # Apply canonical state RIGHT AFTER load_scene so the snapshot
-        # captures the post-load state - before super() / install_cameras
-        # have a chance to recompile and shift qpos away from canonical
-        # (#166 review finding: snapshot taken post-recompile is itself
-        # non-canonical, which is why the original placement was inert).
+        # Pre-register the default robot in world.robots BEFORE super()
+        # runs. Otherwise super().on_episode_start (the base
+        # BenchmarkProtocol) would see an empty list_robots() (because
+        # Simulation.load_scene resets world.robots = {}) and call its
+        # own sim.add_robot — which recompiles the spec, jumping
+        # model.nq from N1 → N2 (#166 second-round verification: probe
+        # showed 44 → 53 with a LIBERO scene). That recompile would
+        # invalidate any qpos snapshot we then capture, since ep1's
+        # snapshot would be at N2 but ep2's load_scene resets back to
+        # N1 and add_robot fires again. By pre-registering here, super()
+        # skips its add_robot and goes straight to the compatibility
+        # check; subsequent episodes also pre-register so the snapshot
+        # shape is stable across episodes.
+        if scene_was_loaded:
+            self._register_default_robot(sim)
+        # Apply canonical state RIGHT AFTER load_scene + pre-register so
+        # the snapshot captures the post-load + post-add_robot state -
+        # before super() and install_cameras get a chance to do anything
+        # else (#166 review: snapshot taken at the wrong lifecycle point
+        # was the prior round's failure mode).
         if scene_was_loaded and self._apply_canonical_state_enabled:
             self._apply_canonical_state(sim)
         super().on_episode_start(sim, rng)
@@ -719,6 +734,71 @@ class LiberoAdapter(BenchmarkProtocol):
         if not tmp.exists():
             tmp.write_text(self._bddl_source)
         return tmp
+
+    def _register_default_robot(self, sim: SimEngine) -> None:
+        """Pre-register the default robot in ``sim._world.robots`` if absent.
+
+        Goal: make ``sim.list_robots()`` return non-empty BEFORE
+        ``super().on_episode_start`` runs, so the base
+        :class:`BenchmarkProtocol` skips its unconditional
+        ``sim.add_robot(name="robot", ...)`` call. Otherwise that
+        unconditional call recompiles the spec on every episode (the
+        scene-supplied Panda is a *separate* kinematic chain from the
+        injected ``robot/`` namespaced one — both end up in the merged
+        model at ``nq = N1 + 9``).
+
+        That recompile is what invalidates the qpos snapshot across
+        episodes (#166 round-3 verification: ``model.nq`` jumps
+        ``44 → 53`` on the LIBERO SCENE5 task). By pre-registering with
+        the SAME name super() would have used (``"robot"``), super()
+        finds ``list_robots() == ["robot"]`` and goes straight to the
+        compatibility check.
+
+        Best-effort:
+
+        * Sims without ``add_robot`` (non-MuJoCo backends) → debug-log
+          + skip; super() will then fall through to its own ``add_robot``
+          path which the backend handles however it likes.
+        * ``add_robot`` returns an error dict → log WARNING and skip;
+          super() will retry with the same kwargs and surface the same
+          error consistently.
+        * Robot already registered (from a prior episode where the
+          adapter pre-registered AND the world has been preserved across
+          ``load_scene`` calls — currently never the case but defensive)
+          → no-op.
+        """
+        list_robots = getattr(sim, "list_robots", None)
+        add_robot = getattr(sim, "add_robot", None)
+        if list_robots is None or add_robot is None:
+            logger.debug("LiberoAdapter: sim missing list_robots / add_robot; skipping pre-register")
+            return
+
+        try:
+            existing = list(list_robots())
+        except Exception as e:  # noqa: BLE001 - defensive
+            logger.debug("LiberoAdapter: list_robots() raised: %s", e)
+            return
+        if "robot" in existing:
+            return  # super() will see it and skip its own add
+
+        try:
+            result = add_robot(name="robot", data_config=self.default_robot)
+        except Exception as e:  # noqa: BLE001 - never abort eval on a setup-time error
+            logger.warning(
+                "LiberoAdapter: pre-register sim.add_robot('robot', %r) raised: %s; "
+                "super() will retry and surface the same error",
+                self.default_robot,
+                e,
+            )
+            return
+        if isinstance(result, dict) and result.get("status") == "error":
+            msg = (result.get("content") or [{}])[0].get("text", "")
+            logger.warning(
+                "LiberoAdapter: pre-register sim.add_robot('robot', %r) failed: %s; "
+                "super() will retry and surface the same error",
+                self.default_robot,
+                msg,
+            )
 
     def _install_libero_cameras(self, sim: SimEngine) -> None:
         """Inject the cameras the ``libero_panda`` data_config expects.
