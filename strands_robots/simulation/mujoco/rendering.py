@@ -768,48 +768,84 @@ class RenderingMixin:
             # ``mujoco.egl.GLContext`` allocates a fresh EGL context
             # per calling thread. A main-thread ``sim.render()`` call
             # warms only the main thread's context; this daemon
-            # thread starts cold. Without this warmup the first ~15
-            # render calls return the GL clear-colour gradient
-            # before the context settles.
+            # thread starts cold. Without warmup, the first ~15
+            # render calls per camera return the GL clear-colour
+            # gradient before the context settles.
             #
-            # Two passes per camera. The first pass binds the GL
-            # context for the camera; the second pass produces the
-            # real geometry (the per-camera ``update_scene`` rebind
-            # cold-starts on a fresh thread, so single-pass leaves
-            # the FIRST rendered camera cold while subsequent ones
-            # warm — round-12 verification showed this asymmetry on
-            # multi-camera recordings, fixed by going to 2 passes
-            # in round 13).
+            # History: rounds 11/12/13 added thread-side warmup; round
+            # 14 reverted because the load-scene-without-mj_forward
+            # bug was bigger. Round 15 fixed mj_forward in load_scene,
+            # which made warmup unnecessary IN THE SLOW PATH. Round
+            # 17's prewarm-fresh-ep0 fast-path skips load_scene,
+            # leaving no per-recorder-thread render before capture.
+            # Round 19 tried main-thread warmup (thread-isolation
+            # made it ineffective). Round 20 re-applied the round-13
+            # 2-pass thread-side warmup. Round-20 verification showed
+            # 2 passes was insufficient: image channel stayed cold for
+            # ~15 frames while wrist cleared at frame 3 - per-camera
+            # warmup latency varies across cameras (likely GPU
+            # command-buffer flush ordering).
             #
-            # History: rounds 11/12/13 added a thread-side warmup;
-            # round 14 reverted it because the load-scene-without-
-            # mj_forward bug was the bigger issue at the time. Round
-            # 15 added ``mj_forward`` to ``Simulation.load_scene``,
-            # which made the warmup unnecessary IN THE SLOW PATH
-            # (where on_episode_start re-runs load_scene). But the
-            # round-17 prewarm-fresh-ep0 fast-path skips load_scene,
-            # leaving no per-recorder-thread render before the
-            # capture loop fires. Round 19 tried main-thread warmup;
-            # round-19 verification confirmed thread-isolation makes
-            # that ineffective. Round 20: re-apply the round-13
-            # 2-pass thread-side warmup, now in conjunction with the
-            # round-15 ``mj_forward`` and the round-17 fast-path.
+            # Round 21 (this code): replace fixed-pass warmup with an
+            # adaptive warmup loop. Render each camera until it
+            # produces output with column-stddev above the cold-
+            # gradient threshold. The cold gradient artifact is uniform
+            # skybox blue->grey with col-std ~0.6; real geometry has
+            # col-std > 25 (background plane + objects + textures).
+            # Threshold of 5.0 cleanly separates the two regimes
+            # without false-positives on legitimately uniform scenes
+            # (those would still be > 1.0 from JPEG/encoding noise
+            # if they're real renders, not the GL clear-colour).
             #
-            # Cost: ``~33 ms x 2 passes x n_cameras`` at thread
-            # startup. For 2-camera LIBERO that's ~132 ms, invisible
-            # vs the 250+ s eval wall-time.
+            # Cap: 30 attempts per camera. At 30 fps that's 1.0 s of
+            # wall-time worst-case before the timing loop starts
+            # capturing - invisible vs the 250+ s eval wall-time.
+            # Common case: ~3-5 attempts per camera, total ~100-200 ms
+            # bounded by the slowest-warming camera in the rotation.
             #
             # Errors during warmup are swallowed at DEBUG. Persistent
             # render failures will resurface as
             # ``state["errors"][cam]`` accumulating in the timing
             # loop below (visible via
             # :meth:`get_cameras_recording_status`).
-            for _ in range(2):
+            _max_warmup_attempts = 30
+            _cold_std_threshold = 5.0
+            _warm: dict[str, bool] = dict.fromkeys(names, False)
+            for _attempt in range(_max_warmup_attempts):
+                if all(_warm.values()):
+                    break
                 for cam in names:
+                    if _warm[cam]:
+                        continue
                     try:
-                        self.render(camera_name=cam, width=width, height=height)
+                        r = self.render(camera_name=cam, width=width, height=height)
+                        arr = _extract_frame_ndarray(r)
                     except Exception as e:  # noqa: BLE001 - warmup failures non-fatal
                         logger.debug("recorder thread warmup render failed for %s: %s", cam, e)
+                        continue
+                    if arr is None:
+                        continue
+                    # arr.std(axis=0) is per-column std-dev; .mean()
+                    # collapses to a scalar. Cold gradients have
+                    # near-zero values; real geometry > 5.
+                    col_std = float(arr.std(axis=0).mean())
+                    if col_std > _cold_std_threshold:
+                        _warm[cam] = True
+                        logger.debug(
+                            "recorder thread warmup: %r warmed at attempt %d (col_std=%.2f)",
+                            cam,
+                            _attempt + 1,
+                            col_std,
+                        )
+            if not all(_warm.values()):
+                cold = [c for c, w in _warm.items() if not w]
+                logger.warning(
+                    "recorder thread warmup: %d cameras still cold after %d attempts: %s. "
+                    "First captured frames may show gradient artifact.",
+                    len(cold),
+                    _max_warmup_attempts,
+                    cold,
+                )
 
             interval = 1.0 / fps
             while state["running"]:

@@ -238,54 +238,44 @@ def test_render_passes_scene_option_to_renderer(tmp_path: Path) -> None:
     sim.destroy()
 
 
-# Recorder thread warms up its GL context before the capture loop
-# (#168 round-20: re-applies the round-13 2-pass thread-side warmup
-# now that round-15's mj_forward in load_scene + round-17's
-# prewarm-fresh-ep0 fast-path are in place. Variant-B verification
-# in round 19 confirmed thread-isolation makes main-thread warmup
-# ineffective; the recorder thread needs its own warmup to bind its
-# own mujoco.egl.GLContext.)
+# Recorder thread warms up its GL context adaptively before the
+# capture loop (#168 round-21: replaces the round-20 fixed 2-pass
+# warmup with warmup-until-warm. Round-20 verification showed image
+# channel needed ~15 frames to clear vs wrist's 3 frames - per-camera
+# warmup latency varies. Round 21 keeps rendering each camera until
+# its output passes the col-std threshold, capped at 30 attempts.)
 
 
 @_requires_mujoco
-def test_recorder_thread_warms_up_two_passes_before_capture() -> None:
-    """The recorder thread does TWO synchronous renders per camera at
-    the start of its ``_loop`` body, BEFORE the timing loop begins
-    capturing into buffers.
+def test_recorder_thread_warms_up_until_each_camera_clears() -> None:
+    """The recorder thread renders each camera adaptively until it
+    produces non-gradient output (col-std > threshold), then starts
+    the timing loop.
 
-    Why two passes (round-13/round-20): MuJoCo's shared ``Renderer``
-    rebinds the active camera on each ``update_scene(camera=X)``
-    call. The FIRST render after a camera switch returns a
-    cold-start readback even if the GL context is otherwise warm.
-    With one pass per camera, warming ends on the LAST camera and
-    the first capture render of the FIRST camera cold-starts again,
-    producing a skybox-only gradient at t=0. Two passes guarantee
-    every camera has had two consecutive renders by the time
-    capture starts.
+    Round-21 contract: warmup loop iterates up to MAX_WARMUP_RENDERS
+    times. Each iteration, for every still-cold camera, render once
+    and check ``arr.std(axis=0).mean()`` against the threshold (5.0).
+    Stop iterating when all cameras are warm or cap is hit.
 
-    Why thread-side and not main-thread (#168 round-19 verification):
-    MuJoCo's ``mujoco.GLContext.make_current()`` is thread-bound.
-    A main-thread warmup binds only the main thread's context;
-    the daemon thread starts cold and its first ~15 renders
-    return GL clear-colour gradient until the context settles.
+    Round-20's fixed 2-pass approach was insufficient for the FIRST
+    camera in multi-camera recordings - image channel stayed cold
+    for ~15 frames while wrist cleared at frame 3. The shared
+    ``mujoco.Renderer`` rebinds per-camera state and the per-camera
+    warmup latency varies (likely GPU command-buffer flush
+    ordering).
 
-    History: rounds 11/12/13 added thread-side warmup; round 14
-    reverted it because the load-scene-without-mj_forward bug was
-    the bigger issue. Round 15 fixed mj_forward in load_scene,
-    making warmup unnecessary in the slow path. But round 17's
-    prewarm-fresh-ep0 fast-path skips load_scene, so the warmup
-    is still needed for that path. Round 20 re-applies the
-    2-pass warmup to cover both paths.
-
-    Test mechanism: mock ``threading.Thread`` to capture
-    ``_loop`` without starting it, pre-set
-    ``state["running"]=False`` so the timing loop exits
-    immediately after warmup. Render calls accumulated during
-    the synchronous invocation are exactly the warmup renders
-    (2 per camera = 2 x n_cameras).
+    Test mechanism: mock ``threading.Thread`` to capture ``_loop``
+    without starting it, mock ``sim.render`` to return a stub frame
+    with ``arr.std(axis=0).mean() > 5`` immediately. Warmup should
+    fire exactly once per camera (then mark warm and exit).
     """
     pytest.importorskip("mujoco")
     os.environ.setdefault("MUJOCO_GL", "glfw")
+
+    import io
+
+    import numpy as np
+    from PIL import Image
 
     from strands_robots.simulation import Simulation
 
@@ -295,12 +285,32 @@ def test_recorder_thread_warms_up_two_passes_before_capture() -> None:
     sim.add_camera("cam_a", position=[0.5, 0, 0.5], target=[0, 0, 0])
     sim.add_camera("cam_b", position=[-0.5, 0, 0.5], target=[0, 0, 0])
 
-    render_calls: list[str] = []
-    original_render = sim.render
+    # Stub frame with non-zero column variance (col-std > 5).
+    # Construct a checkerboard-like pattern.
+    arr = np.zeros((48, 64, 3), dtype=np.uint8)
+    arr[:24, :, :] = 255  # top half white, bottom half black -> high col std
+    pil = Image.fromarray(arr)
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG")
+    png_bytes = buf.getvalue()
 
-    def counting_render(camera_name: str, width=None, height=None) -> dict:
+    render_calls: list[str] = []
+
+    def stub_render(camera_name: str, width=None, height=None) -> dict:
         render_calls.append(camera_name)
-        return original_render(camera_name=camera_name, width=width, height=height)
+        return {
+            "status": "success",
+            "content": [
+                {"text": camera_name},
+                {
+                    "image": {
+                        "format": "png",
+                        "source": {"bytes": png_bytes, "media_type": "image/png"},
+                    }
+                },
+                {"json": {"pixel_variance": 100.0, "pixel_mean": 128.0}},
+            ],
+        }
 
     captured_targets: list = []
 
@@ -318,7 +328,7 @@ def test_recorder_thread_warms_up_two_passes_before_capture() -> None:
         def join(self, timeout=None) -> None:
             pass
 
-    with patch.object(sim, "render", side_effect=counting_render):
+    with patch.object(sim, "render", side_effect=stub_render):
         with patch("threading.Thread", _CaptureThread):
             r = sim.start_cameras_recording(
                 cameras=["cam_a", "cam_b"],
@@ -330,16 +340,95 @@ def test_recorder_thread_warms_up_two_passes_before_capture() -> None:
             )
             assert r["status"] == "success", r
             assert len(captured_targets) == 1
-            # Pre-set running=False so timing loop body skipped;
-            # only warmup runs.
             sim._cams_rec_state["running"] = False
             captured_targets[0]()  # invoke _loop synchronously
 
-    # Round-20 contract: TWO warmup passes, in scan order:
-    # cam_a, cam_b, cam_a, cam_b - 4 total renders, alternating.
-    assert render_calls == ["cam_a", "cam_b", "cam_a", "cam_b"], (
-        f"expected two warmup passes (4 renders alternating), got {render_calls}"
-    )
+    # With non-gradient stub frames returned immediately, both cameras
+    # warm on attempt 1: 2 renders total (one per camera).
+    assert render_calls == ["cam_a", "cam_b"], f"expected one render per camera (warm immediately), got {render_calls}"
+
+    sim.destroy()
+
+
+@_requires_mujoco
+def test_recorder_thread_warmup_continues_when_camera_stays_cold() -> None:
+    """If a camera consistently returns gradient frames, warmup retries
+    up to MAX_WARMUP_RENDERS (30) times before giving up. Last
+    iteration logs WARNING about cameras still cold.
+
+    Pin for #168 round-21 contract: the warmup is bounded; cap is
+    30 attempts so the worst-case overhead is ~1 second at 30 fps.
+    Common case is much faster (1-3 attempts per camera)."""
+    pytest.importorskip("mujoco")
+    os.environ.setdefault("MUJOCO_GL", "glfw")
+
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    sim.create_world()
+    sim.add_robot("arm", data_config="so101", position=[0.0, 0.0, 0.0])
+    sim.add_camera("cam", position=[0.5, 0, 0.5], target=[0, 0, 0])
+
+    # Stub: ALWAYS gradient (uniform color, col-std ~0)
+    gradient = np.full((48, 64, 3), 128, dtype=np.uint8)
+    pil = Image.fromarray(gradient)
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+
+    render_calls: list[str] = []
+
+    def gradient_render(camera_name: str, width=None, height=None) -> dict:
+        render_calls.append(camera_name)
+        return {
+            "status": "success",
+            "content": [
+                {"text": camera_name},
+                {
+                    "image": {
+                        "format": "png",
+                        "source": {"bytes": png_bytes, "media_type": "image/png"},
+                    }
+                },
+                {"json": {"pixel_variance": 0.0, "pixel_mean": 128.0}},
+            ],
+        }
+
+    captured_targets: list = []
+
+    class _CaptureThread:
+        def __init__(self, target=None, daemon=None) -> None:
+            self.target = target
+
+        def start(self) -> None:
+            captured_targets.append(self.target)
+
+        def is_alive(self) -> bool:
+            return False
+
+        def join(self, timeout=None) -> None:
+            pass
+
+    with patch.object(sim, "render", side_effect=gradient_render):
+        with patch("threading.Thread", _CaptureThread):
+            sim.start_cameras_recording(
+                cameras=["cam"],
+                output_dir="/tmp",
+                fps=20,
+                width=64,
+                height=48,
+                name="cold_test",
+            )
+            sim._cams_rec_state["running"] = False
+            captured_targets[0]()
+
+    # Capped at 30 attempts.
+    assert len(render_calls) == 30, f"expected 30 warmup attempts (capped), got {len(render_calls)}"
 
     sim.destroy()
 
