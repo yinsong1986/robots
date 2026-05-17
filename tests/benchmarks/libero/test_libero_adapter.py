@@ -1406,6 +1406,153 @@ class TestAugmentObservation:
         )
 
 
+class TestAugmentObservationImageFlip:
+    """Round 39 (#168): ``LiberoAdapter.augment_observation`` flips
+    rendered images vertically to match upstream LIBERO's
+    ``OffScreenRenderEnv`` pixel convention.
+
+    Why: our ``sim.render()`` returns top-row-zero (image convention),
+    upstream's ``OffScreenRenderEnv`` returns bottom-row-zero (OpenGL
+    convention). The GR00T-N1.7-LIBERO checkpoint was trained against
+    upstream + an additional ``[::-1, ::-1]`` rotation done by
+    ``LiberoEnv._process_observation``. The policy's
+    ``image_rotation_180`` flag mirrors that rotation. So feeding raw
+    sim renders to the policy yields an upside-down image relative to
+    training (round-39 ``diff_libero_obs.py`` measured
+    ``mean |Δ| = 56/255`` raw vs upstream, ``5.40/255`` after V-flip).
+
+    Adapter-side flip means the policy stays generic — its
+    ``image_rotation_180`` flag retains its training-pipeline meaning.
+    """
+
+    def _gradient_image(self) -> np.ndarray:
+        """A 4×4×3 uint8 image with row-distinguishable pixels.
+
+        Top row is bright (255), bottom row dark (0). After V-flip,
+        top becomes dark and bottom becomes bright. Test pin uses this
+        signature to detect both presence and direction of the flip.
+        """
+        rows = np.linspace(255, 0, 4, dtype=np.uint8)  # 255, 170, 85, 0
+        return np.stack([np.full((4, 3), v, dtype=np.uint8) for v in rows], axis=0)
+
+    def test_image_is_flipped_vertically(self):
+        """Round 39 (#168): ``image`` key gets ``[::-1, :]`` applied."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        sim = FakeSim(
+            bodies={
+                "hand": {
+                    "position": [0.5, -0.1, 0.3],
+                    "quaternion": [1.0, 0.0, 0.0, 0.0],
+                },
+            }
+        )
+        gradient = self._gradient_image()
+        obs = {"finger_joint1": 0.04, "image": gradient}
+        out = adapter.augment_observation(sim, obs)
+        # After V-flip: top of input is now bottom of output.
+        np.testing.assert_array_equal(out["image"], gradient[::-1, :])
+        # The original input must NOT be mutated.
+        np.testing.assert_array_equal(obs["image"], gradient)
+
+    def test_wrist_image_is_flipped_vertically(self):
+        """Round 39 (#168): ``wrist_image`` key gets ``[::-1, :]`` applied
+        (same convention as ``image``)."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        sim = FakeSim(
+            bodies={
+                "hand": {
+                    "position": [0.5, -0.1, 0.3],
+                    "quaternion": [1.0, 0.0, 0.0, 0.0],
+                },
+            }
+        )
+        gradient = self._gradient_image()
+        obs = {"finger_joint1": 0.04, "wrist_image": gradient}
+        out = adapter.augment_observation(sim, obs)
+        np.testing.assert_array_equal(out["wrist_image"], gradient[::-1, :])
+
+    def test_flipped_image_is_contiguous(self):
+        """Round 39 (#168): the flipped image must be C-contiguous so
+        downstream serialization (msgpack / numpy.tobytes()) works.
+
+        ``arr[::-1, :]`` returns a non-contiguous view; the adapter
+        must materialize it via ``np.ascontiguousarray``."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        sim = FakeSim(
+            bodies={
+                "hand": {
+                    "position": [0.5, -0.1, 0.3],
+                    "quaternion": [1.0, 0.0, 0.0, 0.0],
+                },
+            }
+        )
+        gradient = self._gradient_image()
+        obs = {"finger_joint1": 0.04, "image": gradient}
+        out = adapter.augment_observation(sim, obs)
+        assert out["image"].flags["C_CONTIGUOUS"], (
+            "flipped image must be C-contiguous for msgpack serialization; "
+            "round-39 fix should wrap with np.ascontiguousarray"
+        )
+
+    def test_skips_non_ndarray_values(self):
+        """Round 39 (#168): if a backend supplies the image as something
+        other than an ndarray (e.g. PIL Image, base64 string), the flip
+        skips silently rather than raising — preserves backend
+        flexibility."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        sim = FakeSim(
+            bodies={
+                "hand": {
+                    "position": [0.5, -0.1, 0.3],
+                    "quaternion": [1.0, 0.0, 0.0, 0.0],
+                },
+            }
+        )
+        # Pass a string instead of an ndarray — should pass through unchanged.
+        obs = {"finger_joint1": 0.04, "image": "<base64-png-bytes>"}
+        out = adapter.augment_observation(sim, obs)
+        assert out["image"] == "<base64-png-bytes>"
+
+    def test_skips_low_dimensional_arrays(self):
+        """Round 39 (#168): an ndarray with fewer than 2 dims (e.g. a
+        scalar / 1D state somehow keyed under 'image') is left alone.
+
+        Pin so the flip can't accidentally corrupt non-image data that
+        happens to be keyed under one of the camera names."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        sim = FakeSim(
+            bodies={
+                "hand": {
+                    "position": [0.5, -0.1, 0.3],
+                    "quaternion": [1.0, 0.0, 0.0, 0.0],
+                },
+            }
+        )
+        # 1D ndarray keyed as 'image'.
+        weird = np.array([1.0, 2.0, 3.0])
+        obs = {"finger_joint1": 0.04, "image": weird}
+        out = adapter.augment_observation(sim, obs)
+        np.testing.assert_array_equal(out["image"], weird)
+
+    def test_does_not_inject_when_keys_absent(self):
+        """Round 39 (#168): no ``image`` / ``wrist_image`` keys in input
+        means no synthetic keys appear in output. The flip is purely a
+        transform of existing keys, not a producer of new ones."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        sim = FakeSim(
+            bodies={
+                "hand": {
+                    "position": [0.5, -0.1, 0.3],
+                    "quaternion": [1.0, 0.0, 0.0, 0.0],
+                },
+            }
+        )
+        obs = {"finger_joint1": 0.04}
+        out = adapter.augment_observation(sim, obs)
+        assert "image" not in out
+        assert "wrist_image" not in out
+
+
 class TestQuaternionToEuler:
     """Pure-math regression tests for ``_quat_wxyz_to_rpy_xyz`` so future
     refactors to the helper don't silently rotate the LIBERO state by π."""

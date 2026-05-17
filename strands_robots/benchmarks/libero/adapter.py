@@ -1428,6 +1428,46 @@ class LiberoAdapter(BenchmarkProtocol):
                     self._gripper_joint_name,
                 )
 
+        # Round 39 (#168) — flip rendered images vertically to match
+        # upstream LIBERO's ``OffScreenRenderEnv`` pixel convention.
+        #
+        # WHY: our ``sim.render()`` returns top-row-zero (image
+        # convention), but upstream LIBERO's ``OffScreenRenderEnv``
+        # returns bottom-row-zero (OpenGL framebuffer convention). The
+        # GR00T-N1.7-LIBERO checkpoint was trained against upstream's
+        # convention with an additional ``[::-1, ::-1]`` rotation
+        # applied at training time by ``LiberoEnv._process_observation``
+        # (mirrored in the inference path via the policy's
+        # ``image_rotation_180`` flag).
+        #
+        # Round-39 ``tests_integ/.../diff_libero_obs.py`` measured the
+        # delta: ``mean |Δ| = 56/255`` for raw vs raw, but
+        # ``mean |Δ| = 5.40/255`` after applying ``[::-1, :]`` to ours
+        # — a 10× reduction confirming the vertical-flip-only
+        # mismatch (a horizontal mirror would have shown the opposite
+        # asymmetry).
+        #
+        # WHAT: flip our renders vertically so they're in upstream
+        # OffScreenRenderEnv convention. The policy's existing
+        # ``image_rotation_180`` flag (which applies ``[::-1, ::-1]``)
+        # then converts upstream-convention to training-image
+        # convention as designed.
+        #
+        # Applied to BOTH ``image`` and ``wrist_image`` because both
+        # come from our mujoco renderer with the same convention. We
+        # use ``np.ascontiguousarray`` so downstream serialization
+        # (msgpack / numpy.tobytes()) works — reversed views are not
+        # contiguous.
+        #
+        # Best-effort: if the image isn't a numpy ndarray (e.g. a
+        # backend supplied a PIL Image) or doesn't have at least 2
+        # dimensions, skip silently and let the original value pass
+        # through. This preserves backend flexibility.
+        for cam_key in ("image", "wrist_image"):
+            cam_value = merged.get(cam_key)
+            if isinstance(cam_value, np.ndarray) and cam_value.ndim >= 2:
+                merged[cam_key] = np.ascontiguousarray(cam_value[::-1, :])
+
         # Round 30 (#168) — emit one structured STATE_LOG line per
         # ``augment_observation`` call when STRANDS_LIBERO_STATE_LOG=1.
         # Captures the EXACT state values fed to GR00T's policy server,
