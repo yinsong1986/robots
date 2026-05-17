@@ -2739,7 +2739,17 @@ class _LiberoOSCController:
             raise _ControllerInstallError(f"EEF site {eef_site_name!r} not found in model")
 
         # 5. Build robosuite MjSim shim around our model + data.
-        sim_shim = MjSim(model, data)
+        # robosuite==1.4.0 ``MjSim.__init__(self, model)`` takes only
+        # the model argument and creates a fresh internal
+        # ``mujoco.MjData(model)`` accessible at ``sim_shim.data._data``.
+        # That fresh data buffer is DISCONNECTED from our sim's
+        # actual ``data`` - the controller would compute torques from
+        # a stale, never-stepped buffer (#168 round 23 verification).
+        # Hot-patch ``sim_shim.data._data`` to point at our actual
+        # data so ``controller.run_controller()`` reads/writes the
+        # same buffer the eval is stepping.
+        sim_shim = MjSim(model)
+        sim_shim.data._data = data
 
         # 6. Build OSC_POSE controller config + instance.
         controller_config = load_controller_config(default_controller="OSC_POSE")

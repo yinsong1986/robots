@@ -1897,6 +1897,171 @@ class TestPrewarm:
         assert (sim._world._data.qpos == 0).all()  # type: ignore[attr-defined]
 
 
+class TestInstallActionController:
+    """``LiberoAdapter._install_action_controller`` builds an OSC_POSE
+    controller that converts GR00T's task-space delta-EEF actions
+    (``{x, y, z, roll, pitch, yaw, gripper}``) into the LIBERO scene's
+    torque-mode joint actuators (#168 round 23 / round 24 fix).
+
+    Without the controller, ``_apply_sim_action`` looks up GR00T's
+    keys by name in the model's actuator/joint tables, finds no
+    match, and silently drops every action - the policy effectively
+    sends zero torque (#168 round 22 verification confirmed this is
+    the actual blocker for ``success_rate=0``).
+
+    Round-23 first-attempt failed with ``MjSim.__init__()`` signature
+    mismatch (used 2-arg form, but robosuite 1.4.0's MjSim takes
+    only ``model``). Round-24 fixes that AND hot-patches
+    ``sim_shim.data._data`` to point at the actual sim's MjData
+    buffer (otherwise the controller computes torques from a fresh,
+    never-stepped MjData disconnected from what the eval is
+    stepping). Both fixes are required for the controller to
+    actually drive the robot.
+    """
+
+    @pytest.fixture
+    def libero_scene_xml(self):
+        """Use the existing scene cache if available; otherwise skip.
+
+        The OSC controller install needs a real LIBERO-shaped MJCF
+        with robot0_joint1..7, gripper0_grip_site, etc. Auto-generating
+        from BDDL would require the libero package and ~30s. Use the
+        local cache if present (round-23 verification was on this
+        path); skip if not.
+        """
+        from pathlib import Path
+
+        cache_dir = Path.home() / ".strands_robots" / "scene_cache" / "libero"
+        if not cache_dir.is_dir():
+            pytest.skip(f"no scene cache at {cache_dir}; cannot test OSC install end-to-end")
+        cached = list(cache_dir.glob("*.xml"))
+        if not cached:
+            pytest.skip(f"no .xml files in {cache_dir}; cannot test OSC install end-to-end")
+        return str(cached[0])
+
+    def test_install_succeeds_on_real_libero_scene(self, libero_scene_xml):
+        """End-to-end: load a real LIBERO scene MJCF, install the OSC
+        controller via ``_install_action_controller``, verify it lands
+        in ``world._backend_state['action_controller']`` with the
+        expected discovered IDs."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        adapter._install_action_controller(sim)
+
+        ctrl = sim._world._backend_state.get("action_controller")
+        assert ctrl is not None, (
+            "expected action_controller installed in _backend_state; check WARNING logs for install failure"
+        )
+        # Round-24 fix: verify the data buffer is shared (NOT a fresh
+        # MjData created internally by MjSim).
+        assert ctrl.sim_shim.data._data is sim._world._data, (
+            "sim_shim.data._data must be hot-patched to share our actual "
+            "data buffer; otherwise OSC writes go to a disconnected MjData"
+        )
+        # Discovered 7 arm actuators, ≥2 gripper actuators, EEF site.
+        assert len(ctrl.arm_actuator_ids) == 7
+        assert len(ctrl.gripper_actuator_ids) >= 2
+        assert ctrl.eef_site_name == "gripper0_grip_site"
+
+    def test_apply_writes_nonzero_torques_to_data_ctrl(self, libero_scene_xml):
+        """Round-24 acceptance pin: after a non-trivial Cartesian delta,
+        ``data.ctrl[arm_actuator_ids]`` is non-zero (the OSC controller
+        actually computes torques and writes them to OUR sim's data).
+
+        Verifies the hot-patch fix: round 23 silently used a
+        disconnected MjData buffer, so torques computed by the
+        controller went nowhere. Round 24's
+        ``sim_shim.data._data = data`` puts the writes back on the
+        actual buffer."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        adapter._install_action_controller(sim)
+        ctrl = sim._world._backend_state.get("action_controller")
+        if ctrl is None:
+            pytest.skip("action_controller install failed - see WARNING log")
+
+        # Zero out any prior ctrl writes.
+        sim._world._data.ctrl[:] = 0  # type: ignore[attr-defined]
+
+        # Apply a non-zero delta-EEF action.
+        action = {
+            "x": 0.05,
+            "y": 0.0,
+            "z": 0.0,
+            "roll": 0.0,
+            "pitch": 0.0,
+            "yaw": 0.0,
+            "gripper": 0.0,
+        }
+        ctrl.apply(action, sim._world._model, sim._world._data, "robot")  # type: ignore[attr-defined]
+
+        # Verify torques landed in OUR data.ctrl (not a disconnected buffer).
+        arm_torques = [sim._world._data.ctrl[i] for i in ctrl.arm_actuator_ids]  # type: ignore[attr-defined]
+        nonzero = sum(1 for t in arm_torques if abs(float(t)) > 1e-6)
+        assert nonzero > 0, (
+            f"expected non-zero arm torques after OSC apply, got {arm_torques}. "
+            f"The controller may be writing to a disconnected MjData buffer "
+            f"(round-23 bug) - check that sim_shim.data._data is hot-patched."
+        )
+
+    def test_install_failure_logs_warning_and_continues(self, caplog):
+        """When OSC install fails (e.g. missing site, missing actuators),
+        ``_install_action_controller`` logs WARNING and returns without
+        raising. Eval continues with action no-op (round-22 behaviour).
+
+        Pin against silent install failure regression: previously a
+        bug (round 23's MjSim signature mismatch) caused the install
+        to silently fail and the user wasn't aware - actions became
+        no-ops at WARNING level so users can detect the install
+        failure in logs."""
+        import logging
+
+        pytest.importorskip("mujoco")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        # No model - install will fail at the world.model check.
+
+        with caplog.at_level(logging.WARNING, logger="strands_robots.benchmarks.libero.adapter"):
+            adapter._install_action_controller(sim)
+
+        # Look for the warning about install failure.
+        warned = any("_install_action_controller" in r.message and "no-op" in r.message for r in caplog.records)
+        assert warned, f"expected WARNING about install failure; got: {[r.message for r in caplog.records]}"
+        # No controller installed.
+        assert "action_controller" not in sim._world._backend_state
+
+
 class TestPrewarmFreshEpisodeZero:
     """Round 17: ``on_episode_start`` detects the prewarm-fresh ep0
     state via ``world._backend_state["libero_prewarm_path"]`` and skips
