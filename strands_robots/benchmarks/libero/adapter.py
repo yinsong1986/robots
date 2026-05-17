@@ -81,14 +81,22 @@ class LiberoAdapter(BenchmarkProtocol):
                                n_episodes=10, seed=42)
 
     Attributes:
-        max_steps: Default 300 (LIBERO convention). Override per-task by
-            passing ``max_steps=`` to the constructor or mutating the
-            attribute after construction.
+        max_steps: Default 720 (NVIDIA upstream
+            ``MultiStepConfig.max_episode_steps`` for LIBERO eval —
+            see ``Isaac-GR00T/gr00t/eval/rollout_policy.py``). Override
+            per-task by passing ``max_steps=`` to the constructor or
+            mutating the attribute after construction. Pre-#168
+            round-37 we used the LIBERO repository's lifelong-learning
+            convention of 300; that was too short for libero_10's
+            longer-horizon manipulation tasks (e.g. multi-step pick-
+            and-place chains) and was contributing to ``success_rate=0``
+            on tasks that needed more time. 720 matches the canonical
+            GR00T-N1.7-LIBERO eval setup.
         problem: The parsed :class:`BDDLProblem`. Stored for introspection
             (agents may read ``problem.language`` as the instruction).
     """
 
-    max_steps: int = 300
+    max_steps: int = 720
     supported_robots_list: list[str] = ["panda"]
     default_robot_name: str = "panda"
 

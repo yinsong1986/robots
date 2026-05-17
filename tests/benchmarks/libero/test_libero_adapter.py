@@ -229,7 +229,11 @@ class TestConstruction:
         adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
         assert adapter.supported_robots == ["panda"]
         assert adapter.default_robot == "panda"
-        assert adapter.max_steps == 300
+        # Default max_steps=720 matches NVIDIA's upstream
+        # ``MultiStepConfig.max_episode_steps`` for LIBERO eval (#168
+        # round 37). Pre-round-37 we used 300 (LIBERO repo's lifelong-
+        # learning convention) which was too short for libero_10.
+        assert adapter.max_steps == 720
         assert adapter.instruction == "pick up the red cube and place it on the plate"
 
     def test_from_text_respects_max_steps_override(self):
