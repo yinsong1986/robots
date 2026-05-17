@@ -676,3 +676,113 @@ class TestActionHorizon:
         assert spec.on_step_calls == 5
         assert payload["episodes"][0]["steps"] == 5
         assert payload["episodes"][0]["success"] is True
+
+
+class TestEvalSeeding:
+    """Round 38 (#168): ``_evaluate_with_spec`` calls ``_set_eval_seed``
+    once before the episode loop to seed Python / NumPy / torch / cuDNN
+    so policy stochastic ops (e.g. sampling, dropout) are reproducible
+    across re-runs.
+
+    Mirrors NVIDIA's upstream ``set_seed`` in
+    ``Isaac-GR00T/scripts/deployment/standalone_inference_script.py:81``,
+    minus the global ``CUBLAS_WORKSPACE_CONFIG`` env var and
+    ``torch.use_deterministic_algorithms(...)`` flag that would persist
+    after the eval. Tests target the seeding helper directly + verify
+    the per-episode RNG path still works via ``episode_rng``.
+    """
+
+    def test_set_eval_seed_seeds_python_random(self):
+        """Round 38 (#168): ``_set_eval_seed`` seeds the Python ``random``
+        module so two calls with the same seed produce the same draw.
+
+        Pin the basic contract in case future refactors move the seeding
+        out of the helper."""
+        import random as _stdlib_random
+
+        from strands_robots.simulation.policy_runner import _set_eval_seed
+
+        _set_eval_seed(42)
+        first = [_stdlib_random.random() for _ in range(5)]
+        _set_eval_seed(42)
+        second = [_stdlib_random.random() for _ in range(5)]
+        assert first == second
+
+    def test_set_eval_seed_seeds_numpy(self):
+        """Round 38 (#168): ``_set_eval_seed`` seeds NumPy's legacy
+        global RNG (``np.random.seed``). Pin so policies that use
+        ``np.random.rand`` etc. are reproducible across re-runs."""
+        import numpy as np
+
+        from strands_robots.simulation.policy_runner import _set_eval_seed
+
+        _set_eval_seed(42)
+        first = np.random.rand(5).tolist()
+        _set_eval_seed(42)
+        second = np.random.rand(5).tolist()
+        assert first == second
+
+    def test_set_eval_seed_tolerates_missing_torch(self, monkeypatch):
+        """Round 38 (#168): ``_set_eval_seed`` no-ops the torch branch
+        when torch isn't importable (mock-policy / minimal-CI installs).
+
+        Pin so the function works on installs without torch — the
+        ``ImportError`` should be swallowed silently."""
+        import builtins
+        import sys
+
+        from strands_robots.simulation.policy_runner import _set_eval_seed
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch" or name.startswith("torch."):
+                raise ImportError(f"simulated missing torch ({name})")
+            return real_import(name, *args, **kwargs)
+
+        # Drop any cached torch modules so the lazy import inside
+        # _set_eval_seed actually goes through fake_import.
+        for mod in list(sys.modules):
+            if mod == "torch" or mod.startswith("torch."):
+                monkeypatch.delitem(sys.modules, mod, raising=False)
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+        # Should not raise.
+        _set_eval_seed(42)
+
+    def test_evaluate_benchmark_re_run_yields_same_episode_count(self):
+        """Round 38 (#168): re-running ``evaluate_benchmark`` with the
+        same seed and a deterministic spec produces the same outcome.
+
+        ``MockPolicy`` is deterministic so the per-step trajectory is
+        identical regardless of seed; this test pins that the seeding
+        path doesn't accidentally introduce non-determinism (e.g. by
+        re-seeding mid-episode)."""
+        sim_a = FakeSim()
+        sim_b = FakeSim()
+        spec_a = _CountingBenchmark()
+        spec_b = _CountingBenchmark()
+        register_benchmark("seed-rerun-a", spec_a)
+        register_benchmark("seed-rerun-b", spec_b)
+
+        result_a = sim_a.evaluate_benchmark(
+            benchmark_name="seed-rerun-a",
+            robot_name="fake_robot",
+            policy_provider="mock",
+            n_episodes=2,
+            seed=12345,
+        )
+        result_b = sim_b.evaluate_benchmark(
+            benchmark_name="seed-rerun-b",
+            robot_name="fake_robot",
+            policy_provider="mock",
+            n_episodes=2,
+            seed=12345,
+        )
+        assert result_a["status"] == "success"
+        assert result_b["status"] == "success"
+        payload_a = next(c["json"] for c in result_a["content"] if "json" in c)
+        payload_b = next(c["json"] for c in result_b["content"] if "json" in c)
+        assert payload_a["success_rate"] == payload_b["success_rate"]
+        assert payload_a["n_episodes"] == payload_b["n_episodes"]
+        assert spec_a.on_step_calls == spec_b.on_step_calls

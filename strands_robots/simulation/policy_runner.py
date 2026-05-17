@@ -54,6 +54,66 @@ from strands_robots.simulation.models import TrajectoryStep
 logger = logging.getLogger(__name__)
 
 
+def _set_eval_seed(seed: int) -> None:
+    """Seed Python / NumPy / torch RNGs for reproducible eval rollouts.
+
+    Mirrors NVIDIA's ``set_seed`` from
+    ``Isaac-GR00T/scripts/deployment/standalone_inference_script.py:81``,
+    minus two global side effects that would persist after the eval and
+    affect unrelated callers in the same process:
+
+    * ``os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"`` — leaks into
+      every subsequent torch op in the process.
+    * ``torch.use_deterministic_algorithms(True, warn_only=True)`` —
+      can break callers downstream that rely on non-deterministic CUDA
+      kernels (e.g. some loss functions).
+
+    Users who want NVIDIA's exact strict-determinism mode can set those
+    themselves before calling :meth:`evaluate_benchmark`. The defaults
+    here cover the common case: reproducible rollouts of the SAME
+    policy + seed combination, without forcing the rest of the process
+    into deterministic-only mode.
+
+    Seeds applied:
+
+    * Python ``random.seed``.
+    * NumPy ``np.random.seed`` (the legacy global RNG; matches what
+      most policies use under the hood).
+    * PyTorch CPU (``torch.manual_seed``) — if torch is importable.
+    * PyTorch CUDA all devices (``torch.cuda.manual_seed_all``) — if
+      torch is importable AND CUDA is available.
+    * cuDNN ``deterministic=True`` / ``benchmark=False`` — if torch
+      is importable. These are the standard reproducibility knobs and
+      are scoped to torch (not the broader environment) so the side
+      effect surface is acceptable.
+
+    Per-episode reproducibility additionally depends on the spec's
+    ``episode_rng`` derived from this master seed inside
+    :meth:`_evaluate_with_spec`.
+
+    NumPy / torch are imported lazily so this helper works on minimal
+    installs that don't have torch (e.g. ``policy_provider="mock"``
+    smoke tests).
+    """
+    random.seed(seed)
+    try:
+        import numpy as _np
+
+        _np.random.seed(seed)
+    except ImportError:
+        pass
+    try:
+        import torch as _torch
+
+        _torch.manual_seed(seed)
+        if _torch.cuda.is_available():
+            _torch.cuda.manual_seed_all(seed)
+        _torch.backends.cudnn.deterministic = True
+        _torch.backends.cudnn.benchmark = False
+    except ImportError:
+        pass
+
+
 # Hook signature: called every control step after send_action.
 # on_frame(step_idx, observation, action) -> None
 OnFrame = Callable[[int, dict[str, Any], dict[str, Any]], None]
@@ -667,6 +727,15 @@ class PolicyRunner:
 
         # T26: skip camera rendering when the policy does not need images.
         _skip_images = not getattr(policy, "requires_images", True)
+        # Round 38 (#168): seed Python / NumPy / torch / cuDNN once before
+        # the episode loop so policy stochastic ops (e.g. attention
+        # dropout, sampling temperature) are reproducible across re-runs
+        # at the same ``seed``. Mirrors NVIDIA's upstream ``set_seed`` in
+        # ``Isaac-GR00T/scripts/deployment/standalone_inference_script.py``.
+        # Per-episode reproducibility still flows through ``episode_rng``
+        # below for the spec's per-episode RNG-driven init / jitter.
+        if seed is not None:
+            _set_eval_seed(seed)
         master_rng = random.Random(seed)
         spec_name = type(spec).__name__
         max_steps = spec.max_steps
