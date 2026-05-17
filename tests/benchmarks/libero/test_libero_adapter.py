@@ -1815,6 +1815,173 @@ class TestPrewarm:
         assert (sim._world._data.qpos == 0).all()  # type: ignore[attr-defined]
 
 
+class TestPrewarmFreshEpisodeZero:
+    """Round 17: ``on_episode_start`` detects the prewarm-fresh ep0
+    state via ``world._backend_state["libero_prewarm_path"]`` and skips
+    its own ``load_scene`` + ``_apply_canonical_state`` calls.
+
+    Without this, the recorder thread spawned by
+    ``start_cameras_recording`` captures frames during the race window
+    between ``on_episode_start``'s ``load_scene`` (which resets MjData
+    to qpos0) and ``_apply_canonical_state`` (which restores
+    init_states[0]). The recorder's first frame consistently shows
+    qpos0 instead of the canonical ready pose.
+
+    The fast-path: prewarm has already loaded the scene + applied
+    init_states[0], so on ep0 with the flag set, on_episode_start
+    skips the redundant reload. Episode counter is bumped to 1
+    manually so ep1+ follows the normal lifecycle.
+    """
+
+    def test_ep0_fast_path_skips_load_scene_when_prewarm_flag_matches(self, tmp_path):
+        """Episode 0 with ``libero_prewarm_path`` matching ``self.scene_path``
+        skips ``sim.load_scene`` (no qpos reset)."""
+        pytest.importorskip("mujoco")
+        scene = tmp_path / "scene.xml"
+        scene.write_text("<mujoco><worldbody/></mujoco>")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=str(scene),
+            install_cameras=False,
+            apply_scene_keyframe=False,
+        )
+        sim = FakeSim(data_config="panda")
+        # Simulate prewarm having set the flag.
+        sim._world._backend_state["libero_prewarm_path"] = str(scene)
+
+        load_scene_calls: list = []
+        original_load_scene = sim.load_scene
+
+        def tracking_load_scene(scene_path):
+            load_scene_calls.append(scene_path)
+            return original_load_scene(scene_path)
+
+        with patch.object(sim, "load_scene", side_effect=tracking_load_scene):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # Fast-path: load_scene was NOT called (prewarm already did it).
+        assert load_scene_calls == [], f"expected ep0 fast-path to skip load_scene; got {load_scene_calls}"
+        # Episode counter bumped to 1 (ep0 consumed).
+        assert adapter._episode_count == 1
+        # Flag cleared so a subsequent prewarm + ep0 detects fresh state again.
+        assert "libero_prewarm_path" not in sim._world._backend_state
+
+    def test_ep0_fast_path_skips_canonical_state_apply(self, tmp_path):
+        """Episode 0 fast-path also skips ``_apply_canonical_state``;
+        prewarm already applied init_states[0]. Re-applying would
+        double-bump the episode counter (since
+        ``_apply_init_state_branch`` increments)."""
+        pytest.importorskip("mujoco")
+        scene = tmp_path / "scene.xml"
+        scene.write_text("<mujoco><worldbody/></mujoco>")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=str(scene),
+            install_cameras=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._backend_state["libero_prewarm_path"] = str(scene)
+
+        with patch.object(LiberoAdapter, "_apply_canonical_state") as mock_apply:
+            adapter.on_episode_start(sim, random.Random(0))
+
+        mock_apply.assert_not_called()
+
+    def test_ep1_uses_normal_lifecycle_even_with_prewarm_flag(self, tmp_path):
+        """Episode 1+ runs full ``load_scene`` + ``_apply_canonical_state``
+        regardless of the prewarm flag. The flag is one-shot for ep0;
+        per-episode reset semantics for ep1+ are preserved."""
+        pytest.importorskip("mujoco")
+        scene = tmp_path / "scene.xml"
+        scene.write_text("<mujoco><worldbody/></mujoco>")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=str(scene),
+            install_cameras=False,
+            apply_scene_keyframe=False,
+        )
+        sim = FakeSim(data_config="panda")
+        # Even if the flag is somehow still set on ep1+, the
+        # _episode_count > 0 check should bypass the fast-path.
+        adapter._episode_count = 1
+        sim._world._backend_state["libero_prewarm_path"] = str(scene)
+
+        load_scene_calls: list = []
+        original_load_scene = sim.load_scene
+
+        def tracking_load_scene(scene_path):
+            load_scene_calls.append(scene_path)
+            return original_load_scene(scene_path)
+
+        with patch.object(sim, "load_scene", side_effect=tracking_load_scene):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # Normal lifecycle: load_scene called.
+        assert load_scene_calls == [str(scene)]
+
+    def test_ep0_normal_lifecycle_when_prewarm_flag_missing(self, tmp_path):
+        """Episode 0 WITHOUT the prewarm flag (e.g. user didn't call
+        prewarm before evaluate_benchmark) falls through to the normal
+        lifecycle: load_scene runs, _apply_canonical_state runs.
+        Backwards-compat for callers that don't use prewarm."""
+        pytest.importorskip("mujoco")
+        scene = tmp_path / "scene.xml"
+        scene.write_text("<mujoco><worldbody/></mujoco>")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=str(scene),
+            install_cameras=False,
+            apply_scene_keyframe=False,
+        )
+        sim = FakeSim(data_config="panda")
+        # No libero_prewarm_path flag.
+        assert "libero_prewarm_path" not in sim._world._backend_state
+
+        load_scene_calls: list = []
+        original_load_scene = sim.load_scene
+
+        def tracking_load_scene(scene_path):
+            load_scene_calls.append(scene_path)
+            return original_load_scene(scene_path)
+
+        with patch.object(sim, "load_scene", side_effect=tracking_load_scene):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # Normal lifecycle: load_scene called.
+        assert load_scene_calls == [str(scene)]
+
+    def test_ep0_fast_path_only_when_paths_match(self, tmp_path):
+        """If ``libero_prewarm_path`` is set but to a DIFFERENT path than
+        ``self.scene_path``, the fast-path is NOT taken. Defensive
+        against stale flag state across adapter instances or scene-path
+        changes mid-eval."""
+        pytest.importorskip("mujoco")
+        scene = tmp_path / "scene.xml"
+        scene.write_text("<mujoco><worldbody/></mujoco>")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=str(scene),
+            install_cameras=False,
+            apply_scene_keyframe=False,
+        )
+        sim = FakeSim(data_config="panda")
+        # Different path than self.scene_path - prewarm flag is stale.
+        sim._world._backend_state["libero_prewarm_path"] = "/some/other/scene.xml"
+
+        load_scene_calls: list = []
+        original_load_scene = sim.load_scene
+
+        def tracking_load_scene(scene_path):
+            load_scene_calls.append(scene_path)
+            return original_load_scene(scene_path)
+
+        with patch.object(sim, "load_scene", side_effect=tracking_load_scene):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # Stale flag → normal lifecycle → load_scene called.
+        assert load_scene_calls == [str(scene)]
+
+
 # Scene <keyframe> application (#166 follow-up)
 
 

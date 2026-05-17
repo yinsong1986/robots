@@ -600,7 +600,42 @@ class LiberoAdapter(BenchmarkProtocol):
                 self.scene_path = generated
 
         scene_was_loaded = False
-        if self.scene_path:
+        # Detect "prewarm-fresh ep0": the example script called
+        # prewarm() before start_cameras_recording, which loaded the
+        # scene + applied init_states[0]. Re-running load_scene here
+        # would reset MjData to qpos0 and open a race window where
+        # the recorder thread captures gradient or qpos0 frames
+        # before _apply_canonical_state restores init_states[0]
+        # (#168 round 17 bug D-residual).
+        #
+        # On ep0 with prewarm-fresh state, skip both load_scene and
+        # _apply_canonical_state - prewarm has already done both.
+        # Bump _episode_count manually so ep1+ follows the normal
+        # per-episode reload + RNG-sample lifecycle.
+        backend_state = getattr(getattr(sim, "_world", None), "_backend_state", None)
+        prewarm_path = backend_state.get("libero_prewarm_path") if isinstance(backend_state, dict) else None
+        is_prewarm_fresh_ep0 = self._episode_count == 0 and self.scene_path and prewarm_path == self.scene_path
+
+        if is_prewarm_fresh_ep0:
+            # Fast-path: prewarm already loaded the scene and applied
+            # init_states[0]. Trust that state; skip load_scene +
+            # _apply_canonical_state. The wrapper, cameras, and
+            # viz_option are also already installed by prewarm.
+            logger.debug(
+                "LiberoAdapter.on_episode_start: prewarm-fresh ep0 detected (path=%r); "
+                "skipping load_scene + canonical-state apply",
+                self.scene_path,
+            )
+            scene_was_loaded = True
+            # Advance the episode counter so ep1+ uses the normal
+            # RNG-sampled init-state path. Mirrors the increment that
+            # _apply_init_state_branch would have done if it had run.
+            self._episode_count = 1
+            # Clear the flag so a subsequent fresh prewarm() (e.g. user
+            # re-evaluates with a different scene) is detected fresh.
+            if isinstance(backend_state, dict):
+                backend_state.pop("libero_prewarm_path", None)
+        elif self.scene_path:
             load_scene = getattr(sim, "load_scene", None)
             if load_scene is None:
                 logger.warning(
@@ -626,14 +661,24 @@ class LiberoAdapter(BenchmarkProtocol):
         # skips its add_robot and goes straight to the compatibility
         # check; subsequent episodes also pre-register so the snapshot
         # shape is stable across episodes.
-        if scene_was_loaded:
+        #
+        # In the prewarm-fresh-ep0 path, _register_default_robot was
+        # already called by prewarm; but it's idempotent (early-returns
+        # if "robot" is already in world.robots), so calling again is
+        # cheap and ensures the wrapper is registered even if a
+        # downstream consumer somehow cleared it.
+        if scene_was_loaded and not is_prewarm_fresh_ep0:
             self._register_default_robot(sim)
         # Apply canonical state RIGHT AFTER load_scene + pre-register so
         # the snapshot captures the post-load + post-add_robot state -
         # before super() and install_cameras get a chance to do anything
         # else (#166 review: snapshot taken at the wrong lifecycle point
         # was the prior round's failure mode).
-        if scene_was_loaded and self._apply_canonical_state_enabled:
+        #
+        # Skipped on the prewarm-fresh-ep0 fast-path: prewarm already
+        # applied init_states[0] and forwarded MjData; re-applying
+        # would just bump the episode counter incorrectly.
+        if scene_was_loaded and self._apply_canonical_state_enabled and not is_prewarm_fresh_ep0:
             self._apply_canonical_state(sim, rng)
         super().on_episode_start(sim, rng)
         if self._install_cameras:
@@ -877,6 +922,19 @@ class LiberoAdapter(BenchmarkProtocol):
                 _apply()
         else:
             _apply()
+
+        # Mark in backend_state that prewarm has applied init_state[0]
+        # for this scene_path. on_episode_start checks this flag on
+        # episode 0 and skips its own load_scene + _apply_canonical_state
+        # to avoid re-resetting qpos to qpos0 in the race window before
+        # the recorder thread captures its first frame (#168 round 17
+        # bug D-residual). The flag is one-shot for ep0; on_episode_start
+        # consumes it (sets ``_episode_count`` to 1 directly) so ep1+
+        # follows the normal per-episode reload + RNG-sample lifecycle.
+        backend_state = getattr(world, "_backend_state", None)
+        if isinstance(backend_state, dict):
+            backend_state["libero_prewarm_path"] = self.scene_path
+
         logger.debug("LiberoAdapter.prewarm: applied init_state[0] (qpos[:%d] + qvel[:%d])", nq, nv)
 
     def _forward_mj_data(self, sim: SimEngine) -> None:
