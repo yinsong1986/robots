@@ -1158,6 +1158,189 @@ class TestRenameMjcfCameras:
         assert 'name="image"' in out
 
 
+class TestApplyLiberoVisualFixes:
+    """``_apply_libero_visual_fixes`` post-processes the compiled MJCF to
+    close the visual-fidelity gap to upstream LIBERO's reference render
+    (#168 round-8 bug E).
+
+    Two transforms:
+    * ``_hide_collision_geoms``: rgba alpha -> 0 on every group=0 geom
+      (collision capsules) so they don't render through the agentview
+      camera. Collision detection unaffected (rgba is purely visual).
+    * ``_augment_visual_block``: replace the spartan ``<visual>`` block
+      with one that has explicit headlight ambient (0.2,0.2,0.2),
+      diffuse (0.4,0.4,0.4), shadows, offscreen dimensions.
+
+    Combined effect on the cached LIBERO scene MJCF brings mean-RGB
+    closer to the reference video's wood-tone profile."""
+
+    def test_hide_collision_geoms_implicit_group_zero(self):
+        """Geoms WITHOUT a ``group="..."`` attribute default to group=0
+        in MuJoCo. RoboSuite-emitted MJCFs use this implicit form (verified
+        empirically: 0 occurrences of ``group="0"`` and ~100 ``<geom>``
+        elements with no group attribute on a real LIBERO_10 cache).
+        The transform must hide these even though the literal regex
+        match for ``group="0"`` returns no hits."""
+        from strands_robots.benchmarks.libero.adapter import _hide_collision_geoms
+
+        # Two geoms: one has explicit group="1" (visual), one has no group
+        # (implicit group=0, collision). Only the latter should have its
+        # alpha set to 0.
+        xml = (
+            '<geom name="visual" group="1" type="mesh" rgba="0.9 0.9 0.9 1"/>'
+            '<geom name="collision" type="mesh" rgba="0 0.5 0 1"/>'
+        )
+        out = _hide_collision_geoms(xml)
+        # Visual geom unchanged.
+        assert 'name="visual" group="1" type="mesh" rgba="0.9 0.9 0.9 1"' in out
+        # Collision geom has alpha=0.
+        assert 'name="collision" type="mesh" rgba="0 0.5 0 0"' in out
+
+    def test_hide_collision_geoms_explicit_group_zero(self):
+        """``group="0"`` set explicitly is also collision - same result."""
+        from strands_robots.benchmarks.libero.adapter import _hide_collision_geoms
+
+        xml = '<geom name="c" group="0" type="mesh" rgba="0 0 0.5 1"/>'
+        out = _hide_collision_geoms(xml)
+        assert 'rgba="0 0 0.5 0"' in out
+
+    def test_hide_collision_geoms_preserves_rgb(self):
+        """Only the alpha channel changes; r/g/b values are preserved
+        so any downstream code reading rgba directly (e.g. for debug
+        coloring) still gets meaningful values."""
+        from strands_robots.benchmarks.libero.adapter import _hide_collision_geoms
+
+        xml = '<geom name="c" type="mesh" rgba="0.123 0.456 0.789 1"/>'
+        out = _hide_collision_geoms(xml)
+        assert 'rgba="0.123 0.456 0.789 0"' in out
+
+    def test_hide_collision_geoms_no_rgba_left_alone(self):
+        """Geoms without an ``rgba="..."`` attribute fall through to
+        their material's color. The transform doesn't add rgba where
+        none was - leaves them alone."""
+        from strands_robots.benchmarks.libero.adapter import _hide_collision_geoms
+
+        xml = '<geom name="c" type="mesh" mesh="link0" material="MetalGray"/>'
+        out = _hide_collision_geoms(xml)
+        assert out == xml
+
+    def test_hide_collision_geoms_idempotent(self):
+        """Applying twice produces the same output as applying once.
+        Critical for the cache-key + post-process flow: if a user re-runs
+        with the same transform version, the cache hit doesn't need to
+        worry about re-applying."""
+        from strands_robots.benchmarks.libero.adapter import _hide_collision_geoms
+
+        xml = '<geom name="a" rgba="0 0.5 0 1"/><geom name="b" group="1" rgba="0.9 0.9 0.9 1"/>'
+        once = _hide_collision_geoms(xml)
+        twice = _hide_collision_geoms(once)
+        assert once == twice
+
+    def test_augment_visual_block_replaces_existing(self):
+        """A pre-existing ``<visual>`` block is replaced wholesale with
+        the canonical LIBERO one. The reviewer's suggested
+        ``<visual><map znear="0.001"/></visual>`` is what RoboSuite
+        emits and is what we replace."""
+        from strands_robots.benchmarks.libero.adapter import _augment_visual_block
+
+        xml = '<mujoco><visual><map znear="0.001"/></visual><worldbody/></mujoco>'
+        out = _augment_visual_block(xml)
+        assert "<headlight" in out
+        assert 'ambient="0.2 0.2 0.2"' in out
+        assert 'diffuse="0.4 0.4 0.4"' in out
+        # The original znear="0.001" is replaced by the canonical znear="0.1"
+        # plus fog / quality / global blocks.
+        assert 'znear="0.1"' in out
+        assert "<quality" in out
+        assert "<global" in out
+        # Old znear=0.001 gone.
+        assert 'znear="0.001"' not in out
+
+    def test_augment_visual_block_no_visual_block_no_op(self):
+        """MJCF without a ``<visual>`` element is left alone (defensive
+        against malformed inputs). Adding one would require structural
+        XML editing which is out of scope for the regex-based helper."""
+        from strands_robots.benchmarks.libero.adapter import _augment_visual_block
+
+        xml = "<mujoco><worldbody/></mujoco>"
+        assert _augment_visual_block(xml) == xml
+
+    def test_augment_visual_block_idempotent(self):
+        """Applying twice produces the same output as applying once."""
+        from strands_robots.benchmarks.libero.adapter import _augment_visual_block
+
+        xml = '<mujoco><visual><map znear="0.001"/></visual></mujoco>'
+        once = _augment_visual_block(xml)
+        twice = _augment_visual_block(once)
+        assert once == twice
+
+    def test_apply_libero_visual_fixes_combined(self):
+        """End-to-end: both transforms applied in sequence produce a
+        fully-fixed MJCF with collision geoms hidden AND visual block
+        boosted."""
+        from strands_robots.benchmarks.libero.adapter import _apply_libero_visual_fixes
+
+        xml = (
+            "<mujoco>"
+            '<visual><map znear="0.001"/></visual>'
+            "<worldbody>"
+            '<geom name="vis" group="1" rgba="0.5 0.5 0.5 1"/>'
+            '<geom name="col" rgba="0 0.5 0 1"/>'
+            "</worldbody>"
+            "</mujoco>"
+        )
+        out = _apply_libero_visual_fixes(xml)
+        # Visual block boosted.
+        assert 'ambient="0.2 0.2 0.2"' in out
+        # Visual geom (group=1) unchanged.
+        assert 'name="vis" group="1" rgba="0.5 0.5 0.5 1"' in out
+        # Collision geom alpha=0.
+        assert 'name="col" rgba="0 0.5 0 0"' in out
+
+    def test_apply_libero_visual_fixes_idempotent(self):
+        """Public entry point is idempotent: cache files written by
+        round-N and read by round-N+1 with the same transform_version
+        re-render identically."""
+        from strands_robots.benchmarks.libero.adapter import _apply_libero_visual_fixes
+
+        xml = (
+            "<mujoco>"
+            '<visual><map znear="0.001"/></visual>'
+            '<worldbody><geom name="c" rgba="0 0.5 0 1"/></worldbody>'
+            "</mujoco>"
+        )
+        once = _apply_libero_visual_fixes(xml)
+        twice = _apply_libero_visual_fixes(once)
+        assert once == twice
+
+    def test_cache_key_includes_transform_version(self):
+        """``_LIBERO_MJCF_TRANSFORM_VERSION`` is hashed into the
+        scene-cache key so a version bump invalidates stale on-disk
+        caches generated by prior versions. Critical for upgrade
+        paths where users pick up a new round and need their cache to
+        regenerate (e.g. pre-#168-r8 cache has un-fixed visual block
+        and visible collision geoms - we MUST NOT serve the stale
+        post-process)."""
+        import strands_robots.benchmarks.libero.adapter as adapter_module
+
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, install_cameras=False)
+        bddl_bytes = b"some bddl content"
+
+        # Capture the cache key under the current version.
+        original_version = adapter_module._LIBERO_MJCF_TRANSFORM_VERSION
+        key1 = adapter._scene_cache_key(bddl_bytes)
+
+        # Bump the version.
+        try:
+            adapter_module._LIBERO_MJCF_TRANSFORM_VERSION = "v999"
+            key2 = adapter._scene_cache_key(bddl_bytes)
+        finally:
+            adapter_module._LIBERO_MJCF_TRANSFORM_VERSION = original_version
+
+        # Different version -> different cache key.
+        assert key1 != key2
+
+
 # Scene <keyframe> application (#166 follow-up)
 
 
