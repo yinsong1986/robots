@@ -762,6 +762,154 @@ class TestAugmentObservation:
         # Gripper still injected from the obs lookup.
         assert out["gripper"] == pytest.approx([0.04, 0.04])
 
+    def test_state_log_disabled_by_default(self, monkeypatch, caplog):
+        """Round 30 (#168): ``STRANDS_LIBERO_STATE_LOG`` is opt-in.
+        When unset, ``augment_observation`` emits no STATE_LOG lines.
+
+        Pin so a future bug doesn't accidentally enable it by default
+        (which would flood production eval logs with state values from
+        every observation request)."""
+        import logging as _logging
+
+        monkeypatch.delenv("STRANDS_LIBERO_STATE_LOG", raising=False)
+
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        sim = FakeSim(
+            bodies={
+                "hand": {
+                    "position": [0.5, -0.1, 0.3],
+                    "quaternion": [1.0, 0.0, 0.0, 0.0],
+                },
+            }
+        )
+
+        with caplog.at_level(_logging.INFO, logger="strands_robots.benchmarks.libero.adapter"):
+            adapter.augment_observation(sim, {"finger_joint1": 0.04})
+
+        state_log_lines = [r for r in caplog.records if "STATE_LOG" in r.getMessage()]
+        assert len(state_log_lines) == 0, f"expected zero STATE_LOG lines without env var, got {len(state_log_lines)}"
+
+    def test_state_log_enabled_emits_one_log_per_call(self, monkeypatch, caplog):
+        """Round 30 (#168): with ``STRANDS_LIBERO_STATE_LOG=1``, each
+        ``augment_observation`` call emits exactly one ``STATE_LOG``
+        INFO line containing the state values being fed to the GR00T
+        policy server.
+
+        Field-set contract:
+        - ``step=N``
+        - ``x=`` ``y=`` ``z=`` (Cartesian position)
+        - ``roll=`` ``pitch=`` ``yaw=`` (Euler angles, sxyz extrinsic)
+        - ``gripper=`` (2-element list per round-21's PR #162 shape)
+        - ``obs_keys=`` (sorted list of all keys in the merged obs)
+
+        Pin so a future refactor that drops a field fails loudly here.
+        """
+        import logging as _logging
+
+        monkeypatch.setenv("STRANDS_LIBERO_STATE_LOG", "1")
+
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        # Verify cached env-var read.
+        assert adapter._state_log_enabled is True
+        assert adapter._state_log_step == 0
+
+        sim = FakeSim(
+            bodies={
+                "hand": {
+                    "position": [0.5, -0.1, 0.3],
+                    "quaternion": [1.0, 0.0, 0.0, 0.0],
+                },
+            }
+        )
+
+        with caplog.at_level(_logging.INFO, logger="strands_robots.benchmarks.libero.adapter"):
+            adapter.augment_observation(sim, {"finger_joint1": 0.04})
+
+        state_log_lines = [r for r in caplog.records if "STATE_LOG" in r.getMessage()]
+        assert len(state_log_lines) == 1, f"expected exactly 1 STATE_LOG line, got {len(state_log_lines)}"
+
+        msg = state_log_lines[0].getMessage()
+        for field in ["step=0", "x=", "y=", "z=", "roll=", "pitch=", "yaw=", "gripper=", "obs_keys="]:
+            assert field in msg, f"missing field {field!r} in STATE_LOG: {msg}"
+
+        # Counter advanced.
+        assert adapter._state_log_step == 1
+
+    def test_state_log_caps_at_max_steps(self, monkeypatch, caplog):
+        """Round 30 (#168): ``STRANDS_LIBERO_STATE_LOG_MAX`` caps how
+        many ``augment_observation`` calls log per episode. After the
+        cap, the call is silent. Pin so a long episode doesn't flood
+        logs once the diagnostic window has captured what's needed."""
+        import logging as _logging
+
+        monkeypatch.setenv("STRANDS_LIBERO_STATE_LOG", "1")
+        monkeypatch.setenv("STRANDS_LIBERO_STATE_LOG_MAX", "3")
+
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        assert adapter._state_log_max == 3
+
+        sim = FakeSim(
+            bodies={
+                "hand": {
+                    "position": [0.5, -0.1, 0.3],
+                    "quaternion": [1.0, 0.0, 0.0, 0.0],
+                },
+            }
+        )
+
+        with caplog.at_level(_logging.INFO, logger="strands_robots.benchmarks.libero.adapter"):
+            for _ in range(7):
+                adapter.augment_observation(sim, {"finger_joint1": 0.04})
+
+        state_log_lines = [r for r in caplog.records if "STATE_LOG" in r.getMessage()]
+        assert len(state_log_lines) == 3, f"expected 3 STATE_LOG lines (cap=3), got {len(state_log_lines)}"
+        assert adapter._state_log_step == 3
+
+    def test_state_log_resets_on_episode_start(self, monkeypatch):
+        """Round 30 (#168): ``on_episode_start`` zeros the per-episode
+        STATE_LOG counter so each episode logs its own first N
+        observations.
+
+        Without this, the second episode of a multi-episode eval
+        would silently emit no STATE_LOG (counter already at the cap
+        from episode 1)."""
+        import random
+
+        monkeypatch.setenv("STRANDS_LIBERO_STATE_LOG", "1")
+
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+
+        # Drive counter forward.
+        adapter._state_log_step = 5
+
+        sim = FakeSim(data_config="panda")
+        rng = random.Random(0)
+        adapter.on_episode_start(sim, rng)
+
+        assert adapter._state_log_step == 0, "on_episode_start must zero the per-episode STATE_LOG counter"
+
+    def test_state_log_invalid_max_value_warns_and_falls_back(self, monkeypatch, caplog):
+        """Round 30 (#168): a malformed ``STRANDS_LIBERO_STATE_LOG_MAX``
+        (e.g. ``foo``) must log a WARNING and fall back to the default
+        (50), not silently swallow the typo. Mirrors the AGENTS.md rule
+        for ``STRANDS_*`` env vars."""
+        import logging as _logging
+
+        monkeypatch.setenv("STRANDS_LIBERO_STATE_LOG", "1")
+        monkeypatch.setenv("STRANDS_LIBERO_STATE_LOG_MAX", "not-an-int")
+
+        with caplog.at_level(_logging.WARNING, logger="strands_robots.benchmarks.libero.adapter"):
+            adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+
+        # Default fallback.
+        assert adapter._state_log_max == 50
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == _logging.WARNING and "STRANDS_LIBERO_STATE_LOG_MAX" in r.getMessage()
+        ]
+        assert len(warnings) >= 1, "expected a WARNING about malformed STRANDS_LIBERO_STATE_LOG_MAX"
+
 
 class TestQuaternionToEuler:
     """Pure-math regression tests for ``_quat_wxyz_to_rpy_xyz`` so future

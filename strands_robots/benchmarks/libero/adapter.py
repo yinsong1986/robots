@@ -421,6 +421,39 @@ class LiberoAdapter(BenchmarkProtocol):
         self._bddl_path = bddl_path
         self._success_fn: Callable[[SimEngine], bool] = compile_goal(problem.goal)
 
+        # Round 30 (#168) — diagnostic logging gate for the STATE side
+        # of the policy interface. Set ``STRANDS_LIBERO_STATE_LOG=1`` to
+        # emit one structured INFO log line per ``augment_observation``
+        # call for the first ``STRANDS_LIBERO_STATE_LOG_MAX`` (default
+        # 50) calls per episode. Pairs with ``STRANDS_LIBERO_ACTION_LOG``
+        # (round 29) so a single eval run captures both sides of the
+        # policy interface for offline bisection.
+        #
+        # Round-29 verification showed ``arm_qpos`` advances and
+        # ``eef_pos`` tracks deltas, but the policy is commanding tiny
+        # deltas (~0.01 in [-1, +1] normalized space). The remaining
+        # `success_rate=0` is on the state-input side — GR00T sees an
+        # observation that says "EEF is already where it needs to be"
+        # and emits near-zero deltas. STATE_LOG dumps exactly what we
+        # feed GR00T so we can compare against LIBERO's
+        # ``OffScreenRenderEnv`` ground truth at the same canonical
+        # init pose.
+        self._state_log_enabled = os.environ.get("STRANDS_LIBERO_STATE_LOG", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        try:
+            self._state_log_max = int(os.environ.get("STRANDS_LIBERO_STATE_LOG_MAX", "50"))
+        except ValueError:
+            logger.warning(
+                "STRANDS_LIBERO_STATE_LOG_MAX=%r is not an integer; defaulting to 50",
+                os.environ.get("STRANDS_LIBERO_STATE_LOG_MAX"),
+            )
+            self._state_log_max = 50
+        self._state_log_step: int = 0
+
     # Construction helpers
 
     @classmethod
@@ -771,6 +804,12 @@ class LiberoAdapter(BenchmarkProtocol):
             self._install_action_controller(sim)
         if self._init_jitter > 0:
             self._apply_init_jitter(sim, rng)
+
+        # Round 30 (#168) — reset per-episode state-log counter so each
+        # episode emits its own first N STATE_LOG lines (matches the
+        # round-29 behaviour for ACTION_LOG via the controller's
+        # reset() call inside _install_action_controller above).
+        self._state_log_step = 0
 
     def prewarm(self, sim: SimEngine) -> None:
         """Idempotent setup that should run BEFORE ``sim.start_cameras_recording``.
@@ -1251,6 +1290,30 @@ class LiberoAdapter(BenchmarkProtocol):
                 "LiberoAdapter: gripper joint %r not found in obs; omitting state.gripper",
                 self._gripper_joint_name,
             )
+
+        # Round 30 (#168) — emit one structured STATE_LOG line per
+        # ``augment_observation`` call when STRANDS_LIBERO_STATE_LOG=1.
+        # Captures the EXACT state values fed to GR00T's policy server,
+        # for offline comparison against LIBERO's
+        # ``OffScreenRenderEnv.observation_spec()`` ground truth at the
+        # same canonical init pose. Round-29 ACTION_LOG showed the
+        # OSC tracks tiny deltas correctly (95% of arm_ctrl is
+        # gravity comp); the policy is *commanding* tiny deltas, which
+        # points at state-input mismatch (units, frame, or magnitudes).
+        if self._state_log_enabled and self._state_log_step < self._state_log_max:
+            logger.info(
+                "STATE_LOG step=%d x=%s y=%s z=%s roll=%s pitch=%s yaw=%s gripper=%s obs_keys=%s",
+                self._state_log_step,
+                _fmt_state_value(merged.get("x")),
+                _fmt_state_value(merged.get("y")),
+                _fmt_state_value(merged.get("z")),
+                _fmt_state_value(merged.get("roll")),
+                _fmt_state_value(merged.get("pitch")),
+                _fmt_state_value(merged.get("yaw")),
+                _fmt_state_value(merged.get("gripper")),
+                sorted(merged.keys()),
+            )
+            self._state_log_step += 1
 
         return merged
 
@@ -2319,6 +2382,26 @@ def _extract_pose(state: dict[str, Any] | None) -> tuple[list[float] | None, lis
         if isinstance(raw_quat, list) and len(raw_quat) == 4 and all(isinstance(c, (int, float)) for c in raw_quat):
             quat = [float(c) for c in raw_quat]
     return (pos, quat)
+
+
+def _fmt_state_value(value: Any) -> str:
+    """Format a state value for ``STATE_LOG`` output (round 30, #168).
+
+    Returns ``"None"`` for missing keys, scalar floats rounded to 6dp,
+    and list/tuple/ndarray values rounded element-wise. Matches the
+    ``np.round(..., 6).tolist()`` style of round-29's ACTION_LOG so
+    a single grep yields parseable values across both diagnostic
+    streams.
+    """
+    if value is None:
+        return "None"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{float(value):.6f}"
+    if isinstance(value, (list, tuple)):
+        return str([round(float(v), 6) if isinstance(v, (int, float)) else v for v in value])
+    if isinstance(value, np.ndarray):
+        return str(np.round(value, 6).tolist())
+    return repr(value)
 
 
 def _quat_wxyz_to_rpy_xyz(quat_wxyz: list[float]) -> tuple[float, float, float]:
