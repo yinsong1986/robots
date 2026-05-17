@@ -532,21 +532,23 @@ class TestActionHorizon:
     to control how many actions are consumed per ``policy.get_actions``
     inference call.
 
-    Default is ``1`` — closed-loop receding-horizon control matching
-    LIBERO/OpenVLA convention. Values > 1 are open-loop chunk replay
-    used for inference-amortization or for testing whether a policy
-    was trained with chunk-replay assumptions.
+    Round 36 (#168): default flipped from ``1`` to ``8`` to match
+    NVIDIA's upstream GR00T LIBERO eval (``MultiStepWrapper`` with
+    ``n_action_steps=8``). GR00T-N1.7-LIBERO checkpoints were trained
+    against 8-step open-loop chunk replay, so an ``action_horizon=1``
+    default put eval out-of-distribution from training. Set
+    ``action_horizon=1`` explicitly for closed-loop receding-horizon
+    control (OpenVLA convention).
     """
 
-    def test_default_action_horizon_is_one_closed_loop(self):
-        """Round 34 (#168): default ``action_horizon=1`` consumes exactly
-        one action per ``policy.get_actions`` call regardless of how many
-        actions the policy returns in its chunk.
+    def test_default_action_horizon_is_eight_chunk_replay(self):
+        """Round 36 (#168): default ``action_horizon=8`` consumes up to
+        eight actions per ``policy.get_actions`` call before re-querying.
 
-        ``MockPolicy`` returns 8 actions per call. With ``action_horizon=1``
-        only the first is applied per inference. Pin the closed-loop
-        default so users on LIBERO/OpenVLA don't accidentally drift
-        into open-loop chunk replay."""
+        ``MockPolicy`` returns 8 actions per call. With
+        ``action_horizon=8`` all eight are applied per inference.
+        Pin the chunk-replay default so users running GR00T-N1.7-LIBERO
+        match NVIDIA's reference eval setup."""
         sim = FakeSim()
         spec = _CountingBenchmark()
         register_benchmark("default-horizon", spec)
@@ -560,7 +562,9 @@ class TestActionHorizon:
         )
         assert result["status"] == "success", result
         payload = next(c["json"] for c in result["content"] if "json" in c)
-        # max_steps=20 ⇒ 20 single-action inferences. on_step called 20×.
+        # max_steps=20 ⇒ 2 chunks of 8 (16) + 4 from the 3rd chunk
+        # (mid-chunk cap) = 20. on_step still called per APPLIED
+        # action.
         assert spec.on_step_calls == 20
         assert payload["episodes"][0]["steps"] == 20
 

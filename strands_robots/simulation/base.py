@@ -460,7 +460,7 @@ class SimEngine(ABC):
         instruction: str = "",
         n_episodes: int = 1,
         seed: int | None = None,
-        action_horizon: int = 1,
+        action_horizon: int = 8,
     ) -> dict[str, Any]:
         """Run a registered :class:`BenchmarkProtocol` against the current sim.
 
@@ -483,14 +483,17 @@ class SimEngine(ABC):
             seed: Master RNG seed for per-episode reproducibility.
             action_horizon: How many actions to consume from each
                 ``policy.get_actions(...)`` chunk before re-querying the
-                policy. Default ``1`` (closed-loop receding-horizon: get
-                fresh observations every control step). LIBERO/OpenVLA
-                benchmarks train and eval at ``action_horizon=1`` —
-                changing this is a research / debugging knob, not
-                a performance optimisation. Values ``> 1`` skip
-                re-observation between consecutive actions in the same
-                chunk, which is open-loop and can drift on tasks
-                requiring contact-rich coordination.
+                policy. Default ``8`` matches NVIDIA's upstream
+                GR00T LIBERO eval (``MultiStepWrapper`` with
+                ``n_action_steps=8``) — the policy commits to 8 actions
+                before re-observing, which is what GR00T-N1.7-LIBERO
+                checkpoints were trained against. Set to ``1`` for
+                closed-loop receding-horizon control (re-observe every
+                step; matches OpenVLA-style eval). Values < 1 are
+                rejected with a structured error. ``on_step`` and
+                success/failure checks run after EACH applied action,
+                so per-step rewards and early termination work
+                correctly regardless of horizon.
 
         Returns:
             Standard status dict. On success, carries per-episode cumulative

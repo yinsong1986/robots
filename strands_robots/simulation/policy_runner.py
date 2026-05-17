@@ -516,7 +516,7 @@ class PolicyRunner:
         success_fn: SuccessFn | str | None = None,
         spec: BenchmarkProtocol | None = None,
         seed: int | None = None,
-        action_horizon: int = 1,
+        action_horizon: int = 8,
     ) -> dict[str, Any]:
         """Evaluate ``policy`` for ``n_episodes`` episodes.
 
@@ -647,7 +647,7 @@ class PolicyRunner:
         instruction: str,
         n_episodes: int,
         seed: int | None,
-        action_horizon: int = 1,
+        action_horizon: int = 8,
     ) -> dict[str, Any]:
         """Drive a :class:`BenchmarkProtocol` for ``n_episodes`` episodes.
 
@@ -729,14 +729,17 @@ class PolicyRunner:
                 coro_or_result = policy.get_actions(observation, instruction)
                 actions = _resolve_coroutine(coro_or_result)
 
-                # Round 34 (#168): consume up to ``action_horizon`` actions
-                # per inference. Default ``action_horizon=1`` is closed-loop
-                # receding-horizon control (LIBERO/OpenVLA convention) — re-
-                # query the policy on every control step. Values > 1 are
-                # open-loop chunk replay; the policy commits to N actions
-                # before re-observing, faster but can drift on contact-rich
-                # tasks. ``on_step`` and success/failure checks run after
-                # EACH applied action so per-step rewards / early termination
+                # Round 36 (#168): consume up to ``action_horizon`` actions
+                # per inference. Default ``action_horizon=8`` matches NVIDIA's
+                # upstream GR00T LIBERO eval (``MultiStepWrapper`` with
+                # ``n_action_steps=8``) — the GR00T-N1.7-LIBERO checkpoints
+                # were trained against an 8-step open-loop chunk replay.
+                # Round 34's earlier ``=1`` default (closed-loop OpenVLA
+                # convention) put eval out-of-distribution from training
+                # and was a contributing factor to ``success_rate=0``.
+                # Set to ``1`` for closed-loop receding-horizon control.
+                # ``on_step`` and success/failure checks run after EACH
+                # applied action so per-step rewards / early termination
                 # work whether action_horizon is 1 or 8.
                 action_applied: dict[str, Any] = {}
                 stop_episode = False
