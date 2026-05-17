@@ -242,21 +242,27 @@ def test_render_passes_scene_option_to_renderer(tmp_path: Path) -> None:
 
 
 @_requires_mujoco
-def test_start_cameras_recording_warms_up_renderer_before_thread() -> None:
-    """``start_cameras_recording`` does one synchronous render per camera
-    BEFORE launching the recorder thread.
+def test_recorder_thread_warms_up_renderer_before_capture_loop() -> None:
+    """The recorder thread does one synchronous render per camera at
+    the START of its ``_loop`` body, BEFORE the timing loop begins
+    capturing into buffers.
 
-    Without this warmup, the recorder thread's first frame hits a
-    cold-start render pipeline (no scene buffer, GL context not bound
-    to the data, etc.) and returns the GL clear-colour / skybox
-    gradient - mean RGB ``(138, 150, 177)`` with col-std ~0.6 - instead
-    of real geometry. With the warmup, the thread's first call is
-    actually the second render() and lands on the warm path.
+    Why this and not main-thread warmup: MuJoCo's
+    ``mujoco.GLContext.make_current()`` binds to the calling thread.
+    A warmup render performed in the main thread (i.e. before
+    ``state["thread"].start()``) doesn't propagate to the daemon
+    thread - the daemon thread has its own cold-start GL context on
+    its first call. Round 11 attempted main-thread warmup and
+    verification confirmed t=0 frame still rendered as a skybox-only
+    gradient (col-std 0.62) because of this thread boundary. The
+    thread-side warmup tested here is the round-12 fix.
 
-    This is a no-GL test: mocks ``Renderer.render`` to count calls
-    AND mocks ``Thread`` so .start() is a no-op (otherwise the
-    daemon thread would fire a few extra render calls before the test
-    cleans up).
+    Test mechanism: mock ``threading.Thread`` to capture the
+    ``_loop`` target without starting it, then invoke ``_loop``
+    directly with ``state["running"]`` pre-set to False so the
+    timing loop exits immediately after warmup. Render calls
+    accumulated during the synchronous invocation are exactly the
+    warmup renders (one per camera).
     """
     pytest.importorskip("mujoco")
     os.environ.setdefault("MUJOCO_GL", "glfw")
@@ -269,7 +275,6 @@ def test_start_cameras_recording_warms_up_renderer_before_thread() -> None:
     sim.add_camera("cam_a", position=[0.5, 0, 0.5], target=[0, 0, 0])
     sim.add_camera("cam_b", position=[-0.5, 0, 0.5], target=[0, 0, 0])
 
-    # Track render calls + camera names.
     render_calls: list[str] = []
     original_render = sim.render
 
@@ -277,17 +282,15 @@ def test_start_cameras_recording_warms_up_renderer_before_thread() -> None:
         render_calls.append(camera_name)
         return original_render(camera_name=camera_name, width=width, height=height)
 
-    # Mock Thread so .start() doesn't actually run _loop. Every render
-    # call recorded here is from the warmup, not the thread loop.
-    started_thread_targets: list = []
+    captured_targets: list = []
 
-    class _NoStartThread:
+    class _CaptureThread:
         def __init__(self, target=None, daemon=None) -> None:
             self.target = target
             self.daemon = daemon
 
         def start(self) -> None:
-            started_thread_targets.append(self.target)
+            captured_targets.append(self.target)
 
         def is_alive(self) -> bool:
             return False
@@ -296,7 +299,7 @@ def test_start_cameras_recording_warms_up_renderer_before_thread() -> None:
             pass
 
     with patch.object(sim, "render", side_effect=counting_render):
-        with patch("threading.Thread", _NoStartThread):
+        with patch("threading.Thread", _CaptureThread):
             r = sim.start_cameras_recording(
                 cameras=["cam_a", "cam_b"],
                 output_dir="/tmp",
@@ -305,35 +308,36 @@ def test_start_cameras_recording_warms_up_renderer_before_thread() -> None:
                 height=48,
                 name="warmup_test",
             )
+            assert r["status"] == "success", r
+            # Round 12: NO render calls have happened yet - warmup is
+            # now inside _loop, which the mocked Thread didn't start.
+            assert render_calls == [], f"unexpected render calls before _loop ran: {render_calls}"
+            # The thread target was captured.
+            assert len(captured_targets) == 1
 
-    # Hot path: at least one render call per camera before the thread
-    # was started (i.e. while the test is running, with the thread
-    # mocked out so its loop never fires).
-    assert r["status"] == "success", r
-    assert "cam_a" in render_calls, f"warmup didn't render cam_a; calls={render_calls}"
-    assert "cam_b" in render_calls, f"warmup didn't render cam_b; calls={render_calls}"
-    # Exactly the warmup count - thread was mocked, so no thread-side calls.
-    assert len(render_calls) == 2, (
-        f"expected exactly 2 warmup renders (one per camera), got {len(render_calls)}: {render_calls}"
-    )
-    # Thread was created and .start() was called (just no-op'd by the mock).
-    assert len(started_thread_targets) == 1
+            # Stop the timing loop before invoking _loop so it returns
+            # immediately after the warmup. Render calls collected
+            # below are exclusively warmup calls.
+            sim._cams_rec_state["running"] = False
+            captured_targets[0]()  # invoke _loop synchronously
 
-    # Tear down via the explicit stop path - the mocked thread never
-    # actually started, so this just clears state.
-    sim._cams_rec_state["running"] = False
+    # Exactly one render per camera, in scan order, from the warmup
+    # at the top of _loop (no timing-loop calls because running=False).
+    assert render_calls == ["cam_a", "cam_b"], f"expected one warmup render per camera, got {render_calls}"
+
     sim.destroy()
 
 
 @_requires_mujoco
-def test_start_cameras_recording_warmup_failure_does_not_abort() -> None:
-    """If the synchronous warmup render raises, ``start_cameras_recording``
-    still proceeds to launch the thread - warmup is best-effort.
+def test_recorder_thread_warmup_failure_does_not_abort() -> None:
+    """If the thread-side warmup render raises, the timing loop still
+    starts (and accumulates ``state['errors'][cam]`` per the standard
+    error-tracking path).
 
-    Required because warmup failure shouldn't crash recording entirely;
-    the thread loop will accumulate ``state['errors'][cam]`` for any
-    persistent render failure and the user can inspect via
-    ``get_cameras_recording_status``."""
+    Required because warmup failure shouldn't crash the whole
+    recorder thread; the timing loop's exception handler will
+    surface persistent failures via
+    :meth:`get_cameras_recording_status`."""
     pytest.importorskip("mujoco")
     os.environ.setdefault("MUJOCO_GL", "glfw")
 
@@ -344,24 +348,23 @@ def test_start_cameras_recording_warmup_failure_does_not_abort() -> None:
     sim.add_robot("arm", data_config="so101", position=[0.0, 0.0, 0.0])
     sim.add_camera("cam", position=[0.5, 0, 0.5], target=[0, 0, 0])
 
-    # Mock render to raise.
     def boom(camera_name: str, width=None, height=None):
         raise RuntimeError(f"simulated warmup failure on {camera_name}")
 
-    started_thread_targets: list = []
+    captured_targets: list = []
 
-    class _NoStartThread:
+    class _CaptureThread:
         def __init__(self, target=None, daemon=None) -> None:
             self.target = target
 
         def start(self) -> None:
-            started_thread_targets.append(self.target)
+            captured_targets.append(self.target)
 
         def is_alive(self) -> bool:
             return False
 
     with patch.object(sim, "render", side_effect=boom):
-        with patch("threading.Thread", _NoStartThread):
+        with patch("threading.Thread", _CaptureThread):
             r = sim.start_cameras_recording(
                 cameras=["cam"],
                 output_dir="/tmp",
@@ -370,12 +373,14 @@ def test_start_cameras_recording_warmup_failure_does_not_abort() -> None:
                 height=48,
                 name="warmup_fail_test",
             )
+            assert r["status"] == "success", r
+            assert len(captured_targets) == 1
+            # Stop the timing loop before invoking _loop so it returns
+            # after warmup attempts (which all raise).
+            sim._cams_rec_state["running"] = False
+            # Must not raise even though warmup renders all raise.
+            captured_targets[0]()
 
-    # Recording started despite warmup failure; thread was launched.
-    assert r["status"] == "success", r
-    assert len(started_thread_targets) == 1
-
-    sim._cams_rec_state["running"] = False
     sim.destroy()
 
 

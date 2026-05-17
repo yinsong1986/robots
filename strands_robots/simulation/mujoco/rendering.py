@@ -762,6 +762,36 @@ class RenderingMixin:
         def _loop():
             from strands_robots.simulation.policy_runner import _extract_frame_ndarray
 
+            # Warm up the GL context ON THIS THREAD before the timing
+            # loop starts capturing into buffers. MuJoCo's
+            # ``mujoco.GLContext.make_current()`` binds to the calling
+            # thread, so any warmup ``render()`` performed in the main
+            # thread (i.e. before ``state["thread"].start()``) doesn't
+            # propagate here - the daemon thread has its own cold-start
+            # GL context on its first call. Round 11 attempted a
+            # main-thread warmup and round-11 verification confirmed
+            # that the t=0 frame still rendered as a skybox-only
+            # gradient (col-std 0.62, mean RGB ``(138, 150, 177)``)
+            # because of this thread boundary. The thread-side warmup
+            # below is the round-12 fix: doing one render per camera on
+            # the recorder thread populates this thread's
+            # ``mjvScene``/``Renderer`` cache so the first buffered
+            # frame in the timing loop lands on the warm path.
+            #
+            # Cost: ~33 ms per camera at thread startup. Recorded
+            # frames don't start accumulating until after this loop
+            # completes.
+            #
+            # Errors during warmup are swallowed at DEBUG. Persistent
+            # render failures will resurface as ``state["errors"][cam]``
+            # accumulating in the timing loop below (visible via
+            # :meth:`get_cameras_recording_status`).
+            for cam in names:
+                try:
+                    self.render(camera_name=cam, width=width, height=height)
+                except Exception as e:  # noqa: BLE001 - warmup failures non-fatal
+                    logger.debug("recorder thread warmup render failed for %s: %s", cam, e)
+
             interval = 1.0 / fps
             while state["running"]:
                 t0 = _time.time()
@@ -783,29 +813,6 @@ class RenderingMixin:
                 lag = _time.time() - t0
                 if lag < interval:
                     _time.sleep(interval - lag)
-
-        # Warm up the renderer before launching the recorder thread.
-        # The first ``render(camera=...)`` call after a scene change
-        # (load_scene, add_camera-driven recompile, etc.) returns a
-        # cold-start readback - typically just the GL clear-colour /
-        # skybox gradient with no geometry, because the cached
-        # ``mjvScene`` buffer hasn't been populated yet (#168 round-11
-        # bug D). Subsequent calls produce real geometry. By doing one
-        # synchronous render per camera here, the recorder thread's
-        # FIRST captured frame is the second render() and lands on the
-        # warm path - real geometry, mjvOption applied (if a
-        # benchmark adapter installed one via prewarm).
-        #
-        # Cost: ~33 ms per camera before this method returns. Invisible
-        # vs the eval's seconds-of-wall-time budget.
-        # Errors during warmup are deliberately swallowed - any real
-        # render error will resurface in the recorder thread loop with
-        # proper accounting via state["errors"][cam].
-        for cam in names:
-            try:
-                self.render(camera_name=cam, width=width, height=height)
-            except Exception as e:  # noqa: BLE001 - warmup failures are non-fatal
-                logger.debug("camera recorder warmup render failed for %s: %s", cam, e)
 
         state["thread"] = _threading.Thread(target=_loop, daemon=True)
         state["thread"].start()
