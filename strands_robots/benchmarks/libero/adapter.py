@@ -145,6 +145,7 @@ class LiberoAdapter(BenchmarkProtocol):
         scene_keyframe_index: int = 0,
         scene_robot_prefix: str = "robot0_",
         scene_gripper_prefix: str = "gripper0_",
+        init_states: np.ndarray | None = None,
         bddl_source: str | None = None,
         bddl_path: str | None = None,
     ):
@@ -295,6 +296,29 @@ class LiberoAdapter(BenchmarkProtocol):
                 :meth:`_register_default_robot` when
                 ``gripper_joint_name=None`` (default). Ignored when an
                 explicit ``gripper_joint_name`` is supplied.
+            init_states: Optional ``ndarray[(N, 1+nq+nv)]`` of LIBERO's
+                canonical training-distribution init states for this
+                task. ``None`` (default) falls through to the keyframe
+                / snapshot-restore branches in
+                :meth:`_apply_canonical_state`. When supplied,
+                :meth:`_apply_init_state` picks one row per episode
+                (RNG-seeded so a given seed re-runs the same init
+                across re-evaluations) and writes
+                ``data.time / data.qpos / data.qvel`` directly. The
+                width of each row MUST equal ``1 + model.nq +
+                model.nv`` - mismatches indicate the procedurally-
+                generated MJCF diverges from upstream LIBERO's scene
+                MJCF (e.g. missing ``(:objects ...)`` declarations) and
+                are raised loudly rather than silently sliced. The
+                array is cached as a member; populate via
+                :func:`load_libero_suite` (which lazy-imports
+                ``libero.libero.benchmark`` and calls
+                ``ts.get_task_init_states(task_id)``) or pass
+                explicitly. Without this kwarg the robot starts at
+                ``qpos=0`` (the joint-default "stretched flat" pose)
+                instead of the canonical "ready" pose GR00T-LIBERO
+                expects, which alone drives ``success_rate=0`` (#168
+                round-7 bug I).
             bddl_source: Original BDDL text - stored on the adapter so
                 the scene generator can pass it back to ``libero`` (which
                 only accepts a *file* path). Set automatically by
@@ -359,6 +383,21 @@ class LiberoAdapter(BenchmarkProtocol):
         self._scene_keyframe_index = int(scene_keyframe_index)
         self._scene_robot_prefix = str(scene_robot_prefix)
         self._scene_gripper_prefix = str(scene_gripper_prefix)
+        # LIBERO's canonical training-distribution init states (#168 round 7,
+        # bug I). When non-None this takes precedence over the keyframe and
+        # snapshot-restore branches in _apply_canonical_state. Stored as a
+        # 2D ``(N, 1+nq+nv)`` array; per-episode selection is RNG-seeded so
+        # a given seed re-runs the same init across re-evaluations.
+        if init_states is not None:
+            init_states_array = np.asarray(init_states, dtype=np.float64)
+            if init_states_array.ndim == 1:
+                # Single state - promote to 2D for uniform indexing.
+                init_states_array = init_states_array[np.newaxis, :]
+            if init_states_array.ndim != 2:
+                raise ValueError(f"init_states must be 1D or 2D ndarray, got ndim={init_states_array.ndim}")
+            self._init_states: np.ndarray | None = init_states_array
+        else:
+            self._init_states = None
         # Snapshot-and-restore fallback for procedurally-generated MJCFs that
         # don't ship a <keyframe> (the case the post-#168 verification
         # exposed). Captured on the first episode after super() +
@@ -392,6 +431,7 @@ class LiberoAdapter(BenchmarkProtocol):
         scene_keyframe_index: int = 0,
         scene_robot_prefix: str = "robot0_",
         scene_gripper_prefix: str = "gripper0_",
+        init_states: np.ndarray | None = None,
     ) -> LiberoAdapter:
         """Parse a ``.bddl`` file from disk and build an adapter.
 
@@ -417,6 +457,7 @@ class LiberoAdapter(BenchmarkProtocol):
             scene_keyframe_index=scene_keyframe_index,
             scene_robot_prefix=scene_robot_prefix,
             scene_gripper_prefix=scene_gripper_prefix,
+            init_states=init_states,
             bddl_path=str(bddl_path),
         )
 
@@ -440,6 +481,7 @@ class LiberoAdapter(BenchmarkProtocol):
         scene_keyframe_index: int = 0,
         scene_robot_prefix: str = "robot0_",
         scene_gripper_prefix: str = "gripper0_",
+        init_states: np.ndarray | None = None,
     ) -> LiberoAdapter:
         """Parse a BDDL string directly - useful in tests."""
         problem = parse_bddl(bddl_text)
@@ -460,6 +502,7 @@ class LiberoAdapter(BenchmarkProtocol):
             scene_keyframe_index=scene_keyframe_index,
             scene_robot_prefix=scene_robot_prefix,
             scene_gripper_prefix=scene_gripper_prefix,
+            init_states=init_states,
             bddl_source=bddl_text,
         )
 
@@ -570,7 +613,7 @@ class LiberoAdapter(BenchmarkProtocol):
         # else (#166 review: snapshot taken at the wrong lifecycle point
         # was the prior round's failure mode).
         if scene_was_loaded and self._apply_canonical_state_enabled:
-            self._apply_canonical_state(sim)
+            self._apply_canonical_state(sim, rng)
         super().on_episode_start(sim, rng)
         if self._install_cameras:
             self._install_libero_cameras(sim)
@@ -1141,39 +1184,51 @@ class LiberoAdapter(BenchmarkProtocol):
             logger.debug("LiberoAdapter: model-side camera enumeration failed: %s", e)
         return names
 
-    def _apply_canonical_state(self, sim: SimEngine) -> None:
+    def _apply_canonical_state(self, sim: SimEngine, rng: random.Random | None = None) -> None:
         """Restore qpos / qvel to the scene's canonical home state.
 
-        Two branches, in order of preference:
+        Three branches, in order of preference:
 
-        1. **Keyframe** (``model.nkey > 0``): call
+        1. **Init states** (``self._init_states is not None``): pick a row
+           via ``rng`` (RNG-seeded so a given seed re-runs the same init
+           across re-evaluations, fall back to ``random.Random()`` when
+           no rng is provided), validate the width matches
+           ``1 + model.nq + model.nv``, then write
+           ``data.time / data.qpos / data.qvel`` directly. This is the
+           branch that landed in #168 round 7 to fix bug I (success_rate=0
+           because the robot started at qpos=0 instead of LIBERO's
+           canonical "ready" pose). Width mismatches are raised loudly
+           rather than silently sliced - they indicate the procedurally-
+           generated MJCF diverges from upstream LIBERO's scene MJCF
+           (e.g. missing ``(:objects ...)`` declarations).
+        2. **Keyframe** (``model.nkey > 0``): call
            ``mujoco.mj_resetDataKeyframe(model, data, scene_keyframe_index)``.
            The MJCF carries the canonical pose explicitly via a
            ``<keyframe>`` element - LIBERO-authored hand-written scenes
            (the ones in upstream ``libero/libero/assets/scenes/``) ship one.
-        2. **Snapshot-and-restore** (``model.nkey == 0``): cache
+        3. **Snapshot-and-restore** (``model.nkey == 0``): cache
            ``data.qpos`` / ``data.qvel`` on the FIRST episode after a
            scene compile (after ``super().on_episode_start`` and
            ``_install_libero_cameras`` have run); restore the cached
            snapshot on every subsequent episode. The procedurally-
            generated MJCFs from :meth:`_generate_scene_from_bddl` (PR #165)
-           don't carry a keyframe, so this branch is the one that
-           actually fires on the codepath ``examples/libero_mujoco.py``
-           exercises today (#166's reported symptom).
+           don't carry a keyframe, so this branch fires when init_states
+           is also None (e.g. adapters built directly from a BDDL file
+           without going through :func:`load_libero_suite`).
 
-        Both branches end with ``mj_forward`` so derived state
+        All three branches end with ``mj_forward`` so derived state
         (``xpos`` / ``xquat`` / sensor data) reflects the canonical
         ``qpos`` before the next ``get_observation`` / ``render`` call.
 
         Best-effort:
 
-        * Sims without an exposed compiled MuJoCo model → debug-log + skip.
-        * ``scene_keyframe_index`` out of range when ``nkey > 0`` → log
+        * Sims without an exposed compiled MuJoCo model -> debug-log + skip.
+        * ``scene_keyframe_index`` out of range when ``nkey > 0`` -> log
           at WARNING and skip (out-of-range is a config error).
-        * ``mujoco`` not importable → debug-log + skip.
+        * ``mujoco`` not importable -> debug-log + skip.
         * Snapshot shape mismatches the current ``qpos`` (e.g. the
           model recompiled with a different ``nq`` between episodes,
-          which is unusual) → re-capture instead of restoring.
+          which is unusual) -> re-capture instead of restoring.
 
         Holds ``sim._lock`` if the sim exposes one to match the locking
         contract of :meth:`Simulation.reset` and :meth:`Simulation.send_action`
@@ -1195,10 +1250,102 @@ class LiberoAdapter(BenchmarkProtocol):
         nkey = int(getattr(model, "nkey", 0))
         lock = getattr(sim, "_lock", None)
 
+        # Branch 1: init_states (highest priority)
+        if self._init_states is not None:
+            self._apply_init_state_branch(model, data, _mj, lock, rng=rng)
+            return
+
+        # Branch 2: keyframe
         if nkey > 0:
             self._apply_keyframe_branch(sim, model, data, _mj, lock, nkey)
+        # Branch 3: snapshot-and-restore
         else:
             self._apply_snapshot_branch(sim, model, data, _mj, lock)
+
+    def _apply_init_state_branch(
+        self,
+        model: Any,
+        data: Any,
+        mj: Any,
+        lock: Any,
+        *,
+        rng: random.Random | None,
+    ) -> None:
+        """Init-state branch of :meth:`_apply_canonical_state` (#168 round 7).
+
+        Picks one row from ``self._init_states`` (RNG-seeded), validates
+        the width matches ``1 + model.nq + model.nv``, then writes
+        ``data.time / data.qpos / data.qvel`` directly. Uses
+        :func:`mujoco.mj_forward` to update derived state.
+
+        Layout per
+        ``/opt/conda/lib/python3.12/site-packages/robosuite/utils/binding_utils.py:213-241``
+        (``MjSimState.from_flattened``): ``[time(1), qpos(nq), qvel(nv)]``,
+        with ``na == 0`` asserted (no actuator state). LIBERO's
+        ``OffScreenRenderEnv.set_init_state`` calls
+        ``sim.set_state_from_flattened(state)`` which decomposes the
+        same way, so applying directly to MuJoCo's ``data`` here matches
+        the reference v0.1.1 LIBERO eval pipeline.
+
+        Width mismatch is fatal (raises ``RuntimeError``) - the
+        procedurally-generated MJCF must match upstream LIBERO's scene
+        for init-state apply to make any sense. Silent slicing /
+        padding would produce a deeply wrong physical state and mask
+        a real scene-generation bug. Per AGENTS.md "no silent defaults
+        on error".
+
+        Per-episode RNG-seeded selection: ``rng.randint(0, n_states-1)``.
+        Re-running the same seed produces the same init state for the
+        same episode index. ``rng=None`` falls back to a fresh
+        ``random.Random()`` so direct calls (e.g. unit tests) still
+        work.
+        """
+        n_states = int(self._init_states.shape[0])  # type: ignore[union-attr]
+        if n_states == 0:
+            logger.debug("LiberoAdapter: empty init_states array; skipping init-state branch")
+            return
+        rng_local = rng if rng is not None else random.Random()
+        idx = rng_local.randint(0, n_states - 1)
+        state = self._init_states[idx]  # type: ignore[index]
+
+        nq = int(model.nq)
+        nv = int(model.nv)
+        na = int(getattr(model, "na", 0))
+        if na != 0:
+            raise RuntimeError(
+                f"LiberoAdapter: model has na={na} actuator state; init_state apply requires na=0. "
+                f"LIBERO scenes don't carry actuator state and the flat-state layout assumes [time, qpos, qvel]."
+            )
+
+        expected_width = 1 + nq + nv
+        actual_width = int(state.shape[0])
+        if actual_width != expected_width:
+            raise RuntimeError(
+                f"LiberoAdapter: init_state width {actual_width} does not match compiled model "
+                f"(1 + nq={nq} + nv={nv} = {expected_width}). The procedurally-generated MJCF "
+                f"likely diverges from the upstream LIBERO scene MJCF for this BDDL task "
+                f"(e.g. missing (:objects ...) declarations dropping free-joint bodies). "
+                f"#168 round 7 bug I: silent slicing forbidden - fix the scene generator instead."
+            )
+
+        def _apply() -> None:
+            data.time = float(state[0])
+            np.copyto(data.qpos, state[1 : 1 + nq])
+            np.copyto(data.qvel, state[1 + nq :])
+            mj.mj_forward(model, data)
+
+        if lock is not None:
+            with lock:
+                _apply()
+        else:
+            _apply()
+
+        logger.debug(
+            "LiberoAdapter: applied init_state[%d] (1+nq+nv=%d, n_states=%d)",
+            idx,
+            expected_width,
+            n_states,
+        )
 
     def _apply_keyframe_branch(
         self,

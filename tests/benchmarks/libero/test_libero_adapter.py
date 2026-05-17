@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 from strands_robots.benchmarks.libero import (
@@ -2557,6 +2558,335 @@ class TestSceneCameraAliasesDefault:
         assert 'name="wrist_image"' in renamed
         assert 'name="agentview"' not in renamed
         assert 'name="robot0_eye_in_hand"' not in renamed
+
+
+class TestApplyInitStateBranch:
+    """``LiberoAdapter._apply_init_state_branch`` writes
+    ``data.time / data.qpos / data.qvel`` directly from a row of the
+    ``init_states`` ndarray (#168 round-7 bug I).
+
+    LIBERO ships task-specific *init states* alongside its benchmark
+    suites - each task has 50 sampled starting configurations of the
+    canonical "ready" pose. Without this branch the robot starts at
+    ``qpos=0`` (the joint-default "stretched flat" pose) instead of the
+    canonical "ready" pose, the policy issues actions calibrated for
+    the canonical pose against a totally different body configuration,
+    the robot wiggles uselessly, and ``success_rate`` collapses to 0.
+
+    Layout per ``robosuite/utils/binding_utils.py:213-241``:
+    ``[time(1), qpos(nq), qvel(nv)]`` with ``na == 0``. The branch
+    raises ``RuntimeError`` on width mismatch (silent slicing
+    forbidden per AGENTS.md "no silent defaults on error") so a
+    procedurally-generated MJCF that diverges from upstream LIBERO's
+    scene MJCF surfaces loudly rather than producing a deeply wrong
+    physical state.
+    """
+
+    @staticmethod
+    def _make_sim_with_model(*, nq: int, nv: int, na: int = 0):
+        """Build a FakeSim whose ``world._model`` exposes nq/nv/na and
+        whose ``world._data`` has writable qpos/qvel/time."""
+        import numpy as np
+
+        class _FakeModel:
+            def __init__(self, nq_: int, nv_: int, na_: int) -> None:
+                self.nq = nq_
+                self.nv = nv_
+                self.na = na_
+                self.nkey = 0  # force snapshot/init-state branch (not keyframe)
+
+        class _FakeData:
+            def __init__(self, nq_: int, nv_: int) -> None:
+                self.qpos = np.zeros(nq_)
+                self.qvel = np.zeros(nv_)
+                self.time = 0.0
+
+        model = _FakeModel(nq, nv, na)
+        data = _FakeData(nq, nv)
+
+        sim = FakeSim(data_config="panda")
+        sim._world._model = model  # type: ignore[attr-defined]
+        sim._world._data = data  # type: ignore[attr-defined]
+        return sim, model, data
+
+    @staticmethod
+    def _make_fake_mj():
+        """Lightweight mujoco stub - only mj_forward needed by the branch."""
+        forward_calls: list[tuple[Any, Any]] = []
+
+        class _Mj:
+            class mjtObj:
+                mjOBJ_BODY = 1
+                mjOBJ_JOINT = 3
+                mjOBJ_ACTUATOR = 5
+
+            @staticmethod
+            def mj_forward(model, data):
+                forward_calls.append((model, data))
+
+        return _Mj(), forward_calls
+
+    def test_init_state_applied_writes_qpos_qvel_time(self):
+        """Happy-path: a single 1+nq+nv-wide init_state row gets written
+        to ``data.time / data.qpos / data.qvel`` and ``mj_forward`` is
+        called once."""
+        nq, nv = 9, 9
+        # Construct a deterministic init state: time=0.5, qpos=[1..9], qvel=[10..18]
+        state = np.array([0.5] + list(range(1, nq + 1)) + list(range(10, 10 + nv)), dtype=np.float64)
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            install_cameras=False,
+            apply_scene_keyframe=True,
+            init_states=state,  # 1D promoted to (1, 1+nq+nv)
+        )
+        assert adapter._init_states is not None
+        assert adapter._init_states.shape == (1, 1 + nq + nv)
+
+        sim, model, data = self._make_sim_with_model(nq=nq, nv=nv)
+        mj, forward_calls = self._make_fake_mj()
+        with patch.dict("sys.modules", {"mujoco": mj}):
+            adapter._apply_canonical_state(sim, random.Random(0))
+
+        # qpos/qvel/time updated to match the init_state.
+        np.testing.assert_array_equal(data.qpos, state[1 : 1 + nq])
+        np.testing.assert_array_equal(data.qvel, state[1 + nq :])
+        assert data.time == 0.5
+        # mj_forward fired.
+        assert len(forward_calls) == 1
+
+    def test_init_state_seeded_selection_is_deterministic(self):
+        """Same RNG seed -> same row of init_states selected. Required
+        so a re-evaluation with the same seed reproduces results
+        exactly. ``rng.randint(0, n-1)`` is the selection mechanism."""
+        nq, nv = 4, 4
+        # Two states - distinguishable by their qpos[0] value.
+        states = np.zeros((2, 1 + nq + nv), dtype=np.float64)
+        states[0, 1] = 100.0  # state 0: qpos[0] = 100
+        states[1, 1] = 200.0  # state 1: qpos[0] = 200
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            install_cameras=False,
+            init_states=states,
+        )
+
+        # Seed 0 -> deterministic index. Seed 0 + same array -> same index.
+        sim_a, _, data_a = self._make_sim_with_model(nq=nq, nv=nv)
+        sim_b, _, data_b = self._make_sim_with_model(nq=nq, nv=nv)
+        mj, _ = self._make_fake_mj()
+        with patch.dict("sys.modules", {"mujoco": mj}):
+            adapter._apply_canonical_state(sim_a, random.Random(0))
+            adapter._apply_canonical_state(sim_b, random.Random(0))
+        # Same seed -> same selected state -> same data.qpos[0].
+        assert data_a.qpos[0] == data_b.qpos[0]
+
+    def test_init_state_width_mismatch_raises(self):
+        """Width != 1 + nq + nv must raise ``RuntimeError`` rather than
+        silently slice. Critical guard for the procedural MJCF -> upstream
+        LIBERO scene divergence (e.g. missing `(:objects ...)` clauses
+        dropping free-joint bodies). Silent slicing would produce a
+        deeply wrong physical state and mask a real bug."""
+        nq, nv = 9, 9
+        # State has 1+nq+5 = 15 entries instead of 1+nq+nv = 19. Mismatch.
+        bad_state = np.zeros(15, dtype=np.float64)
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            install_cameras=False,
+            init_states=bad_state,
+        )
+
+        sim, _, _ = self._make_sim_with_model(nq=nq, nv=nv)
+        mj, _ = self._make_fake_mj()
+        with patch.dict("sys.modules", {"mujoco": mj}):
+            with pytest.raises(RuntimeError, match="init_state width"):
+                adapter._apply_canonical_state(sim, random.Random(0))
+
+    def test_actuator_state_present_raises(self):
+        """``model.na != 0`` violates the
+        ``[time, qpos, qvel]`` flat-state assumption. Raise rather than
+        silently produce a wrong state - LIBERO scenes always have
+        na=0; non-zero indicates a custom scene that needs a different
+        applier."""
+        nq, nv = 9, 9
+        state = np.zeros(1 + nq + nv, dtype=np.float64)
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            install_cameras=False,
+            init_states=state,
+        )
+
+        sim, _, _ = self._make_sim_with_model(nq=nq, nv=nv, na=2)  # actuator state!
+        mj, _ = self._make_fake_mj()
+        with patch.dict("sys.modules", {"mujoco": mj}):
+            with pytest.raises(RuntimeError, match="actuator state"):
+                adapter._apply_canonical_state(sim, random.Random(0))
+
+    def test_init_states_takes_priority_over_keyframe(self):
+        """When BOTH init_states and a model keyframe are present, the
+        init_states branch wins. The keyframe applier must NOT fire.
+        Pin to ensure init_states is the highest-priority canonical-state
+        source; reviewers may otherwise expect keyframe (which is a
+        scene-MJCF feature) to win."""
+        nq, nv = 4, 4
+        state = np.array([0.0] + [42.0] * nq + [0.0] * nv, dtype=np.float64)
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            install_cameras=False,
+            init_states=state,
+        )
+
+        sim, model, data = self._make_sim_with_model(nq=nq, nv=nv)
+        model.nkey = 1  # would route to keyframe branch without init_states
+
+        # Stub mujoco - only used for mj_forward + (would be) mj_resetDataKeyframe.
+        keyframe_calls: list[tuple[Any, Any, int]] = []
+        forward_calls: list[tuple[Any, Any]] = []
+
+        class _Mj:
+            class mjtObj:
+                mjOBJ_BODY = 1
+                mjOBJ_JOINT = 3
+                mjOBJ_ACTUATOR = 5
+
+            @staticmethod
+            def mj_resetDataKeyframe(model, data, idx):
+                keyframe_calls.append((model, data, idx))
+
+            @staticmethod
+            def mj_forward(model, data):
+                forward_calls.append((model, data))
+
+        with patch.dict("sys.modules", {"mujoco": _Mj()}):
+            adapter._apply_canonical_state(sim, random.Random(0))
+
+        # Init-states fired (qpos written), keyframe did NOT.
+        np.testing.assert_array_equal(data.qpos, state[1 : 1 + nq])
+        assert keyframe_calls == []  # keyframe must NOT have fired
+        assert len(forward_calls) == 1  # mj_forward from init_states branch
+
+    def test_init_states_constructor_promotes_1d_to_2d(self):
+        """Passing a 1D ``init_states`` (a single state) is legal -
+        the constructor promotes it to ``(1, S)`` for uniform indexing."""
+        state_1d = np.zeros(19, dtype=np.float64)
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            install_cameras=False,
+            init_states=state_1d,
+        )
+        assert adapter._init_states is not None
+        assert adapter._init_states.shape == (1, 19)
+
+    def test_init_states_constructor_rejects_3d(self):
+        """3D ndarray must raise ``ValueError`` at construction time -
+        only 1D (single state) and 2D (n_states x state_dim) are valid."""
+        bad = np.zeros((2, 3, 19), dtype=np.float64)
+        with pytest.raises(ValueError, match="ndim"):
+            LiberoAdapter.from_text(
+                PICK_CUBE_BDDL,
+                install_cameras=False,
+                init_states=bad,
+            )
+
+    def test_init_states_none_falls_back_to_snapshot_branch(self):
+        """``init_states=None`` (the default) preserves pre-#168-r7
+        behaviour: snapshot-and-restore. Pin so existing user adapters
+        that don't go through ``load_libero_suite`` keep working."""
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            install_cameras=False,
+            init_states=None,
+        )
+        assert adapter._init_states is None
+        # The actual branch behaviour is exercised by
+        # TestApplyCanonicalStateSnapshot above; this test only pins the
+        # constructor-default contract.
+
+    def test_apply_canonical_state_passes_rng_through(self):
+        """``on_episode_start`` forwards its ``rng`` to
+        ``_apply_canonical_state`` so the init_states branch can
+        seed-select. Pin the call chain because adding rng to the
+        signature was a back-compat-fragile change."""
+        # We just verify the method accepts rng as positional / keyword.
+        # If rng plumbing breaks, _apply_canonical_state(sim, rng) raises TypeError.
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, install_cameras=False)
+        sim = FakeSim(data_config="panda")
+        # No model on FakeSim's world - method should debug-log + skip without error.
+        adapter._apply_canonical_state(sim, random.Random(42))
+        adapter._apply_canonical_state(sim)  # rng arg defaults to None
+
+
+class TestLoadInitStatesBySuite:
+    """``_load_init_states_by_bddl`` lazy-imports libero and returns a
+    ``{bddl_filename: ndarray}`` map. Best-effort: missing libero, missing
+    suite, per-task failures all return / preserve a partial dict
+    (ideally empty) and never raise. The empty fallback lets
+    ``load_libero_suite`` register tasks without init_states; the
+    adapter then falls back to its snapshot-and-restore branch."""
+
+    def test_libero_not_installed_returns_empty(self):
+        """When ``libero`` isn't importable, return ``{}`` and don't
+        raise. This is the minimal-CI / unit-test path."""
+        from strands_robots.benchmarks.libero.suite import _load_init_states_by_bddl
+
+        # Patch builtins.__import__ to fail libero import.
+        original_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "libero.libero" or name.startswith("libero"):
+                raise ImportError("libero not installed (test fixture)")
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=fake_import):
+            result = _load_init_states_by_bddl("libero_10")
+        assert result == {}
+
+    def test_invalid_suite_returns_empty(self):
+        """Suite name not in benchmark_dict() -> empty result, no raise."""
+        from strands_robots.benchmarks.libero.suite import _load_init_states_by_bddl
+
+        # Patch the module-level lazy import via a stand-in benchmark that
+        # exposes get_benchmark_dict but doesn't have our suite.
+        fake_benchmark = MagicMock()
+        fake_benchmark.get_benchmark_dict.return_value = {"libero_10": MagicMock()}
+        fake_libero_libero = MagicMock()
+        fake_libero_libero.benchmark = fake_benchmark
+        with patch.dict(
+            "sys.modules",
+            {"libero.libero": fake_libero_libero, "libero": MagicMock()},
+        ):
+            result = _load_init_states_by_bddl("nonexistent_suite")
+        assert result == {}
+
+    def test_per_task_failure_skips_task_not_suite(self):
+        """One task's get_task_init_states() raising must NOT abort the
+        whole suite - other tasks still get loaded. Critical because
+        a single corrupt .pruned_init file shouldn't block 50+ tasks."""
+        from strands_robots.benchmarks.libero.suite import _load_init_states_by_bddl
+
+        states_a = np.zeros((50, 19), dtype=np.float64)
+        states_a[0, 0] = 1.5  # marker
+        # task 0 ok, task 1 raises, task 2 ok
+        ts = MagicMock()
+        ts.get_num_tasks.return_value = 3
+        ts.get_task_bddl_files.return_value = ["a.bddl", "b.bddl", "c.bddl"]
+        ts.get_task_init_states.side_effect = [
+            states_a,
+            RuntimeError("corrupt init state"),
+            states_a,
+        ]
+
+        fake_benchmark = MagicMock()
+        fake_benchmark.get_benchmark_dict.return_value = {"libero_10": lambda: ts}
+        fake_libero_libero = MagicMock()
+        fake_libero_libero.benchmark = fake_benchmark
+        with patch.dict(
+            "sys.modules",
+            {"libero.libero": fake_libero_libero, "libero": MagicMock()},
+        ):
+            result = _load_init_states_by_bddl("libero_10")
+        # Tasks 0 and 2 loaded; task 1 (raised) skipped.
+        assert set(result.keys()) == {"a.bddl", "c.bddl"}
+        # Tasks are keyed by bare filename, not full path.
+        np.testing.assert_array_equal(result["a.bddl"], states_a)
 
 
 # PolicyRunner + evaluate_benchmark integration
