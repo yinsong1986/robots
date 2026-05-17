@@ -590,6 +590,26 @@ class TestAugmentObservation:
     ``roll`` / ``pitch`` / ``yaw`` / ``gripper`` so the ``libero_panda``
     Gr00tDataConfig finds them in the per-step observation."""
 
+    @pytest.fixture
+    def libero_scene_xml(self):
+        """Use the existing scene cache if available; otherwise skip.
+
+        Mirrors the fixture on ``TestInstallActionController``. The
+        round-31 site-priority tests need a real LIBERO-shaped MJCF
+        with both ``robot0_right_hand`` (body) and
+        ``gripper0_grip_site`` (site) so we can verify the site path
+        is preferred over the body path.
+        """
+        from pathlib import Path
+
+        cache_dir = Path.home() / ".strands_robots" / "scene_cache" / "libero"
+        if not cache_dir.is_dir():
+            pytest.skip(f"no scene cache at {cache_dir}; cannot test site-priority end-to-end")
+        cached = list(cache_dir.glob("*.xml"))
+        if not cached:
+            pytest.skip(f"no .xml files in {cache_dir}; cannot test site-priority end-to-end")
+        return str(cached[0])
+
     def test_default_panda_layout(self):
         """Identity quaternion ⇒ all Euler angles are zero."""
         adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
@@ -909,6 +929,207 @@ class TestAugmentObservation:
             if r.levelno == _logging.WARNING and "STRANDS_LIBERO_STATE_LOG_MAX" in r.getMessage()
         ]
         assert len(warnings) >= 1, "expected a WARNING about malformed STRANDS_LIBERO_STATE_LOG_MAX"
+
+    def test_eef_state_site_name_default_matches_libero_convention(self):
+        """Round 31 (#168): default ``eef_state_site_name`` is
+        ``"<scene_gripper_prefix>grip_site"`` ⇒ ``"gripper0_grip_site"``
+        for LIBERO. This is the same site RoboSuite's
+        ``OperationalSpaceController`` reads for ``robot0_eef_pos`` /
+        ``robot0_eef_quat``, so reading from it produces state matching
+        what LIBERO checkpoints were trained against.
+
+        Pin so a future scene_gripper_prefix change (e.g. ``robot0_``)
+        propagates to the site name without silent drift, AND so a
+        test of "are we using the right site" can be a one-line
+        property assertion."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        assert adapter.eef_state_site_name == "gripper0_grip_site"
+
+    def test_eef_state_site_name_user_override(self):
+        """Round 31 (#168): user-supplied ``eef_state_site_name`` overrides
+        the auto-derived default. Useful for non-RoboSuite scenes that
+        ship a different site name, or for legacy tests pinning the
+        body fallback by passing an empty string sentinel."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, eef_state_site_name="my_custom_site")
+        assert adapter.eef_state_site_name == "my_custom_site"
+
+    def test_eef_state_site_name_tracks_scene_gripper_prefix(self):
+        """Round 31 (#168): when ``scene_gripper_prefix`` is changed,
+        the auto-derived ``eef_state_site_name`` follows.
+
+        Pin so a custom-namespace LIBERO variant doesn't end up reading
+        from the wrong site silently."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, scene_gripper_prefix="custom_grip_")
+        assert adapter.eef_state_site_name == "custom_grip_grip_site"
+
+    def test_read_eef_pose_uses_site_when_available(self, libero_scene_xml):
+        """Round 31 (#168) — primary regression for the round-30 bug.
+
+        With a real LIBERO scene compiled into the sim, ``_read_eef_pose``
+        must read from ``data.site_xpos[gripper0_grip_site_id]`` —
+        NOT from ``data.xpos[robot0_right_hand_id]``. Confirms the
+        site path is preferred over the body path when the site
+        exists.
+
+        The two readings differ by ~9.7 cm in z + 180° rotation
+        around X (the wrist body sits ~10 cm above the gripper tip
+        with axes pointing differently); pin that the site reading
+        is what we get back."""
+        pytest.importorskip("mujoco")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        # Ground truth from the same model: site_xpos for gripper0_grip_site.
+        site_id = mujoco.mj_name2id(sim._world._model, mujoco.mjtObj.mjOBJ_SITE, "gripper0_grip_site")  # type: ignore[attr-defined]
+        if site_id < 0:
+            pytest.skip("scene XML missing 'gripper0_grip_site'; skipping site-priority test")
+        expected_pos = list(sim._world._data.site_xpos[site_id])  # type: ignore[attr-defined]
+
+        pos, quat = adapter._read_eef_pose(sim)
+        assert pos is not None and quat is not None, "site path should produce a pos+quat"
+
+        # Position must match site_xpos (within FP tolerance).
+        for axis_idx, axis_name in enumerate(["x", "y", "z"]):
+            assert pos[axis_idx] == pytest.approx(expected_pos[axis_idx], abs=1e-6), (
+                f"site {axis_name} {pos[axis_idx]} != expected {expected_pos[axis_idx]}"
+            )
+
+        # Quaternion is unit-norm.
+        quat_arr = np.array(quat)
+        assert np.linalg.norm(quat_arr) == pytest.approx(1.0, abs=1e-6)
+
+    def test_read_eef_pose_site_differs_from_body(self, libero_scene_xml):
+        """Round 31 (#168): pin the round-30 finding that site readout
+        and body readout produce DIFFERENT pos values (~9.7 cm in z).
+
+        This is a regression sentinel: if a future refactor accidentally
+        falls through to the body path even when the site exists, this
+        test fails — because the test asserts the value we get back
+        matches the site, not the body."""
+        pytest.importorskip("mujoco")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        # Find the wrist body that the legacy body path would read.
+        body_id = mujoco.mj_name2id(sim._world._model, mujoco.mjtObj.mjOBJ_BODY, "robot0_right_hand")  # type: ignore[attr-defined]
+        site_id = mujoco.mj_name2id(sim._world._model, mujoco.mjtObj.mjOBJ_SITE, "gripper0_grip_site")  # type: ignore[attr-defined]
+        if body_id < 0 or site_id < 0:
+            pytest.skip("scene XML missing 'robot0_right_hand' or 'gripper0_grip_site'")
+
+        body_pos = np.array(sim._world._data.xpos[body_id])  # type: ignore[attr-defined]
+        site_pos = np.array(sim._world._data.site_xpos[site_id])  # type: ignore[attr-defined]
+
+        # The two MUST differ — otherwise this scene doesn't exhibit
+        # the round-30 bug and the regression test isn't meaningful.
+        delta = site_pos - body_pos
+        assert np.linalg.norm(delta) > 0.05, (
+            f"site_xpos vs body xpos differ by only {np.linalg.norm(delta)} m; "
+            f"expected ~10 cm. Scene may not match LIBERO's robot0_right_hand / "
+            f"gripper0_grip_site convention. (site={site_pos}, body={body_pos})"
+        )
+
+        # _read_eef_pose returns the SITE value, not the body value.
+        pos, _ = adapter._read_eef_pose(sim)
+        assert pos is not None
+        for axis_idx, expected in enumerate(site_pos):
+            assert pos[axis_idx] == pytest.approx(float(expected), abs=1e-6), (
+                f"axis {axis_idx}: returned {pos[axis_idx]} matches body {body_pos[axis_idx]} "
+                f"instead of site {expected}. Round-30 wrong-body bug may have regressed."
+            )
+
+    def test_read_eef_pose_falls_back_to_body_when_site_missing(self, libero_scene_xml):
+        """Round 31 (#168): when ``eef_state_site_name`` resolves to a
+        site that doesn't exist (custom non-RoboSuite scene), fall
+        back to the body lookup so non-LIBERO callers see zero
+        behaviour change.
+
+        Pin so the round-31 site preference doesn't break adapters
+        used outside LIBERO."""
+        pytest.importorskip("mujoco")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+            # Override to a site name that doesn't exist in the scene.
+            eef_state_site_name="this_site_does_not_exist",
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        # Scene exists, so get_body_state would work for the canonical
+        # body if it were resolvable. We rely on FakeSim's
+        # get_body_state implementation (returns from self._bodies),
+        # which is empty here — so the fallback returns (None, None).
+        # Round-31 contract: NOT raising, just gracefully degrading.
+        pos, quat = adapter._read_eef_pose(sim)
+        # FakeSim's get_body_state on a missing body returns "missing"
+        # error → (None, None). That's the correct behaviour for the
+        # body-fallback path with no body match.
+        assert pos is None or pos == [0, 0, 0]
+        # No site, no body match → both None (or the fallback's empty
+        # default). Either way: no exception was raised.
+
+    def test_augment_observation_uses_site_path_with_real_scene(self, libero_scene_xml):
+        """Round 31 (#168) end-to-end: ``augment_observation`` produces
+        ``state.x/y/z/roll/pitch/yaw`` from the SITE (gripper tip), not
+        the wrist body, when both are available.
+
+        This is the customer-facing assertion: the values that flow
+        into the GR00T policy server's ``state.*`` keys must match the
+        site, not the body. Confirms the round-31 fix at the public
+        ``augment_observation`` boundary."""
+        pytest.importorskip("mujoco")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        site_id = mujoco.mj_name2id(sim._world._model, mujoco.mjtObj.mjOBJ_SITE, "gripper0_grip_site")  # type: ignore[attr-defined]
+        if site_id < 0:
+            pytest.skip("scene XML missing 'gripper0_grip_site'")
+        expected_pos = list(sim._world._data.site_xpos[site_id])  # type: ignore[attr-defined]
+
+        out = adapter.augment_observation(sim, {})
+
+        # state.x/y/z must match site_xpos.
+        for axis_idx, axis_name in enumerate(["x", "y", "z"]):
+            assert out[axis_name] == pytest.approx(expected_pos[axis_idx], abs=1e-6), (
+                f"augment_observation state.{axis_name} {out[axis_name]} != "
+                f"site {expected_pos[axis_idx]}; round-31 site-priority may have regressed."
+            )
 
 
 class TestQuaternionToEuler:

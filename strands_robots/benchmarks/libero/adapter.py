@@ -137,6 +137,7 @@ class LiberoAdapter(BenchmarkProtocol):
         install_cameras: bool = True,
         cameras: dict[str, dict[str, Any]] | None = None,
         eef_body_name: str | None = None,
+        eef_state_site_name: str | None = None,
         gripper_joint_name: str | None = None,
         inject_eef_state: bool = True,
         auto_generate_scene: bool = True,
@@ -182,9 +183,10 @@ class LiberoAdapter(BenchmarkProtocol):
                 disables camera installation regardless of
                 ``install_cameras``.
             eef_body_name: MuJoCo body name whose pose is read for the
-                LIBERO ``state.x/y/z/roll/pitch/yaw`` keys. ``None``
-                (default) triggers auto-resolution from the scene at
-                episode start: when :meth:`_register_default_robot`
+                LIBERO ``state.x/y/z/roll/pitch/yaw`` keys *as a fallback*
+                when ``eef_state_site_name`` is unset or doesn't resolve.
+                ``None`` (default) triggers auto-resolution from the scene
+                at episode start: when :meth:`_register_default_robot`
                 discovers a scene-supplied Panda under
                 ``scene_robot_prefix``, the adapter searches for the
                 canonical RoboSuite EEF body (``<prefix>right_hand`` ->
@@ -192,6 +194,23 @@ class LiberoAdapter(BenchmarkProtocol):
                 ``_eef_body_name`` accordingly. Pass an explicit string
                 to disable auto-resolution (useful for non-RoboSuite
                 scenes); the legacy bare-Panda default is ``"hand"``.
+            eef_state_site_name: MuJoCo *site* name whose pose is read
+                for the LIBERO ``state.x/y/z/roll/pitch/yaw`` keys.
+                ``None`` (default) auto-resolves to
+                ``"<scene_gripper_prefix>grip_site"`` (i.e.
+                ``"gripper0_grip_site"`` for LIBERO scenes), which
+                matches what RoboSuite's ``OperationalSpaceController``
+                reads for ``robot0_eef_pos`` / ``robot0_eef_quat`` —
+                the site is at the gripper tip, ~9.7 cm BELOW the
+                wrist body and rotated 180° around X to point fingers
+                forward. Reading from the *body* (the round-5 default)
+                feeds GR00T state observations from the wrong point in
+                the kinematic chain, which manifested as ``success_rate
+                = 0`` across rounds 23-30 of #168 because the policy
+                saw out-of-distribution state and emitted near-zero
+                deltas. The site is preferred; the body is used as a
+                fallback when the site doesn't exist (non-RoboSuite
+                scenes).
             gripper_joint_name: Joint name whose ``qpos`` is read for the
                 LIBERO ``state.gripper`` key. ``None`` (default) triggers
                 auto-resolution from the scene at episode start using
@@ -352,6 +371,22 @@ class LiberoAdapter(BenchmarkProtocol):
         )
         self._eef_body_name: str = str(eef_body_name) if eef_body_name is not None else "hand"
         self._gripper_joint_name: str = str(gripper_joint_name) if gripper_joint_name is not None else "finger_joint1"
+        # EEF state site (round 31, #168). The state observations fed to
+        # GR00T (state.x/y/z/roll/pitch/yaw) must come from the gripper
+        # *tip* — the same site that RoboSuite's
+        # ``OperationalSpaceController`` reads for its
+        # ``robot0_eef_pos`` / ``robot0_eef_quat`` observables. Reading
+        # from the wrist *body* (the round-5 default) is ~9.7 cm above
+        # the tip and rotated 180° around X, which fed GR00T
+        # out-of-distribution state across rounds 23-30 of #168.
+        # Auto-default to ``"<scene_gripper_prefix>grip_site"`` (i.e.
+        # ``"gripper0_grip_site"`` for LIBERO scenes); user override
+        # disables auto-derivation. Empty-string sentinel is treated as
+        # "no site available", forcing the body fallback (used by tests
+        # that need to exercise the legacy body path).
+        self._user_eef_state_site_name: str | None = (
+            str(eef_state_site_name) if eef_state_site_name is not None else None
+        )
         # Track whether the user explicitly supplied either name so the
         # auto-resolver in :meth:`_register_default_robot` only overrides
         # when the constructor default (``None``) was used. Explicit
@@ -467,6 +502,7 @@ class LiberoAdapter(BenchmarkProtocol):
         install_cameras: bool = True,
         cameras: dict[str, dict[str, Any]] | None = None,
         eef_body_name: str | None = None,
+        eef_state_site_name: str | None = None,
         gripper_joint_name: str | None = None,
         inject_eef_state: bool = True,
         auto_generate_scene: bool = True,
@@ -517,6 +553,7 @@ class LiberoAdapter(BenchmarkProtocol):
         install_cameras: bool = True,
         cameras: dict[str, dict[str, Any]] | None = None,
         eef_body_name: str | None = None,
+        eef_state_site_name: str | None = None,
         gripper_joint_name: str | None = None,
         inject_eef_state: bool = True,
         auto_generate_scene: bool = True,
@@ -538,6 +575,7 @@ class LiberoAdapter(BenchmarkProtocol):
             install_cameras=install_cameras,
             cameras=cameras,
             eef_body_name=eef_body_name,
+            eef_state_site_name=eef_state_site_name,
             gripper_joint_name=gripper_joint_name,
             inject_eef_state=inject_eef_state,
             auto_generate_scene=auto_generate_scene,
@@ -565,6 +603,26 @@ class LiberoAdapter(BenchmarkProtocol):
     def instruction(self) -> str:
         """Language instruction from the BDDL ``:language`` clause, or ``""``."""
         return self.problem.language or ""
+
+    @property
+    def eef_state_site_name(self) -> str:
+        """Resolved MuJoCo site name to read for ``state.x/y/z/roll/pitch/yaw``.
+
+        Returns the user-supplied ``eef_state_site_name`` constructor
+        argument when set, otherwise auto-derives from
+        ``scene_gripper_prefix + "grip_site"`` (i.e. defaults to
+        ``"gripper0_grip_site"`` for LIBERO scenes).
+
+        This is the site RoboSuite's ``OperationalSpaceController`` reads
+        for its ``robot0_eef_pos`` / ``robot0_eef_quat`` observables (via
+        ``data.site_xpos[eef_site_id]``); reading from the same site
+        in :meth:`augment_observation` keeps the state observations
+        we feed GR00T at the gripper TIP, matching the kinematic
+        location LIBERO-trained checkpoints expect. Round 31 (#168).
+        """
+        if self._user_eef_state_site_name is not None:
+            return self._user_eef_state_site_name
+        return f"{self._scene_gripper_prefix}grip_site"
 
     def on_episode_start(self, sim: SimEngine, rng: random.Random) -> None:
         """Auto-generate scene (if needed), load it, capture-or-restore
@@ -1213,24 +1271,43 @@ class LiberoAdapter(BenchmarkProtocol):
         every request with ``Server error: State key 'state.x' must be
         in observation``.
 
+        **Round 31 fix (#168 — pose source).** Read EEF pose from the
+        gripper *site* (``self.eef_state_site_name`` →
+        ``"gripper0_grip_site"`` for LIBERO scenes) instead of the
+        wrist *body* (``self._eef_body_name`` → ``"robot0_right_hand"``).
+        These differ by ~9.7 cm in z and 180° rotation around X — the
+        site is at the gripper TIP, the body is at the wrist. RoboSuite's
+        ``OperationalSpaceController`` reads from the site for its own
+        ``robot0_eef_pos`` / ``robot0_eef_quat`` observables, so reading
+        from the same site here produces state observations matching
+        what LIBERO checkpoints were trained against. Reading from the
+        body fed GR00T out-of-distribution state, which manifested as
+        ``success_rate = 0`` across rounds 23-30.
+
         Implementation:
 
-        1. Read end-effector pose via ``sim.get_body_state(self._eef_body_name)``
-           (default body ``"hand"`` for MuJoCo Menagerie's Panda).
-        2. Convert MuJoCo's ``(w, x, y, z)`` quaternion to extrinsic XYZ
-           Euler ``(roll, pitch, yaw)`` to match the LIBERO/RoboSuite
-           ``mat2euler(..., axes='sxyz')`` convention the dataset and
-           policy were trained on.
-        3. Read gripper opening from ``obs[self._gripper_joint_name]``
-           (already populated by ``Simulation.get_observation``; default
-           ``"finger_joint1"`` matches Menagerie Panda).
+        1. Try the SITE path first via direct
+           ``mujoco.mj_name2id(model, mjtObj.mjOBJ_SITE, eef_state_site_name)``,
+           reading ``data.site_xpos`` + ``data.site_xmat``.
+        2. Fall back to the BODY path via
+           ``sim.get_body_state(self._eef_body_name)`` for non-RoboSuite
+           scenes that don't ship the canonical site (e.g. bare
+           Menagerie Panda). The fallback path matches the pre-round-31
+           behaviour exactly.
+        3. Convert the site/body's rotation matrix or quaternion to
+           extrinsic XYZ Euler ``(roll, pitch, yaw)`` to match the
+           LIBERO/RoboSuite ``mat2euler(..., axes='sxyz')`` convention
+           the dataset and policy were trained on.
+        4. Read gripper opening from ``obs[self._gripper_joint_name]``
+           (already populated by ``Simulation.get_observation``).
 
         Best-effort: if any source is missing (sim doesn't expose
-        ``get_body_state``, body name unknown, gripper joint absent),
-        the corresponding key is omitted with a debug log. The original
-        observation is returned with the resolved keys merged in - we
-        never delete or overwrite an obs key the sim already provided
-        (so a backend that natively returns Cartesian state wins).
+        ``get_body_state``, site absent and body absent, gripper joint
+        absent), the corresponding key is omitted with a debug log. The
+        original observation is returned with the resolved keys merged
+        in - we never delete or overwrite an obs key the sim already
+        provided (so a backend that natively returns Cartesian state
+        wins).
 
         Disable this entirely with ``inject_eef_state=False`` on the
         constructor.
@@ -1240,29 +1317,21 @@ class LiberoAdapter(BenchmarkProtocol):
 
         merged = dict(obs)
 
-        # End-effector pose - via get_body_state which is namespace-aware
-        # (the `panda_arm/hand` form works in multi-robot scenes).
-        get_body_state = getattr(sim, "get_body_state", None)
-        if get_body_state is not None:
-            try:
-                state_result = get_body_state(body_name=self._eef_body_name)
-            except Exception as e:  # noqa: BLE001 - never abort eval on a state lookup
-                logger.debug("LiberoAdapter: get_body_state(%r) raised: %s", self._eef_body_name, e)
-                state_result = None
-            position, quat = _extract_pose(state_result)
-            if position is not None:
-                # Don't overwrite if a backend already supplied these
-                # (e.g. via a custom mapping).
-                merged.setdefault("x", float(position[0]))
-                merged.setdefault("y", float(position[1]))
-                merged.setdefault("z", float(position[2]))
-            if quat is not None:
-                roll, pitch, yaw = _quat_wxyz_to_rpy_xyz(quat)
-                merged.setdefault("roll", roll)
-                merged.setdefault("pitch", pitch)
-                merged.setdefault("yaw", yaw)
-        else:
-            logger.debug("LiberoAdapter: sim has no get_body_state(); skipping EEF state injection")
+        # End-effector pose. Round 31 (#168): try site lookup first
+        # (matches RoboSuite's eef_pos / eef_quat semantics), fall
+        # back to body lookup if the site doesn't exist.
+        position, quat = self._read_eef_pose(sim)
+        if position is not None:
+            # Don't overwrite if a backend already supplied these
+            # (e.g. via a custom mapping).
+            merged.setdefault("x", float(position[0]))
+            merged.setdefault("y", float(position[1]))
+            merged.setdefault("z", float(position[2]))
+        if quat is not None:
+            roll, pitch, yaw = _quat_wxyz_to_rpy_xyz(quat)
+            merged.setdefault("roll", roll)
+            merged.setdefault("pitch", pitch)
+            merged.setdefault("yaw", yaw)
 
         # Gripper - read from the (already collected) joint observation.
         # The Menagerie Panda's two-finger constraint mirrors finger_joint1
@@ -1316,6 +1385,80 @@ class LiberoAdapter(BenchmarkProtocol):
             self._state_log_step += 1
 
         return merged
+
+    def _read_eef_pose(self, sim: SimEngine) -> tuple[list[float] | None, list[float] | None]:
+        """Read EEF position + (wxyz) quaternion for ``augment_observation``.
+
+        Round 31 (#168): try the SITE path first
+        (``data.site_xpos[gripper0_grip_site]`` / ``data.site_xmat[...]``),
+        fall back to the BODY path
+        (``sim.get_body_state(self._eef_body_name)``) if the site doesn't
+        exist (e.g. non-RoboSuite scenes where there's no
+        ``gripper0_grip_site``).
+
+        Returns ``(pos, quat_wxyz)``, either or both of which may be
+        ``None`` on failure (logged at DEBUG; caller selectively injects
+        only the keys it has).
+
+        Why site, not body: RoboSuite's
+        ``OperationalSpaceController`` reads ``robot0_eef_pos`` /
+        ``robot0_eef_quat`` from ``data.site_xpos[eef_site_id]`` —
+        the same site location LIBERO checkpoints were trained
+        against. The ``robot0_right_hand`` body is ~9.7 cm above
+        the site (the wrist) and rotated 180° around X (the wrist
+        axes don't match the gripper's pointing direction); reading
+        from the body fed GR00T out-of-distribution state for
+        rounds 23-30 of #168. See PR #168 round-30 verification +
+        round-31 fix.
+        """
+        # 1. Site path (preferred). Uses direct mujoco access to the
+        # compiled model; namespace prefixing is part of the LIBERO
+        # scene's actual site name (``gripper0_grip_site``), so no
+        # backend-specific namespace handling is needed.
+        world = getattr(sim, "_world", None)
+        model = getattr(world, "_model", None) if world is not None else None
+        data = getattr(world, "_data", None) if world is not None else None
+        if model is not None and data is not None:
+            site_name = self.eef_state_site_name
+            if site_name:
+                try:
+                    import mujoco as _mj
+
+                    site_id = int(_mj.mj_name2id(model, _mj.mjtObj.mjOBJ_SITE, site_name))
+                except (ImportError, AttributeError, TypeError, ValueError) as e:
+                    logger.debug("LiberoAdapter: mujoco site lookup failed for %r: %s", site_name, e)
+                    site_id = -1
+                if site_id >= 0:
+                    try:
+                        pos_arr = np.asarray(data.site_xpos[site_id], dtype=np.float64)
+                        xmat_arr = np.asarray(data.site_xmat[site_id], dtype=np.float64).reshape(9)
+                        quat_arr = np.zeros(4, dtype=np.float64)
+                        _mj.mju_mat2Quat(quat_arr, xmat_arr)
+                        return ([float(c) for c in pos_arr], [float(c) for c in quat_arr])
+                    except (AttributeError, IndexError, ValueError) as e:
+                        logger.debug(
+                            "LiberoAdapter: failed to read site %r pose (site_id=%d): %s",
+                            site_name,
+                            site_id,
+                            e,
+                        )
+
+        # 2. Body fallback (legacy / non-RoboSuite scenes). Uses the
+        # public ``sim.get_body_state`` API — namespace-aware (handles
+        # ``panda_arm/hand`` for multi-robot scenes) and matches what
+        # the round-5 implementation did before the round-31 site
+        # preference. Returns the same ``(pos, quat_wxyz)`` shape so
+        # the caller's logic is unchanged.
+        get_body_state = getattr(sim, "get_body_state", None)
+        if get_body_state is None:
+            logger.debug("LiberoAdapter: sim has no get_body_state(); skipping EEF state injection")
+            return (None, None)
+        try:
+            state_result = get_body_state(body_name=self._eef_body_name)
+        except Exception as e:  # noqa: BLE001 - never abort eval on a state lookup
+            logger.debug("LiberoAdapter: get_body_state(%r) raised: %s", self._eef_body_name, e)
+            return (None, None)
+        return _extract_pose(state_result)
 
     def is_success(self, sim: SimEngine) -> bool:
         return bool(self._success_fn(sim))
