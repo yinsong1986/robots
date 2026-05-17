@@ -232,12 +232,96 @@ class RenderingMixin:
         We look up the namespaced MuJoCo actuator/joint name for this
         specific ``robot_name`` so the same action dict routes to the right
         physical actuator when multiple same-config robots exist.
+
+        Action-controller hook (#168 round 23): when a benchmark adapter
+        has installed a custom action controller via
+        ``world._backend_state["action_controller"]`` (mirroring the
+        ``viz_option`` pattern from #168 round 9), dispatch to it
+        instead of the actuator/joint-name lookup loop. Used by
+        :class:`LiberoAdapter` to convert GR00T's task-space delta-EEF
+        actions (7-dim ``{x, y, z, roll, pitch, yaw, gripper}``) into
+        the LIBERO scene's torque-mode joint actuators (9-dim
+        ``robot0_torq_j1..7`` + gripper) via RoboSuite's
+        ``OperationalSpaceController`` (OSC_POSE). Without this hook,
+        ``_apply_sim_action`` would silently drop every key (no name
+        match), the policy would effectively send 0 torque, and any
+        observed motion would be gravity / drift only.
+
+        Default (no controller installed) preserves the existing
+        actuator/joint-name lookup path verbatim. Non-LIBERO callers
+        and existing tests see zero behaviour change.
         """
         mj = _ensure_mujoco()
         assert self._world is not None  # callers must check
         model, data = self._world._model, self._world._data
         robot = self._world.robots.get(robot_name)
         pfx = robot.namespace if robot else ""
+
+        # Action-controller fast path: adapter-installed transform
+        # from action_dict (e.g. task-space deltas) to data.ctrl
+        # writes (joint torques). When set, the controller takes
+        # full responsibility for the data.ctrl update; the
+        # actuator/joint-name lookup loop is skipped.
+        controller = self._get_action_controller()
+        if controller is not None:
+            try:
+                controller.apply(action_dict, model, data, robot_name)
+            except Exception as e:  # noqa: BLE001 - never abort eval on a controller failure
+                logger.warning(
+                    "_apply_sim_action: action_controller.apply raised %s; falling through to "
+                    "name-lookup path (action may be dropped)",
+                    e,
+                )
+                self._apply_action_by_name(model, data, action_dict, pfx, mj)
+        else:
+            self._apply_action_by_name(model, data, action_dict, pfx, mj)
+
+        for _ in range(max(1, n_substeps)):
+            mj.mj_step(model, data)
+
+        assert self._world is not None
+        self._world.sim_time = data.time
+        self._world.step_count += n_substeps
+
+        if hasattr(self, "_viewer_handle") and self._viewer_handle is not None:
+            self._viewer_handle.sync()
+
+    def _get_action_controller(self) -> Any:
+        """Return an installed action-controller or ``None``.
+
+        Mirrors :meth:`_get_viz_option`. The controller (if present)
+        is set by a benchmark adapter via
+        ``world._backend_state["action_controller"]`` and is expected
+        to expose an ``apply(action_dict, model, data, robot_name)``
+        method that writes to ``data.ctrl``. See
+        :meth:`LiberoAdapter._install_action_controller` for the
+        canonical use case.
+
+        Returns ``None`` (the default) when no adapter has set the
+        override. The actuator/joint-name lookup loop in
+        :meth:`_apply_sim_action` is the fallback in that case.
+        """
+        if self._world is None:
+            return None
+        state = getattr(self._world, "_backend_state", None)
+        if not isinstance(state, dict):
+            return None
+        return state.get("action_controller")
+
+    def _apply_action_by_name(
+        self,
+        model: Any,
+        data: Any,
+        action_dict: dict[str, Any],
+        pfx: str,
+        mj: Any,
+    ) -> None:
+        """Default action-application: look up actuator / joint by name.
+
+        Extracted from :meth:`_apply_sim_action` so the
+        ``action_controller`` fast path can fall back to it on
+        controller failure (the same path non-LIBERO callers use).
+        """
 
         def _lookup(obj_type: Any, name: str) -> int:
             """Try namespaced lookup first, fall back to raw."""
@@ -260,16 +344,6 @@ class RenderingMixin:
                         if model.actuator_trnid[ai, 0] == jnt_id:
                             data.ctrl[ai] = float(value)
                             break
-
-        for _ in range(max(1, n_substeps)):
-            mj.mj_step(model, data)
-
-        assert self._world is not None
-        self._world.sim_time = data.time
-        self._world.step_count += n_substeps
-
-        if hasattr(self, "_viewer_handle") and self._viewer_handle is not None:
-            self._viewer_handle.sync()
 
     def render(
         self, camera_name: str = "default", width: int | None = None, height: int | None = None

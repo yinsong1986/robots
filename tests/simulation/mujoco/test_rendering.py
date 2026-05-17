@@ -179,6 +179,177 @@ def test_get_viz_option_handles_missing_world() -> None:
     assert sim._get_viz_option() is None
 
 
+# Action-controller hook (#168 round 23 - dispatch action_dict via
+# adapter-installed controller in world._backend_state["action_controller"])
+
+
+def test_get_action_controller_returns_none_when_unset() -> None:
+    """``RenderingMixin._get_action_controller`` returns ``None`` when
+    no adapter has populated ``world._backend_state['action_controller']``.
+    This is the default path for non-LIBERO sims;
+    :meth:`_apply_sim_action` falls through to its actuator/joint name
+    lookup loop unchanged."""
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    sim.create_world()
+    assert sim._get_action_controller() is None
+    sim.destroy()
+
+
+def test_get_action_controller_reads_from_backend_state() -> None:
+    """When an adapter sets ``world._backend_state['action_controller']``,
+    the rendering layer reads it via ``_get_action_controller`` and
+    dispatches to ``controller.apply(...)`` instead of the name-lookup
+    loop."""
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    sim.create_world()
+    sentinel_controller = object()
+    assert sim._world is not None
+    sim._world._backend_state["action_controller"] = sentinel_controller
+    assert sim._get_action_controller() is sentinel_controller
+    sim.destroy()
+
+
+def test_get_action_controller_handles_missing_backend_state() -> None:
+    """Defensive: ``world._backend_state`` not being a dict returns
+    None silently rather than raising."""
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    sim.create_world()
+    assert sim._world is not None
+    sim._world._backend_state = "oops not a dict"  # type: ignore[assignment]
+    assert sim._get_action_controller() is None
+    sim.destroy()
+
+
+def test_get_action_controller_handles_missing_world() -> None:
+    """``self._world is None`` -> _get_action_controller returns None."""
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    assert sim._get_action_controller() is None
+
+
+@_requires_mujoco
+def test_apply_sim_action_dispatches_to_controller_when_installed() -> None:
+    """When an action_controller is installed, ``_apply_sim_action``
+    dispatches to ``controller.apply(action_dict, model, data, robot_name)``
+    instead of the actuator/joint name lookup loop. Pin for #168
+    round-23 contract: GR00T's task-space action keys (``x``, ``y``,
+    ``z``, ``roll``, ``pitch``, ``yaw``, ``gripper``) would otherwise
+    silently no-op because they don't match any actuator name."""
+    pytest.importorskip("mujoco")
+    os.environ.setdefault("MUJOCO_GL", "glfw")
+
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    sim.create_world()
+    sim.add_robot("arm", data_config="so101", position=[0.0, 0.0, 0.0])
+
+    apply_calls: list = []
+
+    class _CountingController:
+        def apply(self, action_dict, model, data, robot_name):
+            apply_calls.append((dict(action_dict), robot_name))
+            # Don't write data.ctrl - just record the call.
+
+    assert sim._world is not None
+    sim._world._backend_state["action_controller"] = _CountingController()
+
+    # Send an action dict that wouldn't match any actuator in the so101
+    # model - the name-lookup loop would silently drop these. The
+    # controller should still get called.
+    sim.send_action({"x": 0.5, "gripper": 0.7}, robot_name="arm")
+    assert len(apply_calls) == 1
+    action, robot_name = apply_calls[0]
+    assert action == {"x": 0.5, "gripper": 0.7}
+    assert robot_name == "arm"
+    sim.destroy()
+
+
+@_requires_mujoco
+def test_apply_sim_action_falls_back_when_controller_raises() -> None:
+    """If the action_controller's ``apply`` raises, ``_apply_sim_action``
+    logs a WARNING and falls through to the name-lookup loop. Pin for
+    the controller-failure recovery path so a transient OSC controller
+    crash doesn't silently zero the action stream."""
+    pytest.importorskip("mujoco")
+    os.environ.setdefault("MUJOCO_GL", "glfw")
+
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    sim.create_world()
+    sim.add_robot("arm", data_config="so101", position=[0.0, 0.0, 0.0])
+
+    class _BoomController:
+        def apply(self, action_dict, model, data, robot_name):
+            raise RuntimeError("simulated controller failure")
+
+    assert sim._world is not None
+    sim._world._backend_state["action_controller"] = _BoomController()
+
+    # The name-lookup fallback fires; a recognized actuator key gets
+    # applied. Use a likely-existing so101 actuator name.
+    actuator_names = []
+    import mujoco
+
+    for i in range(int(sim._world._model.nu)):
+        n = mujoco.mj_id2name(sim._world._model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+        if n:
+            actuator_names.append(n)
+    if not actuator_names:
+        pytest.skip("no actuators in so101 model; can't test fallback")
+
+    # Use the FIRST actuator's bare name (strip namespace prefix if any).
+    raw = actuator_names[0]
+    pfx = "arm/"
+    bare = raw[len(pfx) :] if raw.startswith(pfx) else raw
+
+    sim.send_action({bare: 0.5}, robot_name="arm")
+    # Look up the corresponding ctrl[i].
+    ctrl_id = mujoco.mj_name2id(sim._world._model, mujoco.mjtObj.mjOBJ_ACTUATOR, raw)
+    assert ctrl_id >= 0
+    # The fallback's name-lookup loop wrote 0.5 to data.ctrl[ctrl_id].
+    assert sim._world._data.ctrl[ctrl_id] == 0.5
+
+    sim.destroy()
+
+
+def test_apply_sim_action_no_controller_uses_name_lookup() -> None:
+    """Without an action_controller installed, ``_apply_sim_action``
+    uses the name-lookup loop (the pre-round-23 default behaviour).
+    Pin so non-LIBERO callers and existing tests see zero behaviour
+    change."""
+    pytest.importorskip("mujoco")
+    os.environ.setdefault("MUJOCO_GL", "glfw")
+
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    sim.create_world()
+    sim.add_robot("arm", data_config="so101", position=[0.0, 0.0, 0.0])
+
+    assert sim._world is not None
+    # No action_controller installed.
+    assert sim._get_action_controller() is None
+
+    # Random unmatched key - falls through silently (the round-23
+    # diagnostic pattern: GR00T-shaped keys with no name match).
+    sim.send_action({"this_key_does_not_match_any_actuator": 1.0}, robot_name="arm")
+    # data.ctrl all zero.
+    import numpy as np
+
+    assert np.all(sim._world._data.ctrl == 0)
+
+    sim.destroy()
+
+
 @_requires_mujoco
 def test_render_passes_scene_option_to_renderer(tmp_path: Path) -> None:
     """End-to-end: ``Simulation.render(camera_name=...)`` reads

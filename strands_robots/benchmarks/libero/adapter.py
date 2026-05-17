@@ -757,6 +757,17 @@ class LiberoAdapter(BenchmarkProtocol):
             # actuator / COM markers without modifying the cached MJCF.
             # See :meth:`_install_render_options` for the rationale.
             self._install_render_options(sim)
+            # Install OSC_POSE controller so GR00T's task-space delta-EEF
+            # actions ({x, y, z, roll, pitch, yaw, gripper}) get
+            # converted into the LIBERO scene's torque-mode joint
+            # actuators. Without this, _apply_sim_action silently
+            # drops every action key (no name match) and the policy
+            # effectively sends 0 torque (#168 round 23 bug). Best-
+            # effort - if controller setup fails (missing robosuite,
+            # missing site, etc.), log + continue; the eval will run
+            # but actions will be no-ops, which is the same behaviour
+            # as before round 23.
+            self._install_action_controller(sim)
         if self._init_jitter > 0:
             self._apply_init_jitter(sim, rng)
 
@@ -887,6 +898,15 @@ class LiberoAdapter(BenchmarkProtocol):
             self._install_render_options(sim)
         except Exception as e:  # noqa: BLE001
             logger.warning("LiberoAdapter.prewarm: _install_render_options raised: %s", e)
+
+        # Install the OSC_POSE action controller so GR00T's task-space
+        # delta-EEF actions translate to joint torques (#168 round 23
+        # bug). Same idempotency / best-effort pattern as the other
+        # prewarm steps.
+        try:
+            self._install_action_controller(sim)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("LiberoAdapter.prewarm: _install_action_controller raised: %s", e)
 
         # Apply ``init_states[0]`` so the recorder's first frame
         # captures the canonical "ready" pose the policy will see at
@@ -1733,6 +1753,78 @@ class LiberoAdapter(BenchmarkProtocol):
         backend_state["viz_option"] = opt
         logger.debug("LiberoAdapter: installed render options on world._backend_state['viz_option']")
 
+    def _install_action_controller(self, sim: SimEngine) -> None:
+        """Install OSC_POSE controller for GR00T task-space -> joint torques.
+
+        GR00T-LIBERO outputs 7-dim Cartesian delta-EEF actions
+        (``{x, y, z, roll, pitch, yaw, gripper}``); LIBERO scenes use
+        torque-mode joint actuators (``robot0_torq_j1..7`` plus 2
+        gripper). Without this controller, ``_apply_sim_action`` looks
+        up GR00T's action keys by name in the model's actuator/joint
+        tables, finds no match, and silently drops every action - the
+        policy effectively sends zero torque (#168 round 23 verification).
+
+        This installs a :class:`_LiberoOSCController` instance in
+        ``world._backend_state["action_controller"]``. The rendering
+        layer's :meth:`_apply_sim_action` checks for this key (via
+        :meth:`_get_action_controller`) and dispatches to
+        ``controller.apply(action_dict, model, data, robot_name)``
+        which writes joint torques to ``data.ctrl``.
+
+        The controller wraps RoboSuite's
+        ``OperationalSpaceController`` for the arm (6-dim Cartesian
+        PD with inverse-Jacobian) and a direct gripper-actuator
+        write for the 7th channel.
+
+        Best-effort: missing robosuite, missing site, missing actuator
+        IDs - all log + skip without raising. The eval will run with
+        actions silently dropped (the round-22 status quo), which at
+        least doesn't crash.
+
+        Lifecycle: tied to the loaded scene's compiled model. Since
+        ``_apply_canonical_state``'s init-state apply may have already
+        run, the controller is built using stable model IDs at
+        on_episode_start time. Subsequent ``load_scene`` calls
+        invalidate the controller's IDs; the new world's
+        ``_backend_state`` is fresh so callers must re-install via
+        ``prewarm`` or another ``on_episode_start`` cycle.
+        """
+        try:
+            controller = _LiberoOSCController.from_sim(
+                sim,
+                eef_site_name=f"{self._scene_gripper_prefix}grip_site",
+                arm_prefix=self._scene_robot_prefix,
+                gripper_prefix=self._scene_gripper_prefix,
+            )
+        except _ControllerInstallError as e:
+            logger.warning(
+                "LiberoAdapter._install_action_controller: %s. "
+                "GR00T actions will silently no-op until this is resolved.",
+                e,
+            )
+            return
+        except Exception as e:  # noqa: BLE001 - never abort eval on controller failure
+            logger.warning(
+                "LiberoAdapter._install_action_controller: unexpected failure (%s); "
+                "GR00T actions will silently no-op until this is resolved.",
+                e,
+            )
+            return
+
+        world = getattr(sim, "_world", None)
+        if world is None:
+            return
+        backend_state = getattr(world, "_backend_state", None)
+        if not isinstance(backend_state, dict):
+            return
+        backend_state["action_controller"] = controller
+        logger.debug(
+            "LiberoAdapter: installed OSC_POSE action_controller (eef_site=%r, arm_actuators=%d, gripper_actuators=%d)",
+            controller.eef_site_name,
+            len(controller.arm_actuator_ids),
+            len(controller.gripper_actuator_ids),
+        )
+
     def _install_libero_cameras(self, sim: SimEngine) -> None:
         """Inject the cameras the ``libero_panda`` data_config expects.
 
@@ -2495,6 +2587,278 @@ def _build_scene_robot_wrapper(
         actuator_ids=actuator_ids,
         namespace=prefix,
     )
+
+
+class _ControllerInstallError(RuntimeError):
+    """Raised inside :meth:`_LiberoOSCController.from_sim` when the
+    LIBERO action controller can't be built (missing robosuite,
+    missing site/actuator IDs, etc.). Caught by
+    :meth:`LiberoAdapter._install_action_controller` and converted to
+    a WARNING log + silent fall-through to ``_apply_action_by_name``."""
+
+
+class _LiberoOSCController:
+    """OSC_POSE controller wrapper for GR00T-LIBERO action dispatch (#168 round 23).
+
+    Converts task-space delta-EEF actions
+    (``{x, y, z, roll, pitch, yaw, gripper}``) into joint torques
+    via RoboSuite's ``OperationalSpaceController``. Wraps the 7th
+    ``gripper`` channel separately as a direct write to gripper
+    actuators (RoboSuite's OSC ignores the gripper).
+
+    Architecture: holds a robosuite ``MjSim`` shim around the
+    sim's compiled MuJoCo model + data, plus an ``OSC_POSE``
+    controller bound to the arm's 7 joint indices and EEF site.
+    The shim is constructed once at episode start and reused for
+    every action call. ``apply()`` runs the controller with the
+    incoming 6-dim Cartesian delta and writes the resulting
+    torques to ``data.ctrl[arm_actuator_ids]``; the gripper
+    channel writes to ``data.ctrl[gripper_actuator_ids]`` directly.
+
+    Lifecycle: bound to one specific compiled model. If the spec
+    is recompiled (via ``load_scene``, ``add_camera`` triggering a
+    spec-rebuild, etc.) the controller's stored joint / actuator IDs
+    become stale. ``LiberoAdapter._install_action_controller`` is
+    called from prewarm + on_episode_start to keep the controller
+    fresh per episode.
+    """
+
+    def __init__(
+        self,
+        controller: Any,
+        sim_shim: Any,
+        eef_site_name: str,
+        arm_actuator_ids: list[int],
+        gripper_actuator_ids: list[int],
+        model: Any,
+        data: Any,
+    ) -> None:
+        self.controller = controller
+        self.sim_shim = sim_shim
+        self.eef_site_name = eef_site_name
+        self.arm_actuator_ids = list(arm_actuator_ids)
+        self.gripper_actuator_ids = list(gripper_actuator_ids)
+        self.model = model
+        self.data = data
+
+    @classmethod
+    def from_sim(
+        cls,
+        sim: SimEngine,
+        *,
+        eef_site_name: str,
+        arm_prefix: str,
+        gripper_prefix: str,
+    ) -> _LiberoOSCController:
+        """Build a controller bound to ``sim``'s loaded LIBERO scene.
+
+        Discovers:
+        - arm joints and qpos/qvel addresses (``robot0_joint1..7``)
+        - arm actuator IDs (one per arm joint)
+        - gripper actuator IDs (``gripper0_*`` actuators)
+        - EEF site ID (e.g. ``gripper0_grip_site``)
+        - actuator force/torque limits (``model.actuator_ctrlrange``)
+
+        Raises :class:`_ControllerInstallError` with a diagnostic on
+        any discovery failure. The caller (``_install_action_controller``)
+        catches and logs at WARNING.
+        """
+        # Lazy imports - robosuite is a transitive dep via libero,
+        # not pinned directly. Skip silently if either is unavailable.
+        try:
+            import mujoco as _mj
+        except ImportError as e:
+            raise _ControllerInstallError(f"mujoco not importable: {e}") from e
+        try:
+            from robosuite.controllers import (  # type: ignore[import-not-found]
+                controller_factory,
+                load_controller_config,
+            )
+            from robosuite.utils.binding_utils import MjSim  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise _ControllerInstallError(f"robosuite not importable: {e}") from e
+
+        world = getattr(sim, "_world", None)
+        if world is None:
+            raise _ControllerInstallError("sim has no _world")
+        model = getattr(world, "_model", None)
+        data = getattr(world, "_data", None)
+        if model is None or data is None:
+            raise _ControllerInstallError("sim._world has no compiled MuJoCo model/data")
+
+        # 1. Discover arm joints (robot0_joint1..7).
+        arm_joint_ids: list[int] = []
+        arm_qpos_addrs: list[int] = []
+        arm_qvel_addrs: list[int] = []
+        njnt = int(getattr(model, "njnt", 0))
+        for i in range(njnt):
+            jname = _mj.mj_id2name(model, _mj.mjtObj.mjOBJ_JOINT, i)
+            if not isinstance(jname, str) or not jname.startswith(arm_prefix):
+                continue
+            # Skip the gripper joints (different prefix; covered separately).
+            if jname.startswith(gripper_prefix):
+                continue
+            arm_joint_ids.append(i)
+            arm_qpos_addrs.append(int(model.jnt_qposadr[i]))
+            # Each arm joint has 1 DoF (hinge), so qvel addr == joint id's
+            # entry in jnt_dofadr. (For free joints this would be more
+            # complex, but arm joints are hinges.)
+            arm_qvel_addrs.append(int(model.jnt_dofadr[i]))
+        if len(arm_joint_ids) != 7:
+            raise _ControllerInstallError(
+                f"expected 7 arm joints with prefix {arm_prefix!r}, found {len(arm_joint_ids)}"
+            )
+
+        # 2. Discover arm actuator IDs (one per arm joint).
+        arm_actuator_ids: list[int] = []
+        nu = int(getattr(model, "nu", 0))
+        for jid in arm_joint_ids:
+            for ai in range(nu):
+                if int(model.actuator_trnid[ai, 0]) == jid:
+                    arm_actuator_ids.append(ai)
+                    break
+            else:
+                raise _ControllerInstallError(
+                    f"no actuator found driving joint id={jid} (joint name "
+                    f"{_mj.mj_id2name(model, _mj.mjtObj.mjOBJ_JOINT, jid)!r})"
+                )
+
+        # 3. Discover gripper actuator IDs (any actuator with gripper_prefix
+        #    in its name).
+        gripper_actuator_ids: list[int] = []
+        for ai in range(nu):
+            aname = _mj.mj_id2name(model, _mj.mjtObj.mjOBJ_ACTUATOR, ai)
+            if isinstance(aname, str) and aname.startswith(gripper_prefix):
+                gripper_actuator_ids.append(ai)
+        if not gripper_actuator_ids:
+            raise _ControllerInstallError(f"no gripper actuators with prefix {gripper_prefix!r}")
+
+        # 4. Verify EEF site exists.
+        site_id = _mj.mj_name2id(model, _mj.mjtObj.mjOBJ_SITE, eef_site_name)
+        if site_id < 0:
+            raise _ControllerInstallError(f"EEF site {eef_site_name!r} not found in model")
+
+        # 5. Build robosuite MjSim shim around our model + data.
+        sim_shim = MjSim(model, data)
+
+        # 6. Build OSC_POSE controller config + instance.
+        controller_config = load_controller_config(default_controller="OSC_POSE")
+        controller_config["robot_name"] = "Panda"
+        controller_config["sim"] = sim_shim
+        controller_config["eef_name"] = eef_site_name
+        controller_config["joint_indexes"] = {
+            "joints": arm_joint_ids,
+            "qpos": arm_qpos_addrs,
+            "qvel": arm_qvel_addrs,
+        }
+        # actuator_range is (low_arr, high_arr) for the ARM actuators
+        # only - gripper is handled separately.
+        ctrl_low = np.array(
+            [float(model.actuator_ctrlrange[ai, 0]) for ai in arm_actuator_ids],
+            dtype=np.float32,
+        )
+        ctrl_high = np.array(
+            [float(model.actuator_ctrlrange[ai, 1]) for ai in arm_actuator_ids],
+            dtype=np.float32,
+        )
+        controller_config["actuator_range"] = (ctrl_low, ctrl_high)
+        controller = controller_factory("OSC_POSE", controller_config)
+
+        return cls(
+            controller=controller,
+            sim_shim=sim_shim,
+            eef_site_name=eef_site_name,
+            arm_actuator_ids=arm_actuator_ids,
+            gripper_actuator_ids=gripper_actuator_ids,
+            model=model,
+            data=data,
+        )
+
+    def apply(
+        self,
+        action_dict: dict[str, Any],
+        model: Any,
+        data: Any,
+        robot_name: str,  # noqa: ARG002 - kept for hook signature parity
+    ) -> None:
+        """Convert task-space delta-EEF action to joint torques + write data.ctrl.
+
+        Reads from ``action_dict``: ``x, y, z, roll, pitch, yaw, gripper``.
+        Writes to ``data.ctrl[arm_actuator_ids]`` (joint torques) and
+        ``data.ctrl[gripper_actuator_ids]`` (gripper open/close).
+
+        The OSC controller computes inverse Jacobian using
+        ``data.xpos / xmat / qpos / qvel`` - which means
+        :meth:`LiberoAdapter._forward_mj_data` must have run before
+        this is first called (otherwise xpos/xmat are uninitialized).
+        Round-15's ``mj_forward`` in ``Simulation.load_scene``
+        guarantees this.
+
+        Best-effort against bad inputs: missing keys default to 0
+        (no-op delta); shape mismatches log at WARNING and skip
+        without raising.
+        """
+        # Refresh sim_shim's view of data (controller reads from
+        # sim_shim.data.qpos / xpos / xmat). MjSim shim wraps our
+        # data by reference, so this is a no-op in practice but
+        # makes the assumption explicit.
+        self.controller.update()
+
+        # Pack 6-dim Cartesian delta: (dx, dy, dz, droll, dpitch, dyaw).
+        # Missing keys default to 0 (no-op delta).
+        delta = np.array(
+            [
+                float(action_dict.get("x", 0.0)),
+                float(action_dict.get("y", 0.0)),
+                float(action_dict.get("z", 0.0)),
+                float(action_dict.get("roll", 0.0)),
+                float(action_dict.get("pitch", 0.0)),
+                float(action_dict.get("yaw", 0.0)),
+            ],
+            dtype=np.float64,
+        )
+
+        # OSC controller: set goal from delta + run controller →
+        # joint torques. set_goal accepts the 6-vector as a Cartesian
+        # delta in fixed-impedance mode (the LIBERO default).
+        try:
+            self.controller.set_goal(delta)
+            torques = self.controller.run_controller()
+        except Exception as e:  # noqa: BLE001 - log + skip rather than crash eval
+            logger.warning(
+                "_LiberoOSCController.apply: OSC controller raised %s; this step's arm action will be no-op",
+                e,
+            )
+            torques = None
+
+        if torques is not None:
+            torques = np.asarray(torques, dtype=np.float64)
+            if torques.shape[0] != len(self.arm_actuator_ids):
+                logger.warning(
+                    "_LiberoOSCController.apply: torques shape %s != %d arm actuators; skipping arm ctrl write",
+                    torques.shape,
+                    len(self.arm_actuator_ids),
+                )
+            else:
+                for ai, tq in zip(self.arm_actuator_ids, torques, strict=True):
+                    data.ctrl[ai] = float(tq)
+
+        # Gripper passthrough: the 7th GR00T action channel is
+        # an open/close signal. Most LIBERO checkpoints output a
+        # scalar in [-1, +1]; positive = close, negative = open.
+        # Write it to all gripper actuators (RoboSuite's gripper
+        # config typically has 2 finger actuators tied via a
+        # tendon, so this works either way).
+        gripper_value = float(action_dict.get("gripper", 0.0))
+        # Some GR00T checkpoints output a 2-element list; coerce.
+        gripper_raw = action_dict.get("gripper")
+        if isinstance(gripper_raw, (list, tuple, np.ndarray)) and len(gripper_raw) > 0:
+            gripper_value = float(gripper_raw[0])
+        for gi in self.gripper_actuator_ids:
+            # Clip to actuator ctrlrange to avoid driving past limits.
+            lo = float(model.actuator_ctrlrange[gi, 0])
+            hi = float(model.actuator_ctrlrange[gi, 1])
+            data.ctrl[gi] = max(lo, min(hi, gripper_value))
 
 
 __all__ = [
