@@ -1050,6 +1050,283 @@ class TestRenameMjcfCameras:
         assert 'name="image"' in out
 
 
+# Scene <keyframe> application (#166 follow-up)
+
+
+class TestApplySceneKeyframe:
+    """``LiberoAdapter._apply_scene_keyframe_to_sim`` calls
+    ``mj_resetDataKeyframe`` after every ``load_scene`` so qpos starts at
+    the canonical home pose RoboSuite encoded in the MJCF ``<keyframe>``.
+    Without this, ``mj_makeData`` and ``mj_resetData`` initialise from
+    joint-default ``qpos0`` and free-joint objects (mugs, plates) snap
+    to the origin - the #166 root cause for ``success_rate=0.00``.
+    """
+
+    def _make_mock_mujoco(self, calls: list[tuple[str, int]] | None = None):
+        """Return a stub ``mujoco`` module that records mj_resetDataKeyframe calls."""
+        if calls is None:
+            calls = []
+
+        class _Module:
+            @staticmethod
+            def mj_resetDataKeyframe(model, data, key):  # noqa: ARG004
+                calls.append(("mj_resetDataKeyframe", int(key)))
+
+            @staticmethod
+            def mj_forward(model, data):  # noqa: ARG004
+                calls.append(("mj_forward", 0))
+
+        return _Module(), calls
+
+    def test_applies_keyframe_when_model_has_one(self, tmp_path):
+        """End-to-end: scene was loaded, model has nkey>0 ⇒ keyframe applied."""
+
+        class _FakeModel:
+            nkey = 1
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        # Pre-populate the cache so on_episode_start uses the cached path.
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            install_cameras=False,
+        )
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        assert bddl_path is not None
+        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
+
+        sim = FakeSim(data_config="panda")
+        sim._world._model = _FakeModel()  # type: ignore[attr-defined]
+        sim._world._data = object()  # type: ignore[attr-defined]
+
+        mock_mj, calls = self._make_mock_mujoco()
+        with patch.dict("sys.modules", {"mujoco": mock_mj}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # mj_resetDataKeyframe(model, data, 0) MUST have fired.
+        assert ("mj_resetDataKeyframe", 0) in calls
+        # And mj_forward must follow so derived state reflects the new qpos
+        # before the first observation / render.
+        assert ("mj_forward", 0) in calls
+
+    def test_no_keyframe_in_model_skips_application(self, tmp_path):
+        """Model with nkey==0 (e.g. a stub MJCF) must skip without warning."""
+
+        class _FakeModel:
+            nkey = 0
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            install_cameras=False,
+        )
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        assert bddl_path is not None
+        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
+
+        sim = FakeSim(data_config="panda")
+        sim._world._model = _FakeModel()  # type: ignore[attr-defined]
+        sim._world._data = object()  # type: ignore[attr-defined]
+
+        mock_mj, calls = self._make_mock_mujoco()
+        with patch.dict("sys.modules", {"mujoco": mock_mj}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # No keyframe in the model -> nothing to apply.
+        assert calls == []
+
+    def test_apply_scene_keyframe_false_disables(self, tmp_path):
+        """Opt-out: apply_scene_keyframe=False skips the call even when
+        the model declares a keyframe."""
+
+        class _FakeModel:
+            nkey = 1
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            install_cameras=False,
+            apply_scene_keyframe=False,
+        )
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        assert bddl_path is not None
+        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
+
+        sim = FakeSim(data_config="panda")
+        sim._world._model = _FakeModel()  # type: ignore[attr-defined]
+        sim._world._data = object()  # type: ignore[attr-defined]
+
+        mock_mj, calls = self._make_mock_mujoco()
+        with patch.dict("sys.modules", {"mujoco": mock_mj}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        assert calls == []
+
+    def test_skipped_when_no_scene_loaded(self):
+        """Bare-Panda fallback (no scene_path, auto_generate failed) must
+        not try to apply a keyframe - there's no scene to apply it to."""
+
+        class _FakeModel:
+            nkey = 1
+
+        sim = FakeSim(data_config="panda")
+        sim._world._model = _FakeModel()  # type: ignore[attr-defined]
+        sim._world._data = object()  # type: ignore[attr-defined]
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            install_cameras=False,
+            auto_generate_scene=False,  # no scene generation
+            apply_scene_keyframe=True,
+        )
+        # scene_path stays None -> load_scene never called -> no keyframe.
+
+        mock_mj, calls = self._make_mock_mujoco()
+        with patch.dict("sys.modules", {"mujoco": mock_mj}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        assert calls == []
+
+    def test_custom_keyframe_index(self, tmp_path):
+        """``scene_keyframe_index=1`` selects the second ``<keyframe>``."""
+
+        class _FakeModel:
+            nkey = 3
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            install_cameras=False,
+            scene_keyframe_index=2,
+        )
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        assert bddl_path is not None
+        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
+
+        sim = FakeSim(data_config="panda")
+        sim._world._model = _FakeModel()  # type: ignore[attr-defined]
+        sim._world._data = object()  # type: ignore[attr-defined]
+
+        mock_mj, calls = self._make_mock_mujoco()
+        with patch.dict("sys.modules", {"mujoco": mock_mj}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        assert ("mj_resetDataKeyframe", 2) in calls
+
+    def test_out_of_range_keyframe_index_skipped_with_warning(self, tmp_path, caplog):
+        """``scene_keyframe_index >= model.nkey`` is a config error - log
+        WARNING and skip, don't crash the episode."""
+
+        class _FakeModel:
+            nkey = 1
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            install_cameras=False,
+            scene_keyframe_index=5,  # out of range
+        )
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        assert bddl_path is not None
+        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
+
+        sim = FakeSim(data_config="panda")
+        sim._world._model = _FakeModel()  # type: ignore[attr-defined]
+        sim._world._data = object()  # type: ignore[attr-defined]
+
+        mock_mj, calls = self._make_mock_mujoco()
+        with caplog.at_level("WARNING"):
+            with patch.dict("sys.modules", {"mujoco": mock_mj}):
+                adapter.on_episode_start(sim, random.Random(0))
+
+        assert calls == []
+        assert any("out of range" in rec.message for rec in caplog.records if rec.levelname == "WARNING")
+
+    def test_keyframe_applied_after_install_cameras(self, tmp_path):
+        """Order matters: install_cameras may recompile (resetting qpos),
+        so the keyframe MUST be applied AFTER it."""
+
+        class _FakeModel:
+            nkey = 1
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            install_cameras=True,  # camera install runs
+        )
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        assert bddl_path is not None
+        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
+
+        sim = FakeSim(data_config="panda")
+        sim._world._model = _FakeModel()  # type: ignore[attr-defined]
+        sim._world._data = object()  # type: ignore[attr-defined]
+
+        ordering: list[str] = []
+
+        def track_add_camera(self_, name, **kw):  # noqa: ARG002
+            ordering.append(f"add_camera:{name}")
+            return {"status": "success", "content": [{"text": "ok"}]}
+
+        mock_mj, _ = self._make_mock_mujoco()
+        # Wrap mj_resetDataKeyframe to record into the same ordering list.
+        original = mock_mj.mj_resetDataKeyframe
+
+        def tracked_keyframe(model, data, key):
+            ordering.append(f"keyframe:{key}")
+            return original(model, data, key)
+
+        mock_mj.mj_resetDataKeyframe = tracked_keyframe
+
+        # Patch FakeSim.add_camera at the class level for this test.
+        with patch.object(FakeSim, "add_camera", track_add_camera, create=False):
+            with patch.dict("sys.modules", {"mujoco": mock_mj}):
+                adapter.on_episode_start(sim, random.Random(0))
+
+        # Find the indices of the first add_camera and the keyframe call.
+        camera_indices = [i for i, e in enumerate(ordering) if e.startswith("add_camera:")]
+        keyframe_indices = [i for i, e in enumerate(ordering) if e.startswith("keyframe:")]
+        assert camera_indices, "expected at least one add_camera call"
+        assert keyframe_indices, "expected the keyframe to be applied"
+        # Every keyframe call must follow every add_camera call.
+        assert min(keyframe_indices) > max(camera_indices)
+
+    def test_no_model_skips_silently(self):
+        """Backends without a compiled model attribute (future engines) skip
+        the keyframe application without raising."""
+
+        class _BareWorld:
+            cameras: dict[str, Any] = {}
+
+        class _BareSim:
+            _world = _BareWorld()  # no _model / _data
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        # Direct exercise of the helper - must not raise.
+        adapter._apply_scene_keyframe_to_sim(_BareSim())  # type: ignore[arg-type]
+
+
 # PolicyRunner + evaluate_benchmark integration
 
 
