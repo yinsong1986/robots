@@ -653,10 +653,43 @@ class LiberoAdapter(BenchmarkProtocol):
         because :meth:`_install_render_options` runs as part of
         ``on_episode_start``.
 
-        Concrete symptom in round-9 verification: t=0.00 frame mean
-        RGB ``(88, 88, 29)`` (round-7-style contamination), t=0.05+
-        frames mean RGB ``(79, 64, 57)`` (round-9 clean). The first
-        recorded frame consistently differs from the rest.
+        Round-13 verification (#168) revealed a second, more severe
+        race: the renderer returns a skybox-only gradient for any
+        ``render(camera=...)`` call when ``data.xpos`` / ``data.xmat``
+        haven't been populated yet. ``mujoco.MjData`` allocates these
+        arrays at construction (e.g. inside ``Simulation.load_scene``)
+        but doesn't compute them - they stay at zero / identity until
+        ``mj_forward(model, data)`` runs. Until then,
+        ``Renderer.update_scene`` finds the body transforms unset and
+        falls back to the skybox-only readback (the gradient artifact).
+
+        Concrete recorder timeline pre-fix:
+
+        ::
+
+            T0:  sim.load_scene(...)        # MjData allocated, NOT forwarded
+            T0+: spec.prewarm(sim)          # registers robot + cameras + viz_option
+            T1:  sim.start_cameras_recording  # recorder thread launches capture loop
+            T1+: evaluate_benchmark starts
+                 on_episode_start runs:
+                   - load_scene (fresh MjData)
+                   - _apply_canonical_state  # ← finally calls mj_forward here
+
+            Meanwhile the recorder thread:
+              capture iter 1: render(image)   # before main-thread mj_forward → gradient
+              capture iter 1: render(wrist)   # may land after mj_forward → real
+                                              #   (depending on race timing)
+
+        The first capture frame for whichever camera renders before
+        ``mj_forward`` returns gradient. Round 13's 2-pass warmup
+        loop in ``_loop`` didn't help because warmup-of-any-depth
+        on any thread can't conjure populated body transforms - only
+        ``mj_forward`` does that.
+
+        Round 14 fix: prewarm calls ``mj_forward`` itself. After
+        prewarm, ``data.xpos`` / ``data.xmat`` are populated and the
+        recorder's first render returns real geometry regardless of
+        thread or camera order.
 
         This method exposes the *idempotent subset* of
         :meth:`on_episode_start` setup that should run before recording
@@ -669,6 +702,9 @@ class LiberoAdapter(BenchmarkProtocol):
         * :meth:`_install_render_options` - overwrites
           ``world._backend_state["viz_option"]`` with a freshly-built
           ``MjvOption``; semantically equivalent on every call.
+        * ``mujoco.mj_forward(model, data)`` - populates derived
+          state from ``qpos`` / ``qvel``. Safe to call multiple times;
+          re-runs the same forward dynamics computation each call.
 
         Calling :meth:`prewarm` does NOT replace
         :meth:`on_episode_start` - the latter still runs the full
@@ -680,7 +716,7 @@ class LiberoAdapter(BenchmarkProtocol):
 
             sim.load_scene(spec.scene_path)
             sim.add_robot("robot", data_config="panda")
-            spec.prewarm(sim)                  # NEW: install viz_option early
+            spec.prewarm(sim)                  # install viz_option + mj_forward early
             sim.start_cameras_recording(...)   # recorder's first frame is now clean
             result = sim.evaluate_benchmark(...)
 
@@ -718,6 +754,52 @@ class LiberoAdapter(BenchmarkProtocol):
             self._install_render_options(sim)
         except Exception as e:  # noqa: BLE001
             logger.warning("LiberoAdapter.prewarm: _install_render_options raised: %s", e)
+
+        # Forward the MjData so xpos/xmat are populated before the
+        # recorder thread's first render call (#168 round-14 bug D
+        # fix). Without this, every render between prewarm() and
+        # on_episode_start's _apply_canonical_state returns the
+        # skybox-only gradient because Renderer.update_scene finds
+        # body transforms unset.
+        try:
+            self._forward_mj_data(sim)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("LiberoAdapter.prewarm: mj_forward failed: %s", e)
+
+    def _forward_mj_data(self, sim: SimEngine) -> None:
+        """Run ``mujoco.mj_forward(model, data)`` if the sim has both available.
+
+        Best-effort: missing mujoco / world / model / data → debug-log
+        + skip without raising. The only failure mode that can't
+        degrade silently is mj_forward itself raising on inconsistent
+        state, which is genuinely a sim-level bug worth surfacing -
+        let it propagate to prewarm's catch-all.
+        """
+        try:
+            import mujoco as _mj
+        except ImportError:
+            logger.debug("LiberoAdapter._forward_mj_data: mujoco not importable; skipping")
+            return
+
+        world = getattr(sim, "_world", None)
+        if world is None:
+            logger.debug("LiberoAdapter._forward_mj_data: sim has no _world; skipping")
+            return
+        model = getattr(world, "_model", None)
+        data = getattr(world, "_data", None)
+        if model is None or data is None:
+            logger.debug("LiberoAdapter._forward_mj_data: world missing model/data; skipping")
+            return
+
+        # mj_forward populates xpos/xquat/xmat plus other derived state.
+        # The lock matches the contract of other state-mutating helpers
+        # in this adapter (e.g. _apply_init_state_branch).
+        lock = getattr(sim, "_lock", None)
+        if lock is not None:
+            with lock:
+                _mj.mj_forward(model, data)
+        else:
+            _mj.mj_forward(model, data)
 
     def on_step(
         self,

@@ -762,54 +762,6 @@ class RenderingMixin:
         def _loop():
             from strands_robots.simulation.policy_runner import _extract_frame_ndarray
 
-            # Warm up the GL context ON THIS THREAD before the timing
-            # loop starts capturing into buffers. MuJoCo's
-            # ``mujoco.GLContext.make_current()`` binds to the calling
-            # thread, so any warmup ``render()`` performed in the main
-            # thread (i.e. before ``state["thread"].start()``) doesn't
-            # propagate here - the daemon thread has its own cold-start
-            # GL context on its first call. Round 11 attempted a
-            # main-thread warmup and round-11 verification confirmed
-            # that the t=0 frame still rendered as a skybox-only
-            # gradient (col-std 0.62, mean RGB ``(138, 150, 177)``)
-            # because of this thread boundary.
-            #
-            # Round 12 moved the warmup to this thread, but warming
-            # each camera ONCE wasn't enough: the shared ``Renderer``
-            # rebinds the active camera per ``update_scene(camera=X)``
-            # call, and the FIRST call after a camera switch returns
-            # a cold-start readback even after the GL context is
-            # primed. Round-12 verification:
-            #   warmup #1 image -> cold (discard)
-            #   warmup #2 wrist -> cold-after-switch (discard)
-            #   capture image -> cold-after-switch ✗ (saved as frame 0)
-            #   capture wrist -> warm ✓
-            # The first camera's first capture frame was still a
-            # gradient because the warmup ended on the LAST camera
-            # and switching back to image cold-started it again.
-            #
-            # Round 13 fix: loop the warmup TWICE so every camera
-            # has had two consecutive renders by the time the timing
-            # loop starts. After two passes each camera's
-            # most-recent-state is "warmed" and the first capture
-            # render hits the warm path regardless of camera order.
-            #
-            # Cost: ~33 ms x n_cameras x 2 at thread startup. For the
-            # 2-camera LIBERO eval that's ~132 ms, invisible vs the
-            # 250+ s eval wall-time.
-            #
-            # Errors during warmup are swallowed at DEBUG. Persistent
-            # render failures will resurface as
-            # ``state["errors"][cam]`` accumulating in the timing
-            # loop below (visible via
-            # :meth:`get_cameras_recording_status`).
-            for _ in range(2):
-                for cam in names:
-                    try:
-                        self.render(camera_name=cam, width=width, height=height)
-                    except Exception as e:  # noqa: BLE001 - warmup failures non-fatal
-                        logger.debug("recorder thread warmup render failed for %s: %s", cam, e)
-
             interval = 1.0 / fps
             while state["running"]:
                 t0 = _time.time()

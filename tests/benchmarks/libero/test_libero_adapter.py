@@ -1508,6 +1508,166 @@ class TestPrewarm:
         # viz_option still installed - independent of camera install.
         assert "viz_option" in sim._world._backend_state
 
+    def test_prewarm_calls_mj_forward(self):
+        """Round-14 fix: ``prewarm`` calls ``mujoco.mj_forward(model, data)``
+        so ``data.xpos / data.xmat`` are populated before the recorder
+        thread's first render. Without this, every render between
+        ``prewarm()`` and ``on_episode_start``'s ``_apply_canonical_state``
+        returns the skybox-only gradient because
+        ``Renderer.update_scene`` finds body transforms unset.
+
+        Pin for #168 round-14 verification: the bug-D gradient at t=0
+        is NOT a renderer-warmup issue but a mj_forward race. Round 13
+        added a 2-pass warmup loop in ``_loop`` to chase the symptom;
+        round 14 reverts that and addresses the root cause here.
+        """
+        pytest.importorskip("mujoco")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        # FakeSim's _world doesn't expose model/data; populate stubs so
+        # _forward_mj_data has something to call mj_forward on.
+
+        class _FakeModel:
+            pass
+
+        class _FakeData:
+            pass
+
+        sim._world._model = _FakeModel()  # type: ignore[attr-defined]
+        sim._world._data = _FakeData()  # type: ignore[attr-defined]
+
+        # Capture mj_forward calls.
+        mj_forward_calls: list[tuple] = []
+
+        class _StubMj:
+            class mjtVisFlag:
+                mjVIS_JOINT = 0
+                mjVIS_ACTUATOR = 0
+                mjVIS_COM = 0
+
+            class MjvOption:
+                def __init__(self):
+                    # MjvOption with the indexable members the install code touches.
+                    self.geomgroup = [1] * 6
+                    self.sitegroup = [1] * 6
+                    self.flags = [0] * 64
+
+            @staticmethod
+            def mjv_defaultOption(opt):
+                pass
+
+            @staticmethod
+            def mj_forward(model, data):
+                mj_forward_calls.append((model, data))
+
+        with patch.dict("sys.modules", {"mujoco": _StubMj}):
+            adapter.prewarm(sim)
+
+        assert len(mj_forward_calls) == 1, (
+            f"expected exactly one mj_forward call from prewarm, got {len(mj_forward_calls)}"
+        )
+        assert mj_forward_calls[0][0] is sim._world._model
+        assert mj_forward_calls[0][1] is sim._world._data
+
+    def test_prewarm_mj_forward_failure_does_not_abort(self):
+        """If ``mj_forward`` raises during prewarm, log a WARNING but
+        proceed - prewarm must not crash the whole eval pipeline. The
+        next ``on_episode_start`` will retry via
+        ``_apply_canonical_state`` -> ``mj_forward``, so a transient
+        prewarm failure leaves the system recoverable.
+        """
+        pytest.importorskip("mujoco")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+
+        class _FakeModel:
+            pass
+
+        class _FakeData:
+            pass
+
+        sim._world._model = _FakeModel()  # type: ignore[attr-defined]
+        sim._world._data = _FakeData()  # type: ignore[attr-defined]
+
+        class _BoomMj:
+            class mjtVisFlag:
+                mjVIS_JOINT = 0
+                mjVIS_ACTUATOR = 0
+                mjVIS_COM = 0
+
+            class MjvOption:
+                def __init__(self):
+                    self.geomgroup = [1] * 6
+                    self.sitegroup = [1] * 6
+                    self.flags = [0] * 64
+
+            @staticmethod
+            def mjv_defaultOption(opt):
+                pass
+
+            @staticmethod
+            def mj_forward(model, data):
+                raise RuntimeError("simulated mj_forward failure")
+
+        with patch.dict("sys.modules", {"mujoco": _BoomMj}):
+            # Must NOT raise - prewarm catches mj_forward failures.
+            adapter.prewarm(sim)
+
+        # viz_option still installed (mj_forward failure didn't propagate).
+        assert "viz_option" in sim._world._backend_state
+
+    def test_prewarm_no_model_skips_mj_forward(self):
+        """When ``world._model`` or ``world._data`` is None (e.g. test
+        stub or non-MuJoCo backend), ``_forward_mj_data`` skips
+        silently - mj_forward isn't called, no exception."""
+        pytest.importorskip("mujoco")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        # No model or data on the world.
+
+        mj_forward_calls: list = []
+
+        class _StubMj:
+            class mjtVisFlag:
+                mjVIS_JOINT = 0
+                mjVIS_ACTUATOR = 0
+                mjVIS_COM = 0
+
+            class MjvOption:
+                def __init__(self):
+                    self.geomgroup = [1] * 6
+                    self.sitegroup = [1] * 6
+                    self.flags = [0] * 64
+
+            @staticmethod
+            def mjv_defaultOption(opt):
+                pass
+
+            @staticmethod
+            def mj_forward(model, data):
+                mj_forward_calls.append((model, data))
+
+        with patch.dict("sys.modules", {"mujoco": _StubMj}):
+            adapter.prewarm(sim)
+
+        # mj_forward was NOT called because world.model/data is missing.
+        assert mj_forward_calls == []
+
 
 # Scene <keyframe> application (#166 follow-up)
 
