@@ -575,6 +575,133 @@ class TestLiberoCameraInstall:
         adapter.on_episode_start(sim, random.Random(0))
 
 
+class TestPublishCameraDimsToWorld:
+    """Round 40 (#168): when ``_install_libero_cameras`` skips the
+    ``add_camera`` call (because the camera is already in the
+    compiled model from ``scene_camera_aliases`` rename), it still
+    publishes a config-only :class:`SimCamera` entry into
+    ``world.cameras`` so :meth:`_get_sim_observation` reads the
+    configured render dimensions instead of falling through to the
+    480×640 ``default_height``/``default_width``.
+
+    Pre-round-40 the eval pipeline was rendering ``image`` and
+    ``wrist_image`` at 480×640 (different aspect AND resolution from
+    GR00T-N1.7-LIBERO's training distribution of 256×256), feeding
+    the policy out-of-distribution images.
+    """
+
+    def test_publishes_simcamera_with_configured_dims(self):
+        """Round 40 (#168): the published entry must be a
+        :class:`SimCamera` instance with ``height``/``width`` from
+        ``cam_kwargs`` (256×256 for the LIBERO defaults).
+
+        Pin the SHAPE (SimCamera, not dict) so ``_get_sim_observation``'s
+        ``cam_info.height`` attribute access works."""
+        from strands_robots.simulation.models import SimCamera
+
+        sim = FakeSim(data_config="panda")
+        # world.cameras starts empty — model-side rename hasn't put
+        # anything in the registry yet.
+        assert "image" not in sim._world.cameras
+
+        LiberoAdapter._publish_camera_dims_to_world(
+            sim,
+            "image",
+            {"width": 256, "height": 256, "fov": 60.0},
+        )
+
+        cam = sim._world.cameras["image"]
+        assert isinstance(cam, SimCamera)
+        assert cam.name == "image"
+        assert cam.height == 256
+        assert cam.width == 256
+
+    def test_idempotent_does_not_overwrite_existing_entry(self):
+        """Round 40 (#168): when ``world.cameras[cam_name]`` is already
+        populated (e.g. from a prior episode's publish call, or from
+        the user's explicit ``add_camera``), the publish must NOT
+        overwrite it — preserves user-configured pose / FOV /
+        custom-dim overrides across episodes."""
+        from strands_robots.simulation.models import SimCamera
+
+        sim = FakeSim(data_config="panda")
+        # Pre-populate with a custom 128×128 entry (e.g. user override).
+        sim._world.cameras["image"] = SimCamera(name="image", width=128, height=128)
+
+        LiberoAdapter._publish_camera_dims_to_world(
+            sim,
+            "image",
+            {"width": 256, "height": 256, "fov": 60.0},
+        )
+
+        # The pre-existing 128×128 entry must still be there.
+        cam = sim._world.cameras["image"]
+        assert cam.width == 128
+        assert cam.height == 128
+
+    def test_silent_when_world_missing(self):
+        """Round 40 (#168): backends without ``_world`` (future engines)
+        get a silent no-op rather than a crash. Best-effort contract."""
+
+        class WorldlessSim:
+            pass
+
+        # Must not raise.
+        LiberoAdapter._publish_camera_dims_to_world(
+            WorldlessSim(), "image", {"width": 256, "height": 256}
+        )
+
+    def test_silent_when_cameras_attr_not_dict(self):
+        """Round 40 (#168): backends with ``world.cameras`` of an
+        unexpected type (None / list / other) get a silent no-op.
+
+        Pin so the method's defensive `isinstance(_, dict)` check
+        stays in place."""
+
+        class WeirdCameras:
+            cameras = None
+
+        class WeirdSim:
+            _world = WeirdCameras()
+
+        # Must not raise.
+        LiberoAdapter._publish_camera_dims_to_world(
+            WeirdSim(), "image", {"width": 256, "height": 256}
+        )
+
+    def test_install_libero_cameras_publishes_when_already_in_sim(self):
+        """Round 40 (#168): end-to-end through ``_install_libero_cameras``.
+
+        Pre-populate ``world.cameras["image"]`` AS A NON-SIMCAMERA
+        VALUE (mimicking the FakeSim's ``add_camera`` adding a raw
+        dict — though real LIBERO would have a model-side rename
+        producing nothing in the registry initially). The publish
+        path then fires from the skip branch and replaces nothing
+        (idempotent), but for ``wrist_image`` (not pre-populated),
+        we go through the regular ``add_camera`` happy path.
+
+        This test covers both the skip + publish path AND the regular
+        ``add_camera`` path in one ``_install_libero_cameras`` call,
+        verifying neither path errors on this realistic-mixed case.
+        """
+        sim = FakeSim(data_config="panda")
+        # Mimic the LIBERO scene-rename situation: 'image' came in
+        # via scene MJCF (so add_camera should NOT be re-called for
+        # it), 'wrist_image' is fresh (add_camera should fire).
+        sim._world.cameras["image"] = {"already": "there"}
+
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, init_jitter=0.0)
+        adapter.on_episode_start(sim, random.Random(0))
+
+        # 'image' already there — must NOT have been re-added.
+        added_names = {name for name, _ in sim._add_camera_calls}
+        assert "image" not in added_names
+        # The pre-existing 'image' entry stays untouched (idempotent).
+        assert sim._world.cameras["image"] == {"already": "there"}
+        # 'wrist_image' got added regularly.
+        assert "wrist_image" in added_names
+
+
 # Step semantics
 
 

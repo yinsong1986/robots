@@ -50,7 +50,7 @@ from strands_robots.benchmarks.libero.bddl_parser import (
     parse_bddl_file,
 )
 from strands_robots.simulation.benchmark import BenchmarkProtocol, StepInfo
-from strands_robots.simulation.models import SimRobot
+from strands_robots.simulation.models import SimCamera, SimRobot
 from strands_robots.utils import get_base_dir, require_optional
 
 if TYPE_CHECKING:
@@ -2305,6 +2305,24 @@ class LiberoAdapter(BenchmarkProtocol):
         for cam_name, cam_kwargs in self._cameras.items():
             if cam_name in existing:
                 logger.debug("LiberoAdapter: camera %r already in sim; skipping install", cam_name)
+                # Round 40 (#168): even when we skip add_camera (because
+                # the model-compiled camera is already there from
+                # ``scene_camera_aliases`` rename), we still need to
+                # publish the configured render dimensions to
+                # ``world.cameras`` so :meth:`_get_sim_observation` reads
+                # them via its ``cam_info.height/width`` lookup. Without
+                # this step, model-side cameras fall through to the
+                # 480×640 ``default_height``/``default_width`` of the
+                # renderer mixin — which is a different aspect ratio AND
+                # resolution from training (256×256), feeding GR00T
+                # out-of-distribution images even after the round-39
+                # vertical-flip fix. Diagnostic
+                # ``/tmp/opencode/eval-runs/diff_libero_obs.py`` showed
+                # ``sim.get_observation()`` returned 480×640 while
+                # ``sim.render(camera="image", width=256, height=256)``
+                # correctly returned 256×256 — the divergence was
+                # entirely in the get_observation path.
+                self._publish_camera_dims_to_world(sim, cam_name, cam_kwargs)
                 continue
             try:
                 result = add_camera(name=cam_name, **cam_kwargs)
@@ -2316,8 +2334,63 @@ class LiberoAdapter(BenchmarkProtocol):
                 # "already exists" is benign - the scene XML beat us to it.
                 if "already exists" in msg.lower():
                     logger.debug("LiberoAdapter: camera %r already declared by scene", cam_name)
+                    # Same publish step as the skip branch above —
+                    # ``add_camera`` early-returned with "already exists"
+                    # because the scene's MJCF declared the camera, so
+                    # ``world.cameras[cam_name]`` is still empty. Inject
+                    # a config-only SimCamera entry for dimension lookup.
+                    self._publish_camera_dims_to_world(sim, cam_name, cam_kwargs)
                 else:
                     logger.warning("LiberoAdapter: add_camera(%r) failed: %s", cam_name, msg)
+
+    @staticmethod
+    def _publish_camera_dims_to_world(sim: SimEngine, cam_name: str, cam_kwargs: dict[str, Any]) -> None:
+        """Inject a config-only :class:`SimCamera` entry into ``world.cameras``.
+
+        Used by :meth:`_install_libero_cameras` for cameras that already
+        exist in the compiled MuJoCo model (typically renamed via
+        :attr:`scene_camera_aliases`) so :meth:`_get_sim_observation`'s
+        ``cam_info.height``/``cam_info.width`` lookup picks up the
+        configured render dimensions instead of falling through to
+        ``default_height``/``default_width`` (480×640).
+
+        Idempotent: skips silently if ``world.cameras[cam_name]`` is
+        already populated (from a prior call or an explicit
+        ``add_camera`` from the user). Best-effort: skips silently if
+        the sim has no ``_world`` or no ``cameras`` registry.
+
+        Note: ``camera_id`` is left at the default ``-1`` because we
+        don't know (and don't need) the model-side camera index here —
+        :meth:`_get_sim_observation` looks it up via ``mj_name2id``.
+        Only the ``height`` / ``width`` fields matter for this code
+        path; the pose / FOV fields are not used (the model-compiled
+        camera's pose / FOV from the MJCF wins, which is what we want).
+
+        Round 40 (#168).
+        """
+        world = getattr(sim, "_world", None)
+        if world is None:
+            return
+        cameras_attr = getattr(world, "cameras", None)
+        if not isinstance(cameras_attr, dict):
+            return
+        if cam_name in cameras_attr:
+            # Already published (e.g. an earlier episode + scene-recompile
+            # cycle). Don't overwrite the user's possibly-tweaked entry.
+            return
+        height = int(cam_kwargs.get("height", 256))
+        width = int(cam_kwargs.get("width", 256))
+        cameras_attr[cam_name] = SimCamera(
+            name=cam_name,
+            width=width,
+            height=height,
+        )
+        logger.debug(
+            "LiberoAdapter: published render dims for model-side camera %r (%dx%d) to world.cameras",
+            cam_name,
+            width,
+            height,
+        )
 
     @staticmethod
     def _existing_camera_names(sim: SimEngine) -> set[str]:
