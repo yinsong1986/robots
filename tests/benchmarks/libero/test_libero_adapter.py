@@ -441,6 +441,94 @@ class TestLiberoCameraInstall:
         installed_names = {name for name, _ in sim._add_camera_calls}
         assert installed_names == {"wrist_image"}
 
+    def test_model_side_cameras_skip_install_no_recompile(self):
+        """Critical for #166: ``Simulation.load_scene`` creates a fresh
+        ``SimWorld`` whose registry is empty even when the loaded MJCF
+        declares cameras. ``_install_libero_cameras`` MUST detect the
+        scene-supplied cameras via the compiled model (not just the
+        registry) so it doesn't trigger a spec recompile that resets
+        qpos and undoes ``_apply_canonical_state``."""
+
+        class _FakeMjEnum:
+            mjOBJ_CAMERA = 7
+
+        class _FakeMjModule:
+            mjtObj = _FakeMjEnum()
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                return ["image", "wrist_image"][idx]
+
+        class _FakeMjModel:
+            ncam = 2
+
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, init_jitter=0.0)
+        sim = FakeSim(data_config="panda")
+        # Registry is empty (mimics post-load_scene state) but the
+        # compiled model declares both LIBERO cameras.
+        sim._world.cameras.clear()
+        sim._world._model = _FakeMjModel()  # type: ignore[attr-defined]
+
+        with patch.dict("sys.modules", {"mujoco": _FakeMjModule()}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # No add_camera calls - both names detected as already-present
+        # in the compiled model.
+        assert sim._add_camera_calls == []
+
+    def test_partial_model_side_cameras_fills_missing(self):
+        """If the scene declares ONLY ``image`` (not ``wrist_image``) in
+        the compiled model, we install just the missing one."""
+
+        class _FakeMjEnum:
+            mjOBJ_CAMERA = 7
+
+        class _FakeMjModule:
+            mjtObj = _FakeMjEnum()
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                return ["image"][idx]
+
+        class _FakeMjModel:
+            ncam = 1
+
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, init_jitter=0.0)
+        sim = FakeSim(data_config="panda")
+        sim._world.cameras.clear()
+        sim._world._model = _FakeMjModel()  # type: ignore[attr-defined]
+
+        with patch.dict("sys.modules", {"mujoco": _FakeMjModule()}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        installed_names = {name for name, _ in sim._add_camera_calls}
+        assert installed_names == {"wrist_image"}
+
+    def test_existing_camera_names_unions_registry_and_model(self):
+        """Direct exercise of ``_existing_camera_names`` - union of
+        registry and model camera names."""
+
+        class _FakeMjEnum:
+            mjOBJ_CAMERA = 7
+
+        class _FakeMjModule:
+            mjtObj = _FakeMjEnum()
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                return "agentview"
+
+        class _FakeMjModel:
+            ncam = 1
+
+        sim = FakeSim(data_config="panda", preexisting_cameras=["topdown"])
+        sim._world._model = _FakeMjModel()  # type: ignore[attr-defined]
+
+        with patch.dict("sys.modules", {"mujoco": _FakeMjModule()}):
+            names = LiberoAdapter._existing_camera_names(sim)
+
+        assert names == {"topdown", "agentview"}
+
     def test_camera_install_failures_are_logged_not_fatal(self, caplog):
         """A backend that refuses every add_camera shouldn't kill the eval.
 
@@ -1261,9 +1349,13 @@ class TestApplySceneKeyframe:
         assert calls == []
         assert any("out of range" in rec.message for rec in caplog.records if rec.levelname == "WARNING")
 
-    def test_keyframe_applied_after_install_cameras(self, tmp_path):
-        """Order matters: install_cameras may recompile (resetting qpos),
-        so the keyframe MUST be applied AFTER it."""
+    def test_canonical_state_applied_before_install_cameras(self, tmp_path):
+        """Order matters (#166 review finding): the canonical-state apply
+        must run RIGHT AFTER load_scene, BEFORE super() / install_cameras
+        get a chance to recompile and shift qpos away from canonical.
+        Otherwise the snapshot is taken post-recompile - already non-
+        canonical - and replays a non-canonical state on every reset.
+        """
 
         class _FakeModel:
             nkey = 1
@@ -1291,7 +1383,6 @@ class TestApplySceneKeyframe:
             return {"status": "success", "content": [{"text": "ok"}]}
 
         mock_mj, _ = self._make_mock_mujoco()
-        # Wrap mj_resetDataKeyframe to record into the same ordering list.
         original = mock_mj.mj_resetDataKeyframe
 
         def tracked_keyframe(model, data, key):
@@ -1300,18 +1391,19 @@ class TestApplySceneKeyframe:
 
         mock_mj.mj_resetDataKeyframe = tracked_keyframe
 
-        # Patch FakeSim.add_camera at the class level for this test.
         with patch.object(FakeSim, "add_camera", track_add_camera, create=False):
             with patch.dict("sys.modules", {"mujoco": mock_mj}):
                 adapter.on_episode_start(sim, random.Random(0))
 
-        # Find the indices of the first add_camera and the keyframe call.
         camera_indices = [i for i, e in enumerate(ordering) if e.startswith("add_camera:")]
         keyframe_indices = [i for i, e in enumerate(ordering) if e.startswith("keyframe:")]
-        assert camera_indices, "expected at least one add_camera call"
         assert keyframe_indices, "expected the keyframe to be applied"
-        # Every keyframe call must follow every add_camera call.
-        assert min(keyframe_indices) > max(camera_indices)
+        # The keyframe call MUST precede every add_camera call - the
+        # canonical state needs to land before any recompile-prone step.
+        if camera_indices:
+            assert max(keyframe_indices) < min(camera_indices), (
+                f"canonical-state apply at {keyframe_indices} should precede all camera installs at {camera_indices}"
+            )
 
     def test_no_model_skips_silently(self):
         """Backends without a compiled model attribute (future engines) skip

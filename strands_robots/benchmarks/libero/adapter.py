@@ -404,8 +404,8 @@ class LiberoAdapter(BenchmarkProtocol):
         return self.problem.language or ""
 
     def on_episode_start(self, sim: SimEngine, rng: random.Random) -> None:
-        """Auto-generate scene (if needed), load it, validate Panda, install cameras,
-        then apply MJCF keyframe + jitter.
+        """Auto-generate scene (if needed), load it, capture-or-restore
+        canonical state, validate Panda, install cameras, then apply jitter.
 
         Order matters:
 
@@ -417,29 +417,34 @@ class LiberoAdapter(BenchmarkProtocol):
         2. ``load_scene`` (if a path is now set) - so the base
            compatibility check sees the scene's Panda rather than reporting
            "sim is empty → load default_robot".
-        3. ``super().on_episode_start`` - base compat check + auto-load
-           ``default_robot`` if the sim is empty.
-        4. ``_install_libero_cameras`` - inject the cameras the
-           ``libero_panda`` ``Gr00tDataConfig`` expects (``image`` /
-           ``wrist_image``). The auto-generator renames LIBERO's canonical
-           cameras (``agentview`` → ``image``, ``robot0_eye_in_hand_image``
-           → ``wrist_image``) so the install step naturally no-ops on
-           generated scenes - the static-pose fallbacks only fire when the
-           scene didn't supply LIBERO-named cameras.
-        5. **Keyframe application.** ``mj_makeData`` (in
+        3. **Canonical-state apply.** ``mj_makeData`` (in
            :meth:`Simulation.load_scene`) and ``mj_resetData`` (in
            :meth:`Simulation.reset`) both initialise qpos from the
            joint-default ``qpos0`` and **silently ignore MJCF
            ``<keyframe>`` blocks**. RoboSuite-emitted LIBERO scenes encode
-           their canonical home pose in a ``<keyframe>``; without an
-           explicit ``mj_resetDataKeyframe`` call free-joint objects
-           (mugs, plates) snap to ``(0, 0, 0, 1, 0, 0, 0)`` on every
-           reset, which is the #166 root cause for ``success_rate=0.00``.
-           Applied AFTER the camera install so any recompile-induced qpos
-           reset (``add_camera`` / ``add_robot`` recompile the spec) gets
-           re-applied. No-op when the model has no ``<keyframe>``.
+           the canonical home pose in a ``<keyframe>`` (rare); the
+           procedurally-generated MJCFs from #165 don't ship one
+           (``model.nkey == 0``), so :meth:`_apply_canonical_state` falls
+           back to snapshot-and-restore - capture qpos/qvel on the first
+           episode, replay on subsequent ones. **Applied IMMEDIATELY after
+           ``load_scene``** (before super / install_cameras) so the
+           snapshot captures the post-load canonical state without any
+           recompile-induced qpos drift; super() and install_cameras
+           below then operate on top of canonical state.
+        4. ``super().on_episode_start`` - base compat check + auto-load
+           ``default_robot`` if the sim is empty. (Note: this *can*
+           recompile the spec via ``add_robot``; MuJoCo's ``spec.recompile``
+           preserves qpos for existing joints, so the canonical state we
+           just restored survives.)
+        5. ``_install_libero_cameras`` - inject the cameras the
+           ``libero_panda`` ``Gr00tDataConfig`` expects (``image`` /
+           ``wrist_image``). Detects scene-supplied cameras via the
+           compiled model so the static-pose fallbacks only fire when the
+           scene genuinely didn't provide them - this matters for not
+           recompiling the spec on top of our just-restored canonical
+           state (#166 review finding).
         6. ``_apply_init_jitter`` - per-episode RNG-seeded ±jitter to
-           init-subject bodies. Layered on top of the canonical keyframe.
+           init-subject bodies, layered on top of canonical state.
         """
         if self.scene_path is None and self._auto_generate_scene:
             try:
@@ -469,11 +474,16 @@ class LiberoAdapter(BenchmarkProtocol):
                     msg = (result.get("content") or [{}])[0].get("text", "")
                     raise RuntimeError(f"LiberoAdapter: load_scene({self.scene_path!r}) failed: {msg}")
                 scene_was_loaded = True
+        # Apply canonical state RIGHT AFTER load_scene so the snapshot
+        # captures the post-load state - before super() / install_cameras
+        # have a chance to recompile and shift qpos away from canonical
+        # (#166 review finding: snapshot taken post-recompile is itself
+        # non-canonical, which is why the original placement was inert).
+        if scene_was_loaded and self._apply_canonical_state_enabled:
+            self._apply_canonical_state(sim)
         super().on_episode_start(sim, rng)
         if self._install_cameras:
             self._install_libero_cameras(sim)
-        if scene_was_loaded and self._apply_canonical_state_enabled:
-            self._apply_canonical_state(sim)
         if self._init_jitter > 0:
             self._apply_init_jitter(sim, rng)
 
@@ -720,24 +730,32 @@ class LiberoAdapter(BenchmarkProtocol):
         in the sim, every direct-client call to a LIBERO server fails with
         ``Video key 'video.image' must be in observation`` (#148, Failure 1).
 
-        Cameras already present in the sim (declared by a loaded scene MJCF
-        that beats us to the name) are skipped silently. Other failures are
-        logged at WARNING but never fatal - one missing camera shouldn't
-        kill the whole eval.
+        Cameras already present in the sim are skipped silently. "Already
+        present" means *either*:
+
+        * the runtime camera registry on ``sim._world.cameras`` (added via
+          a previous ``sim.add_camera`` call, including by this adapter on
+          a prior episode), OR
+        * the *compiled MuJoCo model* (declared via ``<camera>`` elements
+          in a scene MJCF that ``sim.load_scene`` just loaded).
+
+        The model-side check is critical for #166 because
+        :meth:`Simulation.load_scene` creates a fresh ``SimWorld`` whose
+        ``cameras`` registry starts empty even when the loaded MJCF
+        declares cameras. Without the model-side check the install would
+        re-add the same cameras on top of the scene's ones, triggering a
+        spec recompile that resets qpos away from the canonical state we
+        just restored in :meth:`_apply_canonical_state`.
+
+        Other ``add_camera`` failures are logged at WARNING but never
+        fatal - one missing camera shouldn't kill the whole eval.
         """
         add_camera = getattr(sim, "add_camera", None)
         if add_camera is None:
             logger.debug("LiberoAdapter: sim has no add_camera(); skipping camera install")
             return
 
-        # Cheap check for already-installed cameras: most backends expose a
-        # ``_world.cameras`` dict. If we can't see it, just try add_camera
-        # and let it return its own "already exists" error.
-        existing: set[str] = set()
-        world = getattr(sim, "_world", None)
-        cameras_attr = getattr(world, "cameras", None) if world is not None else None
-        if isinstance(cameras_attr, dict):
-            existing = set(cameras_attr.keys())
+        existing = self._existing_camera_names(sim)
 
         for cam_name, cam_kwargs in self._cameras.items():
             if cam_name in existing:
@@ -755,6 +773,50 @@ class LiberoAdapter(BenchmarkProtocol):
                     logger.debug("LiberoAdapter: camera %r already declared by scene", cam_name)
                 else:
                     logger.warning("LiberoAdapter: add_camera(%r) failed: %s", cam_name, msg)
+
+    @staticmethod
+    def _existing_camera_names(sim: SimEngine) -> set[str]:
+        """Union of registry-side and model-side camera names known to ``sim``.
+
+        Backends without a MuJoCo-compiled model (or with mujoco not
+        importable) fall back to the registry-only check - that's the
+        pre-#166-review behaviour, retained as a defensive fallback for
+        non-MuJoCo engines that still want LIBERO eval.
+
+        Critical for #166: :meth:`Simulation.load_scene` creates a fresh
+        ``SimWorld`` whose ``cameras`` dict starts empty even when the
+        loaded MJCF declares ``<camera>`` elements. Without enumerating
+        the compiled model's cameras here, ``_install_libero_cameras``
+        would unconditionally try to inject ``image`` / ``wrist_image``
+        on top of scene-declared ones, triggering a spec recompile that
+        in turn resets qpos and undoes :meth:`_apply_canonical_state`.
+        """
+        names: set[str] = set()
+        world = getattr(sim, "_world", None)
+
+        # Registry-side: cameras added via sim.add_camera() previously.
+        cameras_attr = getattr(world, "cameras", None) if world is not None else None
+        if isinstance(cameras_attr, dict):
+            names.update(cameras_attr.keys())
+
+        # Model-side: cameras declared in a loaded scene MJCF.
+        model = getattr(world, "_model", None) if world is not None else None
+        if model is None:
+            return names
+        try:
+            import mujoco as _mj
+        except ImportError:
+            logger.debug("LiberoAdapter: mujoco not importable; skipping model-side camera check")
+            return names
+        try:
+            ncam = int(getattr(model, "ncam", 0))
+            for i in range(ncam):
+                name = _mj.mj_id2name(model, _mj.mjtObj.mjOBJ_CAMERA, i)
+                if name:
+                    names.add(name)
+        except Exception as e:  # noqa: BLE001 - never fatal during camera-existence check
+            logger.debug("LiberoAdapter: model-side camera enumeration failed: %s", e)
+        return names
 
     def _apply_canonical_state(self, sim: SimEngine) -> None:
         """Restore qpos / qvel to the scene's canonical home state.
