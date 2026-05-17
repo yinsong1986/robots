@@ -17,7 +17,6 @@ Covers:
 
 from __future__ import annotations
 
-import hashlib
 import random
 from pathlib import Path
 from typing import Any
@@ -902,7 +901,7 @@ class TestSceneGeneration:
         # Pre-populate the cache file at the SHA the adapter computes.
         bddl_path = adapter._resolve_bddl_path_for_libero()
         assert bddl_path is not None
-        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
         cache_path = cache_dir / f"{sha}.xml"
         cache_path.write_text("<mujoco/>")
 
@@ -998,9 +997,14 @@ class TestSceneGeneration:
         assert 'name="agentview"' in text
         assert 'name="image"' not in text
 
-    def test_cache_key_is_sha256_of_bddl(self, tmp_path):
-        """Two adapters built from the SAME BDDL share a cached XML.
-        Two adapters with DIFFERENT BDDL get distinct cache files."""
+    def test_cache_key_includes_bddl_and_aliases(self, tmp_path):
+        """Two adapters built from the SAME BDDL with the SAME alias map
+        share a cached XML. Different BDDL OR different alias map
+        invalidates the cache - the latter is critical for the #168 round-5
+        fix where the default alias map was extended to rename
+        ``robot0_eye_in_hand``: existing user caches must auto-invalidate
+        instead of serving the stale rewrite that leaves the wrist camera
+        as a static fallback."""
         cache_dir = tmp_path / "scene_cache"
 
         a1 = LiberoAdapter.from_text(
@@ -1018,16 +1022,31 @@ class TestSceneGeneration:
             scene_cache_dir=str(cache_dir),
             init_jitter=0.0,
         )
+        # Adapter built with a non-default alias map - same BDDL as a1 but
+        # different aliases should not share a1's cache file.
+        a4 = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            init_jitter=0.0,
+            scene_camera_aliases={"agentview": "image"},  # a1 default has 3 entries
+        )
 
         path1 = a1._resolve_bddl_path_for_libero()
         path2 = a2._resolve_bddl_path_for_libero()
         path3 = a3._resolve_bddl_path_for_libero()
-        assert path1 is not None and path2 is not None and path3 is not None
-        sha1 = hashlib.sha256(path1.read_bytes()).hexdigest()
-        sha2 = hashlib.sha256(path2.read_bytes()).hexdigest()
-        sha3 = hashlib.sha256(path3.read_bytes()).hexdigest()
-        assert sha1 == sha2  # same BDDL → same key
-        assert sha1 != sha3  # different BDDL → different key
+        path4 = a4._resolve_bddl_path_for_libero()
+        assert path1 is not None and path2 is not None and path3 is not None and path4 is not None
+        # Cache key (per-adapter) is computed by ``_scene_cache_key``.
+        key1 = a1._scene_cache_key(path1.read_bytes())
+        key2 = a2._scene_cache_key(path2.read_bytes())
+        key3 = a3._scene_cache_key(path3.read_bytes())
+        key4 = a4._scene_cache_key(path4.read_bytes())
+        # Same BDDL + same default aliases = same cache file.
+        assert key1 == key2
+        # Different BDDL = different cache file (alias map identical).
+        assert key1 != key3
+        # Same BDDL but different aliases = different cache file.
+        assert key1 != key4
 
     def test_resolve_bddl_path_uses_existing_file_when_set(self, tmp_path):
         """``from_file`` constructed adapters reuse the original BDDL path
@@ -1080,7 +1099,7 @@ class TestSceneGeneration:
         # Pre-populate the cache so we don't need a fake libero env.
         bddl_path = adapter._resolve_bddl_path_for_libero()
         assert bddl_path is not None
-        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
         cache_path = cache_dir / f"{sha}.xml"
         cache_path.write_text("<mujoco/>")
 
@@ -1182,7 +1201,7 @@ class TestApplySceneKeyframe:
         )
         bddl_path = adapter._resolve_bddl_path_for_libero()
         assert bddl_path is not None
-        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
         (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
 
         sim = FakeSim(data_config="panda")
@@ -1217,7 +1236,7 @@ class TestApplySceneKeyframe:
         )
         bddl_path = adapter._resolve_bddl_path_for_libero()
         assert bddl_path is not None
-        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
         (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
 
         sim = FakeSim(data_config="panda")
@@ -1250,7 +1269,7 @@ class TestApplySceneKeyframe:
         )
         bddl_path = adapter._resolve_bddl_path_for_libero()
         assert bddl_path is not None
-        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
         (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
 
         sim = FakeSim(data_config="panda")
@@ -1304,7 +1323,7 @@ class TestApplySceneKeyframe:
         )
         bddl_path = adapter._resolve_bddl_path_for_libero()
         assert bddl_path is not None
-        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
         (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
 
         sim = FakeSim(data_config="panda")
@@ -1334,7 +1353,7 @@ class TestApplySceneKeyframe:
         )
         bddl_path = adapter._resolve_bddl_path_for_libero()
         assert bddl_path is not None
-        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
         (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
 
         sim = FakeSim(data_config="panda")
@@ -1369,7 +1388,7 @@ class TestApplySceneKeyframe:
         )
         bddl_path = adapter._resolve_bddl_path_for_libero()
         assert bddl_path is not None
-        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
         (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
 
         sim = FakeSim(data_config="panda")
@@ -1481,7 +1500,7 @@ class TestApplyCanonicalStateSnapshot:
         )
         bddl_path = adapter._resolve_bddl_path_for_libero()
         assert bddl_path is not None
-        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
         (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
 
         sim = FakeSim(data_config="panda")
@@ -1519,7 +1538,7 @@ class TestApplyCanonicalStateSnapshot:
         )
         bddl_path = adapter._resolve_bddl_path_for_libero()
         assert bddl_path is not None
-        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
         (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
 
         # Pre-seed the snapshot to simulate "this is episode 2+".
@@ -1562,7 +1581,7 @@ class TestApplyCanonicalStateSnapshot:
         )
         bddl_path = adapter._resolve_bddl_path_for_libero()
         assert bddl_path is not None
-        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
         (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
 
         # Pre-seed a 5-element snapshot.
@@ -1602,7 +1621,7 @@ class TestApplyCanonicalStateSnapshot:
         )
         bddl_path = adapter._resolve_bddl_path_for_libero()
         assert bddl_path is not None
-        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
         (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
 
         sim = FakeSim(data_config="panda")
@@ -1636,7 +1655,7 @@ class TestApplyCanonicalStateSnapshot:
         )
         bddl_path = adapter._resolve_bddl_path_for_libero()
         assert bddl_path is not None
-        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
         (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
 
         # Pre-seed a stale snapshot.
@@ -1761,7 +1780,7 @@ class TestPreRegisterDefaultRobot:
         )
         bddl_path = adapter._resolve_bddl_path_for_libero()
         assert bddl_path is not None
-        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
         (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
         return adapter
 
@@ -1975,6 +1994,342 @@ class TestPreRegisterDefaultRobot:
         assert wrapper.namespace == "robot0_"
         # Wrapper name is the canonical "robot" key.
         assert wrapper.name == "robot"
+
+
+class TestResolveSceneEefAndGripper:
+    """``LiberoAdapter._resolve_scene_eef_and_gripper`` overrides the
+    bare-Panda defaults (``"hand"`` / ``"finger_joint1"``) when the scene
+    declares the canonical RoboSuite / LIBERO names (``robot0_right_hand``
+    body, ``gripper0_finger_joint1`` joint). Without this override, the
+    ``augment_observation`` hook silently drops every ``state.x/y/z`` /
+    ``state.gripper`` key on a RoboSuite-emitted scene because
+    ``get_body_state("hand")`` returns body_id=-1 and the gripper-joint
+    suffix-match fails. The GR00T server then rejects the observation
+    with ``State key 'state.x' must be in observation`` and the eval
+    crashes before producing any frame (#168 round-4 bug F)."""
+
+    def _make_robosuite_model(
+        self,
+        *,
+        eef_body: str = "robot0_right_hand",
+        gripper_joint: str = "gripper0_finger_joint1",
+        extra_bodies: tuple[str, ...] = (),
+        extra_joints: tuple[str, ...] = (),
+    ):
+        """Build a stub MuJoCo model that mimics a RoboSuite-compiled
+        Panda scene's name layout. Critical: the EEF body name and
+        gripper joint name match the canonical RoboSuite emit names so
+        :meth:`_resolve_scene_eef_and_gripper` can find them via
+        ``mj_name2id``.
+        """
+        body_names = ["world", "robot0_base", "robot0_link0", eef_body, "gripper0_right_gripper"] + list(extra_bodies)
+        joint_names = ["robot0_joint1", "robot0_joint2", gripper_joint] + list(extra_joints)
+        actuator_names = ["robot0_actuator0"]
+
+        class _FakeMjEnum:
+            mjOBJ_BODY = 1
+            mjOBJ_JOINT = 3
+            mjOBJ_ACTUATOR = 5
+
+        class _FakeModel:
+            nbody = len(body_names)
+            njnt = len(joint_names)
+            nu = len(actuator_names)
+            body_parentid: list[int] = []
+
+        model = _FakeModel()
+        model.body_parentid = [0] * len(body_names)
+
+        class _FakeMj:
+            mjtObj = _FakeMjEnum()
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                if obj_type == 1:
+                    return body_names[idx] if 0 <= idx < len(body_names) else None
+                if obj_type == 3:
+                    return joint_names[idx] if 0 <= idx < len(joint_names) else None
+                if obj_type == 5:
+                    return actuator_names[idx] if 0 <= idx < len(actuator_names) else None
+                return None
+
+            @staticmethod
+            def mj_name2id(model, obj_type, name):  # noqa: ARG004
+                pool = {1: body_names, 3: joint_names, 5: actuator_names}.get(obj_type, [])
+                try:
+                    return pool.index(name)
+                except ValueError:
+                    return -1
+
+        return model, _FakeMj()
+
+    def _scene_path_setup(self, tmp_path):
+        """Create a cached scene XML so on_episode_start hits load_scene path."""
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            install_cameras=False,
+            apply_scene_keyframe=False,
+        )
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        assert bddl_path is not None
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
+        (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
+        return adapter
+
+    def test_eef_body_auto_resolved_to_robot0_right_hand(self, tmp_path):
+        """Default constructor ``eef_body_name=None`` -> auto-detect.
+        Scene has ``robot0_right_hand`` -> override default ``"hand"``."""
+        adapter = self._scene_path_setup(tmp_path)
+        # Adapter constructor leaves _eef_body_name at the bare-Panda fallback.
+        assert adapter._eef_body_name == "hand"
+        assert adapter._user_eef_body_name is None
+
+        model, mj = self._make_robosuite_model()
+        sim = FakeSim(data_config="panda")
+        sim._world.robots.clear()
+        sim._world._model = model  # type: ignore[attr-defined]
+
+        with patch.dict("sys.modules", {"mujoco": mj}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # After episode start, the auto-resolver picked up the scene's
+        # canonical RoboSuite EEF body name.
+        assert adapter._eef_body_name == "robot0_right_hand"
+
+    def test_gripper_joint_auto_resolved_to_gripper0_finger_joint1(self, tmp_path):
+        """Default ``gripper_joint_name=None`` -> auto-detect via the
+        ``scene_gripper_prefix`` namespace (``gripper0_``)."""
+        adapter = self._scene_path_setup(tmp_path)
+        assert adapter._gripper_joint_name == "finger_joint1"
+        assert adapter._user_gripper_joint_name is None
+
+        model, mj = self._make_robosuite_model()
+        sim = FakeSim(data_config="panda")
+        sim._world.robots.clear()
+        sim._world._model = model  # type: ignore[attr-defined]
+
+        with patch.dict("sys.modules", {"mujoco": mj}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        assert adapter._gripper_joint_name == "gripper0_finger_joint1"
+
+    def test_explicit_eef_body_name_preserved(self, tmp_path):
+        """User-supplied ``eef_body_name="hand"`` (or any explicit value) is
+        NEVER overridden, even if the scene declares ``robot0_right_hand``.
+        Backwards compat for callers running custom scenes."""
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            install_cameras=False,
+            apply_scene_keyframe=False,
+            eef_body_name="hand",  # explicit user override
+        )
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
+        (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
+
+        # _user_eef_body_name records the explicit user value.
+        assert adapter._user_eef_body_name == "hand"
+
+        model, mj = self._make_robosuite_model()
+        sim = FakeSim(data_config="panda")
+        sim._world.robots.clear()
+        sim._world._model = model  # type: ignore[attr-defined]
+
+        with patch.dict("sys.modules", {"mujoco": mj}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # User explicit override - resolver did NOT touch it.
+        assert adapter._eef_body_name == "hand"
+
+    def test_explicit_gripper_joint_name_preserved(self, tmp_path):
+        """User-supplied ``gripper_joint_name`` is NEVER overridden."""
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            install_cameras=False,
+            apply_scene_keyframe=False,
+            gripper_joint_name="finger_joint1",
+        )
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
+        (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
+
+        assert adapter._user_gripper_joint_name == "finger_joint1"
+
+        model, mj = self._make_robosuite_model()
+        sim = FakeSim(data_config="panda")
+        sim._world.robots.clear()
+        sim._world._model = model  # type: ignore[attr-defined]
+
+        with patch.dict("sys.modules", {"mujoco": mj}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        assert adapter._gripper_joint_name == "finger_joint1"
+
+    def test_no_match_keeps_bare_panda_default(self, tmp_path):
+        """Scene without ``robot0_right_hand`` / ``gripper0_finger_joint1``
+        (e.g. a custom non-RoboSuite scene): auto-resolver finds no
+        candidate, leaves the bare-Panda defaults in place."""
+        adapter = self._scene_path_setup(tmp_path)
+
+        # Model has scene-Panda body matching `robot0_` prefix (so
+        # _register_default_robot still fires the resolver) but the
+        # canonical EEF / gripper names are missing.
+        model, mj = self._make_robosuite_model(
+            eef_body="robot0_unusual_eef",
+            gripper_joint="custom_joint",
+        )
+        # Override mj_name2id to NOT find any of the resolver's candidates.
+        body_names = ["world", "robot0_base", "robot0_link0", "robot0_unusual_eef"]
+        joint_names = ["robot0_joint1", "custom_joint"]
+
+        class _BareMj:
+            class mjtObj:
+                mjOBJ_BODY = 1
+                mjOBJ_JOINT = 3
+                mjOBJ_ACTUATOR = 5
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                if obj_type == 1:
+                    return body_names[idx] if 0 <= idx < len(body_names) else None
+                if obj_type == 3:
+                    return joint_names[idx] if 0 <= idx < len(joint_names) else None
+                return None
+
+            @staticmethod
+            def mj_name2id(model, obj_type, name):  # noqa: ARG004
+                # Only finds names actually present (no candidate matches)
+                if obj_type == 1 and name in body_names:
+                    return body_names.index(name)
+                if obj_type == 3 and name in joint_names:
+                    return joint_names.index(name)
+                return -1
+
+        class _Model:
+            nbody = len(body_names)
+            njnt = len(joint_names)
+            nu = 1
+            body_parentid = [0] * 4
+
+        sim = FakeSim(data_config="panda")
+        sim._world.robots.clear()
+        sim._world._model = _Model()  # type: ignore[attr-defined]
+
+        with patch.dict("sys.modules", {"mujoco": _BareMj()}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # Resolver found nothing -> fell back to bare-Panda defaults.
+        assert adapter._eef_body_name == "hand"
+        assert adapter._gripper_joint_name == "finger_joint1"
+
+    def test_custom_scene_gripper_prefix_used_in_resolution(self, tmp_path):
+        """``scene_gripper_prefix="custom_"`` -> resolver looks up
+        ``custom_finger_joint1`` instead of ``gripper0_finger_joint1``."""
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            install_cameras=False,
+            apply_scene_keyframe=False,
+            scene_gripper_prefix="custom_",
+        )
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        sha = adapter._scene_cache_key(bddl_path.read_bytes())
+        (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
+
+        model, mj = self._make_robosuite_model(gripper_joint="custom_finger_joint1")
+        sim = FakeSim(data_config="panda")
+        sim._world.robots.clear()
+        sim._world._model = model  # type: ignore[attr-defined]
+
+        with patch.dict("sys.modules", {"mujoco": mj}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        assert adapter._gripper_joint_name == "custom_finger_joint1"
+
+    def test_first_named_returns_none_when_mj_name2id_missing(self):
+        """``_first_named`` returns None when the mj module lacks
+        ``mj_name2id`` (e.g. test stubs that only implement mj_id2name).
+        Defensive guard against partial test fakes."""
+        from strands_robots.benchmarks.libero.adapter import LiberoAdapter as _Adapter
+
+        class _StubMj:
+            class mjtObj:
+                mjOBJ_BODY = 1
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                return None
+
+        # _first_named is a static method - call it directly without an instance.
+        result = _Adapter._first_named(_StubMj(), object(), names=["foo"], obj=1)
+        assert result is None
+
+
+class TestSceneCameraAliasesDefault:
+    """The default ``_scene_camera_aliases`` map covers BOTH the bare
+    RoboSuite camera name (``robot0_eye_in_hand``, what RoboSuite's
+    ``env.sim.model.get_xml()`` emits in the compiled MJCF) AND the
+    legacy ``_image``-suffixed variant (``robot0_eye_in_hand_image``,
+    older convention). Both must rename to ``wrist_image`` so the
+    ``libero_panda`` ``Gr00tDataConfig`` finds the gripper-tracking
+    eye-in-hand camera at the canonical observation key. Without the
+    bare-name entry, the static top-down workspace fallback in
+    :attr:`LIBERO_CAMERAS` gets installed as ``wrist_image``, and GR00T
+    sees out-of-distribution input on its wrist channel every step
+    (#168 round-4 bug A)."""
+
+    def test_default_aliases_include_both_eye_in_hand_variants(self):
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        aliases = adapter._scene_camera_aliases
+        # Both spellings rename to the same canonical key.
+        assert aliases.get("robot0_eye_in_hand") == "wrist_image"
+        assert aliases.get("robot0_eye_in_hand_image") == "wrist_image"
+        # Agentview rename is also still present.
+        assert aliases.get("agentview") == "image"
+
+    def test_explicit_aliases_replace_default_entirely(self):
+        """Passing ``scene_camera_aliases=...`` REPLACES the default
+        (no merge). Users opting into a custom map are responsible for
+        re-adding the wrist alias if they want it."""
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_camera_aliases={"only_one": "renamed"},
+        )
+        assert adapter._scene_camera_aliases == {"only_one": "renamed"}
+
+    def test_robot0_eye_in_hand_renames_to_wrist_image_in_xml(self):
+        """End-to-end: applying the default alias map to a RoboSuite-style
+        XML with a bare ``robot0_eye_in_hand`` camera produces an XML
+        where that camera is renamed to ``wrist_image``."""
+        from strands_robots.benchmarks.libero.adapter import _rename_mjcf_cameras
+
+        xml = (
+            "<mujoco>"
+            "<worldbody>"
+            '<camera name="agentview" pos="1 0 1"/>'
+            '<body name="robot0_right_hand">'
+            '<camera name="robot0_eye_in_hand" pos="0.05 0 0"/>'
+            "</body>"
+            "</worldbody>"
+            "</mujoco>"
+        )
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        renamed = _rename_mjcf_cameras(xml, adapter._scene_camera_aliases)
+        assert 'name="image"' in renamed
+        assert 'name="wrist_image"' in renamed
+        assert 'name="agentview"' not in renamed
+        assert 'name="robot0_eye_in_hand"' not in renamed
 
 
 # PolicyRunner + evaluate_benchmark integration

@@ -31,6 +31,7 @@ the one that pulls in the upstream package to discover task files.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from collections.abc import Callable
@@ -92,19 +93,22 @@ class LiberoAdapter(BenchmarkProtocol):
 
     #: Cameras the ``libero_panda`` ``Gr00tDataConfig`` expects to find on the
     #: sim. Names match the bare keys of its ``video_keys`` (``video.image``
-    #: → ``image``, ``video.wrist_image`` → ``wrist_image``) so the policy's
+    #: -> ``image``, ``video.wrist_image`` -> ``wrist_image``) so the policy's
     #: ``_build_service_observation`` picks them up directly without an
     #: explicit ``observation_mapping``.
     #:
     #: Poses are world-fixed approximations of LIBERO's RoboSuite-conventional
-    #: views (third-person "agentview" + wrist view). The real LIBERO setup
-    #: parents ``robot0_eye_in_hand_image`` to the gripper body; that requires
-    #: a proper LIBERO scene MJCF (which the upstream pip package does NOT
-    #: ship). Until those scene XMLs are wired in via ``scene_path=``, the
-    #: wrist camera here is a *static* top-down workspace view - the model
-    #: still gets *an* image, but it doesn't track the end-effector. Override
-    #: by passing ``cameras={"wrist_image": {"position": [...], ...}}`` to
-    #: the constructor.
+    #: views (third-person "agentview" + wrist view). When the scene MJCF
+    #: declares the canonical RoboSuite cameras (``agentview`` for third-person,
+    #: ``robot0_eye_in_hand`` body-mounted to ``robot0_right_hand`` for the
+    #: wrist view), :attr:`_scene_camera_aliases` renames them at MJCF-load
+    #: time so the model's compiled cameras are exactly ``image`` /
+    #: ``wrist_image`` - the static fallbacks below never get installed and
+    #: the policy sees the real, gripper-tracked wrist camera. The static
+    #: fallback only fires for scenes that *don't* declare the RoboSuite
+    #: cameras (e.g. bare-Panda + custom MJCF without the agentview /
+    #: eye_in_hand setup). Override either entry by passing
+    #: ``cameras={"wrist_image": {"position": [...], ...}}`` to the constructor.
     LIBERO_CAMERAS: dict[str, dict[str, Any]] = {
         "image": {
             "position": [1.0, 0.0, 1.5],
@@ -131,8 +135,8 @@ class LiberoAdapter(BenchmarkProtocol):
         init_jitter: float = 0.0,
         install_cameras: bool = True,
         cameras: dict[str, dict[str, Any]] | None = None,
-        eef_body_name: str = "hand",
-        gripper_joint_name: str = "finger_joint1",
+        eef_body_name: str | None = None,
+        gripper_joint_name: str | None = None,
         inject_eef_state: bool = True,
         auto_generate_scene: bool = True,
         scene_cache_dir: str | None = None,
@@ -140,6 +144,7 @@ class LiberoAdapter(BenchmarkProtocol):
         apply_scene_keyframe: bool = True,
         scene_keyframe_index: int = 0,
         scene_robot_prefix: str = "robot0_",
+        scene_gripper_prefix: str = "gripper0_",
         bddl_source: str | None = None,
         bddl_path: str | None = None,
     ):
@@ -175,17 +180,27 @@ class LiberoAdapter(BenchmarkProtocol):
                 disables camera installation regardless of
                 ``install_cameras``.
             eef_body_name: MuJoCo body name whose pose is read for the
-                LIBERO ``state.x/y/z/roll/pitch/yaw`` keys. Default
-                ``"hand"`` matches MuJoCo Menagerie's Panda. Use
-                ``"<robot_name>/hand"`` in multi-Panda scenes (the
-                lookup goes through the namespace-aware
-                :meth:`Simulation.get_body_state`, so the bare name is
-                usually fine).
+                LIBERO ``state.x/y/z/roll/pitch/yaw`` keys. ``None``
+                (default) triggers auto-resolution from the scene at
+                episode start: when :meth:`_register_default_robot`
+                discovers a scene-supplied Panda under
+                ``scene_robot_prefix``, the adapter searches for the
+                canonical RoboSuite EEF body (``<prefix>right_hand`` ->
+                ``<prefix>hand`` -> bare ``hand``) and overrides
+                ``_eef_body_name`` accordingly. Pass an explicit string
+                to disable auto-resolution (useful for non-RoboSuite
+                scenes); the legacy bare-Panda default is ``"hand"``.
             gripper_joint_name: Joint name whose ``qpos`` is read for the
-                LIBERO ``state.gripper`` key. Default ``"finger_joint1"``
-                matches the Menagerie Panda; the second finger
-                (``finger_joint2``) mirrors via an MJCF equality
-                constraint, so reading just one is sufficient.
+                LIBERO ``state.gripper`` key. ``None`` (default) triggers
+                auto-resolution from the scene at episode start using
+                the RoboSuite gripper-namespace convention: search for
+                ``<scene_gripper_prefix>finger_joint1`` (e.g.
+                ``gripper0_finger_joint1``) -> ``<scene_robot_prefix>finger_joint1``
+                -> bare ``finger_joint1``. Pass an explicit string to
+                disable auto-resolution; the legacy bare-Panda default
+                is ``"finger_joint1"``. The Menagerie Panda's two-finger
+                MJCF equality constraint mirrors the value to the second
+                finger, so reading just one is sufficient.
             inject_eef_state: When ``True`` (default), the adapter's
                 :meth:`augment_observation` injects ``x`` / ``y`` / ``z``
                 / ``roll`` / ``pitch`` / ``yaw`` / ``gripper`` keys
@@ -209,12 +224,27 @@ class LiberoAdapter(BenchmarkProtocol):
                 Cache key is SHA256 of the BDDL source so two adapters
                 built from the same BDDL share a cached XML.
             scene_camera_aliases: Mapping from MJCF camera name (as
-                emitted by LIBERO) to the policy-side observation key
-                expected by the ``libero_panda`` data_config. Default
-                ``{"agentview": "image", "robot0_eye_in_hand_image": "wrist_image"}``
-                renames RoboSuite/LIBERO's two canonical cameras so
+                emitted by LIBERO / RoboSuite) to the policy-side
+                observation key expected by the ``libero_panda``
+                data_config. Default
+                ``{"agentview": "image", "robot0_eye_in_hand": "wrist_image",
+                "robot0_eye_in_hand_image": "wrist_image"}`` renames the
+                two canonical RoboSuite cameras so
                 ``Gr00tPolicy._build_service_observation`` finds them by
-                bare-key lookup. Pass an empty dict to disable renaming.
+                bare-key lookup. Both ``robot0_eye_in_hand`` and the
+                ``_image``-suffixed variant are mapped because RoboSuite's
+                emitted MJCFs use the bare name on the ``<camera>`` element
+                while older convention adds the ``_image`` suffix - this way
+                the rename works regardless of upstream version. Pass an
+                empty dict to disable renaming (the static fallbacks in
+                :attr:`LIBERO_CAMERAS` will then fire because no scene
+                camera matches the policy-side ``image`` / ``wrist_image``
+                names; the wrist channel becomes a static top-down view
+                which puts GR00T-LIBERO out-of-distribution every step).
+                When this map is non-empty, its sorted contents are
+                hashed into the scene-cache key so a regenerated cache
+                automatically picks up alias changes (e.g. a user adding
+                a new alias) instead of serving a stale rewrite.
             apply_scene_keyframe: When ``True`` (default) AND a scene was
                 loaded, :meth:`on_episode_start` restores qpos/qvel to the
                 scene's canonical home state AFTER ``super().on_episode_start``
@@ -256,6 +286,15 @@ class LiberoAdapter(BenchmarkProtocol):
                 pre-register step no-ops silently when no body matches
                 the prefix - super() then falls back to its standard
                 ``add_robot`` path.
+            scene_gripper_prefix: Body / joint name prefix that
+                identifies the scene-supplied gripper. Default
+                ``"gripper0_"`` matches RoboSuite's gripper namespace
+                (separate from ``scene_robot_prefix`` because RoboSuite
+                attaches grippers via its own naming scheme). Used by
+                the gripper-joint auto-resolver in
+                :meth:`_register_default_robot` when
+                ``gripper_joint_name=None`` (default). Ignored when an
+                explicit ``gripper_joint_name`` is supplied.
             bddl_source: Original BDDL text - stored on the adapter so
                 the scene generator can pass it back to ``libero`` (which
                 only accepts a *file* path). Set automatically by
@@ -286,26 +325,40 @@ class LiberoAdapter(BenchmarkProtocol):
             if cameras is not None
             else {k: dict(v) for k, v in self.LIBERO_CAMERAS.items()}
         )
-        self._eef_body_name = str(eef_body_name)
-        self._gripper_joint_name = str(gripper_joint_name)
+        self._eef_body_name: str = str(eef_body_name) if eef_body_name is not None else "hand"
+        self._gripper_joint_name: str = str(gripper_joint_name) if gripper_joint_name is not None else "finger_joint1"
+        # Track whether the user explicitly supplied either name so the
+        # auto-resolver in :meth:`_register_default_robot` only overrides
+        # when the constructor default (``None``) was used. Explicit
+        # values - including the legacy bare-Panda strings ``"hand"`` and
+        # ``"finger_joint1"`` - are treated as "user knows best, do not
+        # touch", which preserves backwards-compat for custom scene users.
+        self._user_eef_body_name: str | None = str(eef_body_name) if eef_body_name is not None else None
+        self._user_gripper_joint_name: str | None = str(gripper_joint_name) if gripper_joint_name is not None else None
         self._inject_eef_state = bool(inject_eef_state)
         self._auto_generate_scene = bool(auto_generate_scene)
         self._scene_cache_dir = scene_cache_dir
         # Default camera-name alias map matches RoboSuite/LIBERO's two
         # canonical camera names to the bare keys (``image`` /
         # ``wrist_image``) that ``libero_panda``'s Gr00tDataConfig
-        # expects. Passing an empty dict disables renaming.
+        # expects. Both ``robot0_eye_in_hand`` (the bare name RoboSuite
+        # emits in its compiled MJCFs) and the older ``_image``-suffixed
+        # variant are mapped so the rename works regardless of which
+        # upstream version produced the scene XML. Passing an empty dict
+        # disables renaming.
         self._scene_camera_aliases: dict[str, str] = (
             dict(scene_camera_aliases)
             if scene_camera_aliases is not None
             else {
                 "agentview": "image",
+                "robot0_eye_in_hand": "wrist_image",
                 "robot0_eye_in_hand_image": "wrist_image",
             }
         )
         self._apply_canonical_state_enabled = bool(apply_scene_keyframe)
         self._scene_keyframe_index = int(scene_keyframe_index)
         self._scene_robot_prefix = str(scene_robot_prefix)
+        self._scene_gripper_prefix = str(scene_gripper_prefix)
         # Snapshot-and-restore fallback for procedurally-generated MJCFs that
         # don't ship a <keyframe> (the case the post-#168 verification
         # exposed). Captured on the first episode after super() +
@@ -329,8 +382,8 @@ class LiberoAdapter(BenchmarkProtocol):
         init_jitter: float = 0.0,
         install_cameras: bool = True,
         cameras: dict[str, dict[str, Any]] | None = None,
-        eef_body_name: str = "hand",
-        gripper_joint_name: str = "finger_joint1",
+        eef_body_name: str | None = None,
+        gripper_joint_name: str | None = None,
         inject_eef_state: bool = True,
         auto_generate_scene: bool = True,
         scene_cache_dir: str | None = None,
@@ -338,6 +391,7 @@ class LiberoAdapter(BenchmarkProtocol):
         apply_scene_keyframe: bool = True,
         scene_keyframe_index: int = 0,
         scene_robot_prefix: str = "robot0_",
+        scene_gripper_prefix: str = "gripper0_",
     ) -> LiberoAdapter:
         """Parse a ``.bddl`` file from disk and build an adapter.
 
@@ -362,6 +416,7 @@ class LiberoAdapter(BenchmarkProtocol):
             apply_scene_keyframe=apply_scene_keyframe,
             scene_keyframe_index=scene_keyframe_index,
             scene_robot_prefix=scene_robot_prefix,
+            scene_gripper_prefix=scene_gripper_prefix,
             bddl_path=str(bddl_path),
         )
 
@@ -375,8 +430,8 @@ class LiberoAdapter(BenchmarkProtocol):
         init_jitter: float = 0.0,
         install_cameras: bool = True,
         cameras: dict[str, dict[str, Any]] | None = None,
-        eef_body_name: str = "hand",
-        gripper_joint_name: str = "finger_joint1",
+        eef_body_name: str | None = None,
+        gripper_joint_name: str | None = None,
         inject_eef_state: bool = True,
         auto_generate_scene: bool = True,
         scene_cache_dir: str | None = None,
@@ -384,6 +439,7 @@ class LiberoAdapter(BenchmarkProtocol):
         apply_scene_keyframe: bool = True,
         scene_keyframe_index: int = 0,
         scene_robot_prefix: str = "robot0_",
+        scene_gripper_prefix: str = "gripper0_",
     ) -> LiberoAdapter:
         """Parse a BDDL string directly - useful in tests."""
         problem = parse_bddl(bddl_text)
@@ -403,6 +459,7 @@ class LiberoAdapter(BenchmarkProtocol):
             apply_scene_keyframe=apply_scene_keyframe,
             scene_keyframe_index=scene_keyframe_index,
             scene_robot_prefix=scene_robot_prefix,
+            scene_gripper_prefix=scene_gripper_prefix,
             bddl_source=bddl_text,
         )
 
@@ -673,9 +730,9 @@ class LiberoAdapter(BenchmarkProtocol):
             return None
 
         bddl_bytes = bddl_path.read_bytes()
-        sha = hashlib.sha256(bddl_bytes).hexdigest()
+        cache_key = self._scene_cache_key(bddl_bytes)
         cache_dir = Path(self._scene_cache_dir).expanduser() if self._scene_cache_dir else _default_scene_cache_dir()
-        cache_path = cache_dir / f"{sha}.xml"
+        cache_path = cache_dir / f"{cache_key}.xml"
         if cache_path.exists():
             logger.debug("LiberoAdapter: scene cache hit %s", cache_path)
             return str(cache_path)
@@ -752,6 +809,31 @@ class LiberoAdapter(BenchmarkProtocol):
         if not tmp.exists():
             tmp.write_text(self._bddl_source)
         return tmp
+
+    def _scene_cache_key(self, bddl_bytes: bytes) -> str:
+        """Compute the scene-cache filename stem for ``bddl_bytes``.
+
+        The key is ``sha256(bddl_bytes || b"|aliases:" || sorted-json(aliases))``.
+        Including the alias map makes the cache invalidate automatically
+        when a user changes :attr:`_scene_camera_aliases` (or the
+        adapter's default map evolves, e.g. the #168-r5 fix that adds
+        ``"robot0_eye_in_hand": "wrist_image"``). Without this,
+        upgrading users would serve the stale on-disk rewrite that
+        leaves ``robot0_eye_in_hand`` un-renamed - the GR00T policy
+        would keep seeing the static top-down fallback at the
+        ``wrist_image`` slot and the wrist channel would be
+        out-of-distribution every step.
+
+        ``json.dumps(..., sort_keys=True)`` makes the hash deterministic
+        across Python invocations (dict iteration order is insertion
+        order in CPython 3.7+, but tests construct adapters in
+        unpredictable orders and we want stable hashing).
+
+        Returns the hex digest (no extension); callers append ``.xml`` /
+        ``.bddl`` as appropriate.
+        """
+        alias_repr = json.dumps(self._scene_camera_aliases, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(bddl_bytes + b"|aliases:" + alias_repr).hexdigest()
 
     def _register_default_robot(self, sim: SimEngine) -> None:
         """Wrap the scene-supplied Panda in ``world.robots`` WITHOUT recompiling.
@@ -833,6 +915,126 @@ class LiberoAdapter(BenchmarkProtocol):
             len(wrapper.joint_names),
             len(wrapper.actuator_ids),
         )
+
+        # The bare-Panda defaults for ``_eef_body_name`` ("hand") and
+        # ``_gripper_joint_name`` ("finger_joint1") don't exist in
+        # RoboSuite-emitted scenes - those use ``robot0_right_hand`` for
+        # the EEF body and ``gripper0_finger_joint1`` for the gripper
+        # joint. Without this auto-resolution, ``augment_observation``
+        # silently drops every ``state.x/y/z/roll/pitch/yaw`` and
+        # ``state.gripper`` key (because ``get_body_state("hand")``
+        # returns body_id=-1 and the gripper-joint suffix-match fails),
+        # the GR00T server then rejects every observation with
+        # ``State key 'state.x' must be in observation`` and the eval
+        # crashes before producing any frame. The user-explicit-override
+        # check via ``_user_eef_body_name`` / ``_user_gripper_joint_name``
+        # ensures that callers passing a custom value still get their
+        # value respected; only the constructor default (``None``)
+        # triggers auto-resolution.
+        self._resolve_scene_eef_and_gripper(_mj, model)
+
+    def _resolve_scene_eef_and_gripper(self, mj: Any, model: Any) -> None:
+        """Auto-resolve EEF body name and gripper joint name from the scene.
+
+        Searches the compiled MuJoCo model for the canonical RoboSuite /
+        LIBERO names that the upstream GR00T-LIBERO checkpoint was trained
+        against:
+
+        * EEF body: ``<scene_robot_prefix>right_hand`` (RoboSuite default)
+          -> ``<scene_robot_prefix>hand`` -> bare ``hand`` /
+          ``right_hand``. First match wins.
+        * Gripper joint: ``<scene_gripper_prefix>finger_joint1``
+          (RoboSuite default; the gripper has its OWN namespace separate
+          from the robot's because RoboSuite attaches grippers via a
+          dedicated naming scheme) -> ``<scene_robot_prefix>finger_joint1``
+          -> bare ``finger_joint1``. First match wins.
+
+        Only fires when the constructor default (``None``) was used.
+        Explicit user-supplied values - tracked via
+        ``_user_eef_body_name`` / ``_user_gripper_joint_name`` - are
+        preserved verbatim (they may legitimately point at a custom
+        scene whose body / joint names don't match the conventions
+        above).
+
+        Best-effort: any failure (model missing the ``nbody``/``njnt``
+        attributes, ``mj_name2id`` raising) is caught and logged at
+        DEBUG, leaving the legacy bare-Panda defaults
+        (``"hand"`` / ``"finger_joint1"``) in place. That preserves the
+        pre-#166 behaviour for non-MuJoCo backends.
+        """
+        prefix = self._scene_robot_prefix
+        gprefix = self._scene_gripper_prefix
+
+        if self._user_eef_body_name is None:
+            eef_candidates: list[str] = []
+            # Prefix-namespaced first (the case for RoboSuite/LIBERO)
+            for suffix in ("right_hand", "hand", "eef"):
+                if prefix:
+                    eef_candidates.append(f"{prefix}{suffix}")
+            # Then bare names as fallback (covers Menagerie's bare Panda)
+            eef_candidates.extend(["right_hand", "hand", "eef"])
+            resolved = self._first_named(mj, model, names=eef_candidates, obj=mj.mjtObj.mjOBJ_BODY)
+            if resolved is not None and resolved != self._eef_body_name:
+                logger.debug(
+                    "LiberoAdapter: auto-resolved eef_body_name to %r (was %r); scene has prefix %r",
+                    resolved,
+                    self._eef_body_name,
+                    prefix,
+                )
+                self._eef_body_name = resolved
+            elif resolved is None:
+                logger.debug(
+                    "LiberoAdapter: no scene EEF body found among %r; keeping default %r",
+                    eef_candidates,
+                    self._eef_body_name,
+                )
+
+        if self._user_gripper_joint_name is None:
+            grip_candidates: list[str] = []
+            # Gripper namespace first (RoboSuite ``gripper0_finger_joint1``)
+            if gprefix:
+                grip_candidates.append(f"{gprefix}finger_joint1")
+            # Robot namespace next (some custom scenes share namespaces)
+            if prefix:
+                grip_candidates.append(f"{prefix}finger_joint1")
+            # Bare fallback (Menagerie Panda)
+            grip_candidates.append("finger_joint1")
+            resolved = self._first_named(mj, model, names=grip_candidates, obj=mj.mjtObj.mjOBJ_JOINT)
+            if resolved is not None and resolved != self._gripper_joint_name:
+                logger.debug(
+                    "LiberoAdapter: auto-resolved gripper_joint_name to %r (was %r); gripper prefix %r",
+                    resolved,
+                    self._gripper_joint_name,
+                    gprefix,
+                )
+                self._gripper_joint_name = resolved
+            elif resolved is None:
+                logger.debug(
+                    "LiberoAdapter: no scene gripper joint found among %r; keeping default %r",
+                    grip_candidates,
+                    self._gripper_joint_name,
+                )
+
+    @staticmethod
+    def _first_named(mj: Any, model: Any, *, names: list[str], obj: int) -> str | None:
+        """Return the first name in ``names`` that resolves to a valid id.
+
+        Walks ``names`` in order and returns the first one for which
+        ``mj.mj_name2id(model, obj, name)`` returns a non-negative id.
+        Returns ``None`` when no candidate resolves or when ``mj`` lacks
+        ``mj_name2id`` (defensive against test stubs).
+        """
+        mj_name2id = getattr(mj, "mj_name2id", None)
+        if mj_name2id is None:
+            return None
+        try:
+            for name in names:
+                if mj_name2id(model, obj, name) >= 0:
+                    return name
+        except Exception as e:  # noqa: BLE001 - never fatal during name resolution
+            logger.debug("LiberoAdapter: mj_name2id lookup raised: %s", e)
+            return None
+        return None
 
     def _install_libero_cameras(self, sim: SimEngine) -> None:
         """Inject the cameras the ``libero_panda`` data_config expects.
