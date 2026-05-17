@@ -1508,6 +1508,88 @@ class TestPrewarm:
         # viz_option still installed - independent of camera install.
         assert "viz_option" in sim._world._backend_state
 
+    def test_prewarm_calls_warmup_render_at_end(self):
+        """Round 19 defensive: prewarm calls ``sim.render(camera_name=...)``
+        once at the very end to prime process-shared GL state. The
+        recorder thread spawned by ``start_cameras_recording`` then
+        inherits warm shared state on its first render call.
+
+        Pin for #168 round-19 verification: variant-B scenario where
+        prewarm fully succeeds (no redundant Panda) and on_episode_start
+        takes the fast-path - without main-thread warmup, the recorder
+        thread's first ~15 calls return GL clear-colour gradient even
+        with ``mj_forward`` populating xpos/xmat. The single warmup
+        render here primes shared driver state.
+        """
+        pytest.importorskip("mujoco")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        # Track render calls.
+        render_calls: list[tuple] = []
+        original_render = sim.render
+
+        def tracking_render(camera_name="default", width=None, height=None):
+            render_calls.append((camera_name, width, height))
+            return original_render(camera_name=camera_name, width=width, height=height)
+
+        with patch.object(sim, "render", side_effect=tracking_render):
+            adapter.prewarm(sim)
+
+        # Exactly one warmup render call. Camera name is the first
+        # in self._cameras (default LIBERO config has "image" first).
+        assert len(render_calls) == 1, f"expected exactly one warmup render call from prewarm; got {render_calls}"
+        cam_name, width, height = render_calls[0]
+        assert cam_name == "image", f"expected first camera 'image'; got {cam_name!r}"
+        # width/height are small - just need to prime state, not capture.
+        assert width == 64
+        assert height == 64
+
+    def test_prewarm_warmup_render_no_render_method_silently_skips(self):
+        """If sim has no ``render()`` method (test stub or unusual
+        backend), the warmup step skips silently."""
+        pytest.importorskip("mujoco")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+
+        # Replace sim.render with None to simulate "no render method".
+        with patch.object(sim, "render", None):
+            # Must not raise.
+            adapter.prewarm(sim)
+
+    def test_prewarm_warmup_render_failure_does_not_abort(self):
+        """If the warmup render raises, prewarm continues without
+        re-raising. Logged at DEBUG (not WARNING) - this is informational
+        only, the real recorder error path will surface persistent
+        failures via state['errors']."""
+        pytest.importorskip("mujoco")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+
+        def boom(camera_name="default", width=None, height=None):
+            raise RuntimeError("simulated render failure")
+
+        with patch.object(sim, "render", side_effect=boom):
+            # Must not raise.
+            adapter.prewarm(sim)
+
+        # Other prewarm steps still ran (viz_option installed).
+        assert "viz_option" in sim._world._backend_state
+
     def test_prewarm_calls_mj_forward(self):
         """Round-14 fix: ``prewarm`` calls ``mujoco.mj_forward(model, data)``
         so ``data.xpos / data.xmat`` are populated before the recorder

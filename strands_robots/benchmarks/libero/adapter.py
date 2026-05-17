@@ -889,6 +889,69 @@ class LiberoAdapter(BenchmarkProtocol):
         except Exception as e:  # noqa: BLE001
             logger.warning("LiberoAdapter.prewarm: mj_forward failed: %s", e)
 
+        # Force one main-thread render to prime any process-wide
+        # GL state that the recorder thread inherits (#168 round 19
+        # bug D defensive). The recorder thread spawned by
+        # ``start_cameras_recording`` has its own
+        # ``threading.local`` Renderer instance, but some driver-
+        # level state (compiled shaders, texture caches, GLContext
+        # bind state) is process-shared. The reviewer's variant-B
+        # verification (round 18) showed that without a main-thread
+        # render after prewarm, the recorder thread's first ~15
+        # render calls return GL clear-colour gradient even when
+        # ``mj_forward`` has populated ``data.xpos / xmat``. A single
+        # main-thread render on the same camera primes that shared
+        # state so the recorder thread's first call lands warm.
+        #
+        # Rounds 11-13 attempted thread-side warmup loops, which
+        # round-12 verification showed don't help (GL context is
+        # thread-bound and the per-thread Renderer is cold). The
+        # main-thread approach here is different: it primes the
+        # process-shared driver state, not the per-thread Renderer.
+        # If the driver state assumption is wrong (no shared state),
+        # this is a harmless ~33ms render that was never used.
+        #
+        # Best-effort: render failures (no GL context, missing
+        # camera, etc.) are logged at DEBUG and don't abort prewarm.
+        try:
+            self._warmup_render(sim)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("LiberoAdapter.prewarm: warmup render failed: %s", e)
+
+    def _warmup_render(self, sim: SimEngine) -> None:
+        """Force one synchronous render on the main thread to prime GL state.
+
+        Picks the first registered camera (typically ``image`` for
+        LIBERO scenes) and calls ``sim.render(camera_name=cam, ...)``
+        once. Discards the result; only the GL state-priming side-effect
+        matters.
+
+        Best-effort: any failure (sim has no render(), no cameras
+        installed, GL context unavailable) is logged at DEBUG and
+        returns silently. The recorder thread's render path has its
+        own error handling for persistent failures via
+        ``state["errors"][cam]``.
+
+        Camera selection: tries ``self._cameras`` keys in order
+        (``image`` then ``wrist_image`` for default LIBERO config),
+        falls back to ``"default"`` if the dict is empty. Only
+        renders ONE camera - we just need to prime shared state, not
+        warm every camera's per-thread renderer (the per-thread
+        renderer is the recorder's responsibility).
+        """
+        render = getattr(sim, "render", None)
+        if render is None:
+            logger.debug("LiberoAdapter.prewarm: sim has no render(); skipping warmup")
+            return
+        # Pick the first declared camera; default fallback if none.
+        cam_name = next(iter(self._cameras), "default") if self._cameras else "default"
+        try:
+            render(camera_name=cam_name, width=64, height=64)
+        except Exception as e:  # noqa: BLE001 - warmup failures non-fatal
+            logger.debug("LiberoAdapter.prewarm: warmup render(%r) failed: %s", cam_name, e)
+            return
+        logger.debug("LiberoAdapter.prewarm: warmup render(%r) primed GL state", cam_name)
+
     def _apply_init_state_for_prewarm(self, sim: SimEngine) -> None:
         """Write ``init_states[0]`` to ``world._data`` (best-effort).
 
