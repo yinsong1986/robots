@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -234,4 +235,210 @@ def test_render_passes_scene_option_to_renderer(tmp_path: Path) -> None:
     )
 
     sim.destroy()
+    sim.destroy()
+
+
+# Recorder warmup before thread launch (#168 round-11 bug D)
+
+
+@_requires_mujoco
+def test_start_cameras_recording_warms_up_renderer_before_thread() -> None:
+    """``start_cameras_recording`` does one synchronous render per camera
+    BEFORE launching the recorder thread.
+
+    Without this warmup, the recorder thread's first frame hits a
+    cold-start render pipeline (no scene buffer, GL context not bound
+    to the data, etc.) and returns the GL clear-colour / skybox
+    gradient - mean RGB ``(138, 150, 177)`` with col-std ~0.6 - instead
+    of real geometry. With the warmup, the thread's first call is
+    actually the second render() and lands on the warm path.
+
+    This is a no-GL test: mocks ``Renderer.render`` to count calls
+    AND mocks ``Thread`` so .start() is a no-op (otherwise the
+    daemon thread would fire a few extra render calls before the test
+    cleans up).
+    """
+    pytest.importorskip("mujoco")
+    os.environ.setdefault("MUJOCO_GL", "glfw")
+
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    sim.create_world()
+    sim.add_robot("arm", data_config="so101", position=[0.0, 0.0, 0.0])
+    sim.add_camera("cam_a", position=[0.5, 0, 0.5], target=[0, 0, 0])
+    sim.add_camera("cam_b", position=[-0.5, 0, 0.5], target=[0, 0, 0])
+
+    # Track render calls + camera names.
+    render_calls: list[str] = []
+    original_render = sim.render
+
+    def counting_render(camera_name: str, width=None, height=None) -> dict:
+        render_calls.append(camera_name)
+        return original_render(camera_name=camera_name, width=width, height=height)
+
+    # Mock Thread so .start() doesn't actually run _loop. Every render
+    # call recorded here is from the warmup, not the thread loop.
+    started_thread_targets: list = []
+
+    class _NoStartThread:
+        def __init__(self, target=None, daemon=None) -> None:
+            self.target = target
+            self.daemon = daemon
+
+        def start(self) -> None:
+            started_thread_targets.append(self.target)
+
+        def is_alive(self) -> bool:
+            return False
+
+        def join(self, timeout=None) -> None:
+            pass
+
+    with patch.object(sim, "render", side_effect=counting_render):
+        with patch("threading.Thread", _NoStartThread):
+            r = sim.start_cameras_recording(
+                cameras=["cam_a", "cam_b"],
+                output_dir="/tmp",
+                fps=20,
+                width=64,
+                height=48,
+                name="warmup_test",
+            )
+
+    # Hot path: at least one render call per camera before the thread
+    # was started (i.e. while the test is running, with the thread
+    # mocked out so its loop never fires).
+    assert r["status"] == "success", r
+    assert "cam_a" in render_calls, f"warmup didn't render cam_a; calls={render_calls}"
+    assert "cam_b" in render_calls, f"warmup didn't render cam_b; calls={render_calls}"
+    # Exactly the warmup count - thread was mocked, so no thread-side calls.
+    assert len(render_calls) == 2, (
+        f"expected exactly 2 warmup renders (one per camera), got {len(render_calls)}: {render_calls}"
+    )
+    # Thread was created and .start() was called (just no-op'd by the mock).
+    assert len(started_thread_targets) == 1
+
+    # Tear down via the explicit stop path - the mocked thread never
+    # actually started, so this just clears state.
+    sim._cams_rec_state["running"] = False
+    sim.destroy()
+
+
+@_requires_mujoco
+def test_start_cameras_recording_warmup_failure_does_not_abort() -> None:
+    """If the synchronous warmup render raises, ``start_cameras_recording``
+    still proceeds to launch the thread - warmup is best-effort.
+
+    Required because warmup failure shouldn't crash recording entirely;
+    the thread loop will accumulate ``state['errors'][cam]`` for any
+    persistent render failure and the user can inspect via
+    ``get_cameras_recording_status``."""
+    pytest.importorskip("mujoco")
+    os.environ.setdefault("MUJOCO_GL", "glfw")
+
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    sim.create_world()
+    sim.add_robot("arm", data_config="so101", position=[0.0, 0.0, 0.0])
+    sim.add_camera("cam", position=[0.5, 0, 0.5], target=[0, 0, 0])
+
+    # Mock render to raise.
+    def boom(camera_name: str, width=None, height=None):
+        raise RuntimeError(f"simulated warmup failure on {camera_name}")
+
+    started_thread_targets: list = []
+
+    class _NoStartThread:
+        def __init__(self, target=None, daemon=None) -> None:
+            self.target = target
+
+        def start(self) -> None:
+            started_thread_targets.append(self.target)
+
+        def is_alive(self) -> bool:
+            return False
+
+    with patch.object(sim, "render", side_effect=boom):
+        with patch("threading.Thread", _NoStartThread):
+            r = sim.start_cameras_recording(
+                cameras=["cam"],
+                output_dir="/tmp",
+                fps=20,
+                width=64,
+                height=48,
+                name="warmup_fail_test",
+            )
+
+    # Recording started despite warmup failure; thread was launched.
+    assert r["status"] == "success", r
+    assert len(started_thread_targets) == 1
+
+    sim._cams_rec_state["running"] = False
+    sim.destroy()
+
+
+@_requires_mujoco
+def test_recorder_first_frame_is_real_geometry(tmp_path: Path) -> None:
+    """End-to-end: the FIRST frame written to the MP4 is real geometry
+    (col-std > 30), not the skybox-only gradient (col-std ~0.6).
+
+    Pin for #168 round-11 bug D: pre-fix, the recorder thread's first
+    captured frame was a cold-start gradient because the renderer's
+    scene buffer hadn't been populated. The synchronous warmup before
+    thread launch ensures the first thread-side render() lands on the
+    warm path.
+
+    Gated behind ``_requires_mujoco`` because it needs a real GL
+    context to actually render meaningful pixels."""
+    os.environ.setdefault("MUJOCO_GL", "glfw")
+
+    import imageio.v2 as imageio
+    import numpy as np
+
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    sim.create_world()
+    sim.add_robot("arm", data_config="so101", position=[0.0, 0.0, 0.0])
+    sim.add_camera("cam", position=[0.4, -0.4, 0.5], target=[0.0, 0.0, 0.1])
+    sim.step(n_steps=5)
+
+    # Brand-new recorder; first frame must be warm.
+    r = sim.start_cameras_recording(
+        cameras=["cam"],
+        output_dir=str(tmp_path),
+        fps=20,
+        width=64,
+        height=48,
+        name="first_frame_test",
+    )
+    assert r["status"] == "success", r
+
+    time.sleep(0.2)
+    sim.stop_cameras_recording()
+
+    # Decode the MP4 and inspect the first frame's column stddev.
+    mp4_files = list(tmp_path.glob("*.mp4"))
+    assert mp4_files, "expected at least one mp4 file"
+    reader = imageio.get_reader(str(mp4_files[0]))
+    try:
+        frames: list = []
+        for frame in reader.iter_data():  # type: ignore[attr-defined]
+            frames.append(frame)
+    finally:
+        reader.close()
+    assert len(frames) >= 1
+    first = np.asarray(frames[0])
+    # Real-geometry frames have col-std around 30+; cold-start gradient
+    # frames have col-std around 0.6 (dominated by the smooth horizontal
+    # skybox blue->grey gradient).
+    col_std = float(first.std(axis=0).mean())
+    assert col_std > 5.0, (
+        f"first frame appears to be cold-start gradient, col_std={col_std:.2f}; "
+        f"expected real geometry (col_std>5). Frame mean RGB: "
+        f"({first[..., 0].mean():.1f}, {first[..., 1].mean():.1f}, {first[..., 2].mean():.1f})"
+    )
+
     sim.destroy()
