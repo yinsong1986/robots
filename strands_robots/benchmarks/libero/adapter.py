@@ -3505,6 +3505,45 @@ class _LiberoOSCController:
         )
         gripper_value = _to_scalar(action_dict.get("gripper", 0.0))
 
+        # Round 41 (#168) — convert RLDS gripper convention → robosuite/LIBERO
+        # convention. The GR00T-N1.7-LIBERO checkpoint emits ``action.gripper``
+        # in the RLDS dataloader's convention (``0 = close``, ``1 = open``);
+        # robosuite's ``PandaGripper.format_action`` expects the opposite
+        # (``+1 = close``, ``-1 = open``). NVIDIA bridges the two with two
+        # helpers in ``Isaac-GR00T/gr00t/eval/sim/LIBERO/libero_env.py``:
+        #
+        #   normalize_gripper_action(action, binarize=True):
+        #     # [0, 1] → [-1, 1] → sign() → ±1
+        #     action[..., -1] = 2 * action[..., -1] - 1
+        #     action[..., -1] = np.sign(action[..., -1])
+        #
+        #   invert_gripper_action(action):
+        #     # ±1 → ∓1 (RLDS → LIBERO sign convention)
+        #     action[..., -1] = action[..., -1] * -1.0
+        #
+        # Combined: ``gripper_out = -np.sign(2 * gripper_in - 1)``. Concretely:
+        #   gripper_in = 0.0 (RLDS close) → -sign(-1) = +1 (LIBERO close) ✓
+        #   gripper_in = 0.5             → -sign(0)  =  0 (no motion)
+        #   gripper_in = 1.0 (RLDS open)  → -sign(+1) = -1 (LIBERO open)  ✓
+        #
+        # Pre-round-41 we passed the raw model output to our OSC's
+        # ``np.sign(gripper_value)`` directly. Since the model's typical
+        # outputs are in [0, 1], every "open" intent (model output ≈ 1)
+        # collapsed to ``sign=+1``, which our OSC interprets as CLOSE — so
+        # the gripper consistently went CLOSED for OPEN commands and
+        # vice-versa. This is the action-side counterpart to round 39's
+        # observation-side V-flip bug; both rounds together close the
+        # client-pipeline parity gap that left ``success_rate=0`` after
+        # rounds 36-40 even though state pipeline was byte-equivalent
+        # (round 35) and image pipeline was within ``mean |Δ|=3-9/255``
+        # (rounds 39+40).
+        #
+        # Diagnostic that surfaced this: NVIDIA's reference eval against
+        # the SAME checkpoint+task got ``success_rate=1.0`` at 10s/ep,
+        # while ours stayed at 0.0 at 120s/ep — clear ground-truth proof
+        # the gap was on our side.
+        gripper_value = -float(np.sign(2.0 * gripper_value - 1.0))
+
         # set_goal once per policy step. Subsequent run_controller
         # calls in the substep loop interpolate / hold this goal.
         try:

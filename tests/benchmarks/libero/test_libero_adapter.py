@@ -3502,22 +3502,28 @@ class TestInstallActionController:
         np.testing.assert_array_equal(ctrl._gripper_current_action, np.zeros(2))
 
     def test_gripper_close_command_drives_both_fingers_to_closed(self, libero_scene_xml):
-        """Round 28 (#168): ``gripper=+1`` (close) must drive BOTH finger
-        ctrl values toward their closed positions, NOT just one.
+        """Round 28 (#168): ``gripper`` close-command must drive BOTH
+        finger ctrl values toward their closed positions, NOT just one.
 
-        Pre-fix bug: writing the raw ``+1`` scalar to both gripper
-        actuators clipped against asymmetric ctrlranges
-        (finger1: ``[0, 0.04]`` where +1 → 0.04 = OPEN; finger2:
-        ``[-0.04, 0]`` where +1 → 0 = closed). One finger moved the
-        wrong way per grasp attempt.
+        Pre-fix bug: writing the raw scalar to both gripper actuators
+        clipped against asymmetric ctrlranges (finger1: ``[0, 0.04]``
+        where +1 → 0.04 = OPEN; finger2: ``[-0.04, 0]`` where +1 → 0 =
+        closed). One finger moved the wrong way per grasp attempt.
 
         Post-fix: stateful ramp + bias/weight rescale. After 25
-        substeps of ``+1`` from neutral:
+        substeps of close from neutral:
         - finger1 ctrl moves from 0.02 (mid) toward 0 (closed)
         - finger2 ctrl moves from -0.02 (mid) toward 0 (closed)
 
         Both fingers converge to 0 (closed); pin the per-finger sign
-        so the wrong-direction bug can't sneak back."""
+        so the wrong-direction bug can't sneak back.
+
+        Round 41 (#168) update: the gripper input is now in RLDS
+        convention (``0 = close``, ``1 = open``); the OSC controller
+        applies ``-np.sign(2x-1)`` to convert RLDS → robosuite
+        convention. So "close" command = ``gripper=0.0`` (was
+        ``gripper=+1.0`` before round 41 because we were treating
+        the input as already-converted)."""
         pytest.importorskip("mujoco")
         pytest.importorskip("robosuite")
         import mujoco
@@ -3550,8 +3556,10 @@ class TestInstallActionController:
             for gi in ctrl.gripper_actuator_ids
         ]
 
-        # Send a close command (+1) for one policy step. Verify EACH
-        # finger's ctrl moved toward its respective closed position.
+        # Send a close command (RLDS 0.0 = close) for one policy step.
+        # Verify EACH finger's ctrl moved toward its respective closed
+        # position. Round 41 transform: -sign(2*0-1) = -sign(-1) = +1
+        # → ramp [-0.01, +0.01] → fingers toward closed.
         action = {
             "x": [0.0, 0.0],
             "y": [0.0, 0.0],
@@ -3559,7 +3567,7 @@ class TestInstallActionController:
             "roll": [0.0, 0.0],
             "pitch": [0.0, 0.0],
             "yaw": [0.0, 0.0],
-            "gripper": [1.0, 1.0],  # close
+            "gripper": [0.0, 0.0],  # RLDS close
         }
         ctrl.apply(action, sim._world._model, sim._world._data, "robot")  # type: ignore[attr-defined]
 
@@ -3585,20 +3593,21 @@ class TestInstallActionController:
             assert ctrl_val != mid, f"finger ctrl {ctrl_val} didn't move from mid={mid}"
 
     def test_gripper_close_vs_open_produces_opposite_ctrl_directions(self, libero_scene_xml):
-        """Round 28 (#168): ``gripper=+1`` (close) and ``gripper=-1``
-        (open) must produce ctrl values that move in OPPOSITE directions
-        per finger.
+        """Round 28 (#168): close-command vs open-command must produce
+        ctrl values that move in OPPOSITE directions per finger.
 
         Pre-fix bug: writing the raw scalar to both fingers meant
-        ``+1`` → finger1 ctrl=0.04 (OPEN, wrong direction!), finger2
-        ctrl=0 (closed). And ``-1`` → finger1 ctrl=0 (closed), finger2
-        ctrl=-0.04 (OPEN). The two commands didn't produce reversed
-        outputs — they each had one finger going wrong, making the
+        close and open commands didn't actually produce reversed
+        outputs — each had one finger going wrong, making the
         gripper effectively un-actuable.
 
-        Post-fix: opposite signs of input produce opposite-sign deltas
-        for ``current_action``, and the bias/weight rescale preserves
-        that into the ctrl values."""
+        Post-fix: opposite signs of (round-41-converted) input produce
+        opposite-sign deltas for ``current_action``, and the
+        bias/weight rescale preserves that into the ctrl values.
+
+        Round 41 (#168) update: input is in RLDS convention (0=close,
+        1=open). The OSC controller's internal ``-sign(2x-1)``
+        transform converts to robosuite's (+1=close, -1=open)."""
         pytest.importorskip("mujoco")
         pytest.importorskip("robosuite")
         import mujoco
@@ -3635,11 +3644,13 @@ class TestInstallActionController:
                 np.array(ctrl._gripper_current_action),
             )
 
-        ctrl_close, current_close = _drive(+1.0)
-        ctrl_open, current_open = _drive(-1.0)
+        # RLDS convention: 0.0 = close, 1.0 = open.
+        ctrl_close, current_close = _drive(0.0)
+        ctrl_open, current_open = _drive(1.0)
 
         # current_action should be opposite-signed for the two
-        # commands (since ramp = ±[-1, +1] * speed * sign(input)).
+        # commands (since the round-41 transform inverts sign and the
+        # ramp = ±[-1, +1] * speed * sign(transformed_input)).
         np.testing.assert_array_almost_equal(current_close, -current_open)
         # And the ctrl deltas (after bias/weight rescale) too:
         # they should be opposite-signed deltas around the neutral
@@ -3692,11 +3703,12 @@ class TestInstallActionController:
             "roll": [0.0, 0.0],
             "pitch": [0.0, 0.0],
             "yaw": [0.0, 0.0],
-            "gripper": [1.0, 1.0],  # sustained close
+            "gripper": [0.0, 0.0],  # sustained close (RLDS: 0=close)
         }
 
         # Call apply() three times. Each call ramps current_action by
-        # ~0.25 (25 substeps × 0.01 speed × sign=+1) toward saturation.
+        # ~0.25 toward saturation (after round-41 transform, RLDS 0.0
+        # → robosuite +1 → 25 substeps × 0.01 speed × sign=+1 → ramp).
         ctrl.apply(action, sim._world._model, sim._world._data, "robot")  # type: ignore[attr-defined]
         first = np.array(ctrl._gripper_current_action)
         ctrl.apply(action, sim._world._model, sim._world._data, "robot")  # type: ignore[attr-defined]
@@ -3744,6 +3756,71 @@ class TestInstallActionController:
 
         ctrl.reset()
         np.testing.assert_array_equal(ctrl._gripper_current_action, np.zeros(2))
+
+    def test_round_41_rlds_to_robosuite_gripper_transform(self, libero_scene_xml):
+        """Round 41 (#168): the OSC controller applies NVIDIA's
+        ``normalize_gripper_action + invert_gripper_action`` chain
+        internally. Pin the truth table:
+
+        - RLDS 0.0 (close) → ``-sign(2*0-1) = -sign(-1) = +1`` →
+          robosuite +1 (close) → ramp ``[-0.01, +0.01]`` →
+          ``current_action = [-0.25, +0.25]`` after one apply
+        - RLDS 1.0 (open) → ``-sign(2*1-1) = -sign(+1) = -1`` →
+          robosuite -1 (open) → ramp ``[+0.01, -0.01]`` →
+          ``current_action = [+0.25, -0.25]`` after one apply
+        - RLDS 0.5 (no-op) → ``-sign(0) = 0`` → ramp ``[0, 0]`` →
+          ``current_action`` unchanged
+
+        Pin so a future refactor that drops the round-41 transform
+        (e.g. moves it to a different layer + forgets to call it)
+        regresses the polarity bug that left ``success_rate=0``
+        despite all the structural fixes from rounds 36-40."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+
+        def _apply_one_step(gripper_in: float) -> np.ndarray:
+            sim = FakeSim(data_config="panda")
+            sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+            sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+            mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+            adapter._install_action_controller(sim)
+            ctrl = sim._world._backend_state.get("action_controller")
+            assert ctrl is not None
+            action = {
+                "x": [0.0, 0.0],
+                "y": [0.0, 0.0],
+                "z": [0.0, 0.0],
+                "roll": [0.0, 0.0],
+                "pitch": [0.0, 0.0],
+                "yaw": [0.0, 0.0],
+                "gripper": [gripper_in, gripper_in],
+            }
+            ctrl.apply(action, sim._world._model, sim._world._data, "robot")  # type: ignore[attr-defined]
+            return np.array(ctrl._gripper_current_action)
+
+        # RLDS 0.0 = close → robosuite +1 → ramp [-0.25, +0.25] (toward closed).
+        np.testing.assert_array_almost_equal(
+            _apply_one_step(0.0), np.array([-0.25, 0.25]),
+            err_msg="RLDS 0.0 should drive ramp toward [-0.25, +0.25] (close)",
+        )
+        # RLDS 1.0 = open → robosuite -1 → ramp [+0.25, -0.25] (toward open).
+        np.testing.assert_array_almost_equal(
+            _apply_one_step(1.0), np.array([0.25, -0.25]),
+            err_msg="RLDS 1.0 should drive ramp toward [+0.25, -0.25] (open)",
+        )
+        # RLDS 0.5 = midpoint → -sign(0) = 0 → no ramp.
+        np.testing.assert_array_almost_equal(
+            _apply_one_step(0.5), np.zeros(2),
+            err_msg="RLDS 0.5 should produce zero ramp (no motion)",
+        )
 
     def test_action_log_disabled_by_default(self, libero_scene_xml, monkeypatch):
         """Round 29 (#168): ``STRANDS_LIBERO_ACTION_LOG`` is opt-in.
