@@ -612,9 +612,47 @@ class LiberoAdapter(BenchmarkProtocol):
         # _apply_canonical_state - prewarm has already done both.
         # Bump _episode_count manually so ep1+ follows the normal
         # per-episode reload + RNG-sample lifecycle.
+        #
+        # Defensive sanity-check (#168 round 18): even when the
+        # ``libero_prewarm_path`` flag is set and matches
+        # ``self.scene_path``, verify that the current model size
+        # still matches what prewarm worked on. If the model has
+        # been mutated since prewarm ran (e.g. an unexpected
+        # ``sim.add_robot`` call between prewarm and
+        # evaluate_benchmark, which would weld in a redundant Panda
+        # and change ``model.nq``), the flag is stale and the
+        # fast-path would skip both load_scene AND the canonical
+        # state restore - leaving the recorder to capture qpos0 of
+        # a 2-Panda model. Fail loud at WARNING and fall through to
+        # the normal lifecycle so on_episode_start can recover.
         backend_state = getattr(getattr(sim, "_world", None), "_backend_state", None)
         prewarm_path = backend_state.get("libero_prewarm_path") if isinstance(backend_state, dict) else None
         is_prewarm_fresh_ep0 = self._episode_count == 0 and self.scene_path and prewarm_path == self.scene_path
+
+        # Sanity-check: if the flag is set but the model size doesn't
+        # match init_states[0], the model has been mutated since
+        # prewarm ran. Don't take the fast-path; let on_episode_start
+        # do the full reload + canonical-state apply. WARNING-level
+        # so users can detect their bad call ordering.
+        if is_prewarm_fresh_ep0 and self._init_states is not None and self._init_states.shape[0] > 0:
+            world = getattr(sim, "_world", None)
+            model = getattr(world, "_model", None) if world is not None else None
+            if model is not None:
+                expected_width = 1 + int(getattr(model, "nq", 0)) + int(getattr(model, "nv", 0))
+                actual_width = int(self._init_states[0].shape[0])
+                if actual_width != expected_width:
+                    logger.warning(
+                        "LiberoAdapter.on_episode_start: prewarm-fresh flag is set but "
+                        "model size mismatches init_states[0] (1+nq+nv=%d, init_states[0].shape=%d). "
+                        "This usually means sim.add_robot or another model-mutating call ran "
+                        "between prewarm() and evaluate_benchmark, recompiling the spec and "
+                        "invalidating prewarm's setup. Falling through to normal lifecycle.",
+                        expected_width,
+                        actual_width,
+                    )
+                    is_prewarm_fresh_ep0 = False
+                    if isinstance(backend_state, dict):
+                        backend_state.pop("libero_prewarm_path", None)
 
         if is_prewarm_fresh_ep0:
             # Fast-path: prewarm already loaded the scene and applied
@@ -770,11 +808,21 @@ class LiberoAdapter(BenchmarkProtocol):
 
         Recommended call site (e.g. ``examples/libero_mujoco.py``)::
 
-            sim.load_scene(spec.scene_path)
-            sim.add_robot("robot", data_config="panda")
-            spec.prewarm(sim)                  # install viz_option + mj_forward early
-            sim.start_cameras_recording(...)   # recorder's first frame is now clean
+            sim.load_scene(spec.scene_path)        # scene-supplied Panda is in the loaded MJCF
+            spec.prewarm(sim)                      # registers wrapper + viz_option + init_state[0] + mj_forward
+            sim.start_cameras_recording(...)       # recorder's first frame is the canonical ready pose
             result = sim.evaluate_benchmark(...)
+
+        IMPORTANT: do NOT call ``sim.add_robot("robot", data_config="panda")``
+        between ``load_scene`` and ``prewarm`` for LIBERO scenes. The
+        scene MJCF already contains the Panda; ``add_robot`` would weld
+        a redundant Panda into the spec via spec recompile, bumping
+        ``model.nq`` past what ``init_states[0]`` was sized for, and
+        prewarm's init-state apply would silently no-op (logged at
+        WARNING). This is bug-D-residual #168 round 18; the
+        ``_register_default_robot`` step inside prewarm wraps the
+        scene-supplied Panda automatically without needing a separate
+        ``add_robot`` call.
 
         Assumes ``sim`` already has the scene loaded (via
         ``sim.load_scene``). Adapters built from a BDDL without a
@@ -901,8 +949,21 @@ class LiberoAdapter(BenchmarkProtocol):
             # canonical-state branch does - prewarm is a hint, not a
             # hard contract. on_episode_start's _apply_init_state_branch
             # will surface the same width mismatch with strict=True.
-            logger.debug(
-                "LiberoAdapter.prewarm: init_state[0] width %d != 1+nq+nv=%d; skipping",
+            #
+            # Logged at WARNING (not DEBUG) because this is almost
+            # always the symptom of a bad call ordering: the example
+            # script called ``sim.add_robot`` (or another spec-recompiling
+            # operation) between ``sim.load_scene`` and ``spec.prewarm``,
+            # welding a redundant robot into the spec. That recompile
+            # bumps ``nq`` past what the LIBERO ``init_states[0]`` was
+            # sized for, and prewarm silently no-ops here. Visible at
+            # WARNING level, users can spot the mistake without enabling
+            # debug logging (#168 round 18 verification).
+            logger.warning(
+                "LiberoAdapter.prewarm: init_state[0] width %d != 1+nq+nv=%d; skipping init-state apply. "
+                "This usually means sim.add_robot (or another spec-recompiling call) ran between "
+                "sim.load_scene and spec.prewarm. Recommended call order: load_scene -> prewarm -> "
+                "start_cameras_recording -> evaluate_benchmark, with NO sim.add_robot between them.",
                 state.shape[0],
                 expected_width,
             )

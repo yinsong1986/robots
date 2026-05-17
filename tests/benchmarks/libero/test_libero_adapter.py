@@ -1981,6 +1981,137 @@ class TestPrewarmFreshEpisodeZero:
         # Stale flag → normal lifecycle → load_scene called.
         assert load_scene_calls == [str(scene)]
 
+    def test_ep0_fast_path_skipped_on_model_size_mismatch(self, tmp_path, caplog):
+        """When the prewarm flag is set AND scene_path matches, but the
+        current model's nq+nv doesn't match init_states[0] width, the
+        model has been mutated since prewarm ran (e.g. a redundant
+        ``sim.add_robot`` welded in another robot). The fast-path
+        sanity-check detects this and falls through to the normal
+        lifecycle, logging at WARNING.
+
+        Pin for #168 round-18 verification: rounds 17 fast-path took
+        the flag at face value and skipped load_scene + canonical-state
+        even when prewarm's init-state apply had silently no-op'd due
+        to a model-size mismatch caused by an example-script
+        ``sim.add_robot`` between ``sim.load_scene`` and ``spec.prewarm``.
+        Result: recorder captured qpos0 of the 2-Panda model.
+        """
+        pytest.importorskip("mujoco")
+        import logging
+
+        scene = tmp_path / "scene.xml"
+        scene.write_text("<mujoco><worldbody/></mujoco>")
+        # init_states is sized for nq=4, nv=4 (1+4+4 = 9-wide).
+        states = np.zeros((1, 9), dtype=np.float64)
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=str(scene),
+            install_cameras=False,
+            apply_scene_keyframe=False,
+            init_states=states,
+        )
+        sim = FakeSim(data_config="panda")
+        # Set the prewarm flag (simulating a successful-looking prewarm).
+        sim._world._backend_state["libero_prewarm_path"] = str(scene)
+
+        # But the current model has nq=10, nv=10 (1+10+10 = 21-wide),
+        # NOT 9. Sanity-check detects this and falls through.
+        class _StaleModel:
+            nq = 10
+            nv = 10
+
+        sim._world._model = _StaleModel()  # type: ignore[attr-defined]
+
+        load_scene_calls: list = []
+        original_load_scene = sim.load_scene
+
+        def tracking_load_scene(scene_path):
+            load_scene_calls.append(scene_path)
+            return original_load_scene(scene_path)
+
+        with caplog.at_level(logging.WARNING, logger="strands_robots.benchmarks.libero.adapter"):
+            with patch.object(sim, "load_scene", side_effect=tracking_load_scene):
+                adapter.on_episode_start(sim, random.Random(0))
+
+        # Sanity-check fired: load_scene called (normal lifecycle, not fast-path).
+        assert load_scene_calls == [str(scene)], f"expected load_scene to be called; got {load_scene_calls}"
+        # Flag was cleared by the sanity-check.
+        assert "libero_prewarm_path" not in sim._world._backend_state
+        # WARNING was logged so the user can detect the bad call ordering.
+        assert any("model size mismatches init_states[0]" in r.message for r in caplog.records), (
+            f"expected WARNING about model-size mismatch; got: {[r.message for r in caplog.records]}"
+        )
+
+    def test_prewarm_init_state_width_mismatch_logs_at_warning(self, caplog):
+        """Width mismatch in ``_apply_init_state_for_prewarm`` logs at
+        WARNING (not DEBUG) so users can detect a bad call ordering
+        without enabling debug logging.
+
+        Pin for #168 round 18: the failure mode is almost always a
+        ``sim.add_robot`` between ``sim.load_scene`` and
+        ``spec.prewarm`` recompiling the spec and bumping ``model.nq``
+        past what ``init_states[0]`` was sized for. The skip is
+        silent at DEBUG; at WARNING it's visible by default.
+        """
+        import logging
+
+        pytest.importorskip("mujoco")
+        # init_states width 5 (nq=2, nv=2 -> 1+2+2=5)
+        states = np.zeros((1, 5), dtype=np.float64)
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+            init_states=states,
+        )
+        sim = FakeSim(data_config="panda")
+
+        class _Model:
+            nq = 4  # mismatch: 1+4+4=9, not 5
+            nv = 4
+            na = 0
+
+        class _Data:
+            def __init__(self) -> None:
+                self.qpos = np.zeros(4)
+                self.qvel = np.zeros(4)
+                self.time = 0.0
+
+        sim._world._model = _Model()  # type: ignore[attr-defined]
+        sim._world._data = _Data()  # type: ignore[attr-defined]
+
+        class _StubMj:
+            class mjtVisFlag:
+                mjVIS_JOINT = 0
+                mjVIS_ACTUATOR = 0
+                mjVIS_COM = 0
+
+            class MjvOption:
+                def __init__(self):
+                    self.geomgroup = [1] * 6
+                    self.sitegroup = [1] * 6
+                    self.flags = [0] * 64
+
+            @staticmethod
+            def mjv_defaultOption(opt):
+                pass
+
+            @staticmethod
+            def mj_forward(model, data):
+                pass
+
+        with caplog.at_level(logging.WARNING, logger="strands_robots.benchmarks.libero.adapter"):
+            with patch.dict("sys.modules", {"mujoco": _StubMj}):
+                adapter.prewarm(sim)
+
+        # WARNING was logged (not DEBUG).
+        assert any("init_state[0] width 5 != 1+nq+nv=9" in r.message for r in caplog.records), (
+            f"expected WARNING about width mismatch; got: {[r.message for r in caplog.records]}"
+        )
+        # Flag was NOT set (skip path).
+        assert "libero_prewarm_path" not in sim._world._backend_state
+
 
 # Scene <keyframe> application (#166 follow-up)
 
