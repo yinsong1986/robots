@@ -37,6 +37,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
 from strands_robots.benchmarks.libero.bddl_parser import (
     BDDLParseError,
     BDDLProblem,
@@ -125,7 +127,7 @@ class LiberoAdapter(BenchmarkProtocol):
         *,
         scene_path: str | None = None,
         max_steps: int | None = None,
-        init_jitter: float = 0.02,
+        init_jitter: float = 0.0,
         install_cameras: bool = True,
         cameras: dict[str, dict[str, Any]] | None = None,
         eef_body_name: str = "hand",
@@ -148,8 +150,15 @@ class LiberoAdapter(BenchmarkProtocol):
                 if enabled (see below).
             max_steps: Override the class-level 300.
             init_jitter: Per-episode ±jitter (metres) applied to xy of every
-                object referenced by ``(:init (on A B))`` clauses. Set to 0
-                to disable jitter.
+                object referenced by ``(:init (on A B))`` clauses. Default
+                ``0.0`` matches LIBERO's deterministic-reset convention -
+                the upstream training data is generated with fixed init
+                states per ``(task, seed)`` and the GR00T-LIBERO checkpoint
+                expects to see those exact poses (#166). Pass a positive
+                value (e.g. ``0.02``) to layer per-episode randomization on
+                top of the canonical state - useful for evaluating
+                *generalization*, but expect lower nominal success rates
+                because the policy is operating slightly out-of-distribution.
             install_cameras: When ``True`` (default), install the cameras
                 in :attr:`LIBERO_CAMERAS` (or ``cameras`` override) on
                 episode start. Set to ``False`` if your scene MJCF already
@@ -205,28 +214,35 @@ class LiberoAdapter(BenchmarkProtocol):
                 ``Gr00tPolicy._build_service_observation`` finds them by
                 bare-key lookup. Pass an empty dict to disable renaming.
             apply_scene_keyframe: When ``True`` (default) AND a scene was
-                loaded AND the compiled MuJoCo model has at least one
-                ``<keyframe>`` element, :meth:`on_episode_start` calls
-                ``mujoco.mj_resetDataKeyframe(model, data, scene_keyframe_index)``
-                AFTER ``super().on_episode_start`` and any camera install.
-                This is the fix for #166: ``mj_makeData`` (inside
-                :meth:`Simulation.load_scene`) and ``mj_resetData`` (in
-                :meth:`Simulation.reset`) both initialise qpos from the
-                joint-default ``qpos0`` and **silently ignore MJCF
-                ``<keyframe>`` blocks**. RoboSuite-emitted LIBERO scenes
-                encode their canonical home pose (free-joint object
-                positions, gripper open/close, robot home qpos) in a
-                ``<keyframe>``; without an explicit ``mj_resetDataKeyframe``
-                call, free-joint objects snap to ``(0, 0, 0, 1, 0, 0, 0)``
-                (origin + identity quat) on every reset, which surfaces as
-                ``success_rate=0.00`` because ep2+ start out-of-distribution.
-                Set to ``False`` for non-LIBERO BDDL specs that don't ship
-                a keyframe (the helper no-ops when ``model.nkey == 0``
-                anyway, so the override is mostly diagnostic).
+                loaded, :meth:`on_episode_start` restores qpos/qvel to the
+                scene's canonical home state AFTER ``super().on_episode_start``
+                and any camera install. Two branches:
+
+                * **Preferred** — when ``model.nkey > 0`` (MJCF declares a
+                  ``<keyframe>``, which LIBERO-authored hand-written scenes
+                  do): calls ``mujoco.mj_resetDataKeyframe(model, data,
+                  scene_keyframe_index)``.
+                * **Fallback** — when ``model.nkey == 0`` (MJCFs from the
+                  procedural :meth:`_generate_scene_from_bddl` path don't
+                  carry a keyframe): snapshot-and-restore. The first
+                  episode after a scene compile captures
+                  ``data.qpos.copy()`` / ``data.qvel.copy()``; every
+                  subsequent episode does ``np.copyto(data.qpos,
+                  snapshot.qpos)`` + ``mj_forward`` so derived state
+                  reflects the canonical pose. This is the actual fix for
+                  #166's ``success_rate=0.00`` symptom on the codepath
+                  ``examples/libero_mujoco.py`` exercises.
+
+                The two branches produce equivalent observable state, so
+                tests that pin one work for the other; see
+                ``TestApplyCanonicalState``. Set to ``False`` to disable
+                both branches (useful for diagnostic comparisons against
+                the pre-fix behaviour).
             scene_keyframe_index: Which ``<keyframe>`` to apply when
-                ``apply_scene_keyframe`` is true. Defaults to ``0`` (first
-                keyframe), which is the LIBERO convention. Pass a different
-                index to select a non-default home pose.
+                the keyframe branch is taken (``model.nkey > 0``). Defaults
+                to ``0`` (first keyframe), which is the LIBERO convention.
+                Pass a different index to select a non-default home pose.
+                Ignored when the snapshot fallback fires.
             bddl_source: Original BDDL text - stored on the adapter so
                 the scene generator can pass it back to ``libero`` (which
                 only accepts a *file* path). Set automatically by
@@ -274,8 +290,15 @@ class LiberoAdapter(BenchmarkProtocol):
                 "robot0_eye_in_hand_image": "wrist_image",
             }
         )
-        self._apply_scene_keyframe = bool(apply_scene_keyframe)
+        self._apply_canonical_state_enabled = bool(apply_scene_keyframe)
         self._scene_keyframe_index = int(scene_keyframe_index)
+        # Snapshot-and-restore fallback for procedurally-generated MJCFs that
+        # don't ship a <keyframe> (the case the post-#168 verification
+        # exposed). Captured on the first episode after super() +
+        # _install_libero_cameras have run; replayed on every subsequent
+        # episode so qpos/qvel land on the same canonical state every time.
+        self._canonical_qpos: np.ndarray | None = None
+        self._canonical_qvel: np.ndarray | None = None
         self._bddl_source = bddl_source
         self._bddl_path = bddl_path
         self._success_fn: Callable[[SimEngine], bool] = compile_goal(problem.goal)
@@ -289,7 +312,7 @@ class LiberoAdapter(BenchmarkProtocol):
         *,
         scene_path: str | None = None,
         max_steps: int | None = None,
-        init_jitter: float = 0.02,
+        init_jitter: float = 0.0,
         install_cameras: bool = True,
         cameras: dict[str, dict[str, Any]] | None = None,
         eef_body_name: str = "hand",
@@ -333,7 +356,7 @@ class LiberoAdapter(BenchmarkProtocol):
         *,
         scene_path: str | None = None,
         max_steps: int | None = None,
-        init_jitter: float = 0.02,
+        init_jitter: float = 0.0,
         install_cameras: bool = True,
         cameras: dict[str, dict[str, Any]] | None = None,
         eef_body_name: str = "hand",
@@ -449,8 +472,8 @@ class LiberoAdapter(BenchmarkProtocol):
         super().on_episode_start(sim, rng)
         if self._install_cameras:
             self._install_libero_cameras(sim)
-        if scene_was_loaded and self._apply_scene_keyframe:
-            self._apply_scene_keyframe_to_sim(sim)
+        if scene_was_loaded and self._apply_canonical_state_enabled:
+            self._apply_canonical_state(sim)
         if self._init_jitter > 0:
             self._apply_init_jitter(sim, rng)
 
@@ -733,44 +756,75 @@ class LiberoAdapter(BenchmarkProtocol):
                 else:
                     logger.warning("LiberoAdapter: add_camera(%r) failed: %s", cam_name, msg)
 
-    def _apply_scene_keyframe_to_sim(self, sim: SimEngine) -> None:
-        """Apply MJCF ``<keyframe>`` to ``sim``'s qpos / qvel / ctrl.
+    def _apply_canonical_state(self, sim: SimEngine) -> None:
+        """Restore qpos / qvel to the scene's canonical home state.
 
-        This is the #166 fix: ``mj_makeData`` (in ``Simulation.load_scene``)
-        and ``mj_resetData`` (in ``Simulation.reset``) initialise qpos from
-        the joint-default ``qpos0`` and silently ignore MJCF ``<keyframe>``
-        elements. RoboSuite-emitted LIBERO scenes encode the canonical
-        home pose (object positions, gripper open/close, robot home qpos)
-        in a keyframe — this method explicitly applies it via
-        ``mujoco.mj_resetDataKeyframe`` so episode 2+ start from the same
-        canonical state as episode 1.
+        Two branches, in order of preference:
+
+        1. **Keyframe** (``model.nkey > 0``): call
+           ``mujoco.mj_resetDataKeyframe(model, data, scene_keyframe_index)``.
+           The MJCF carries the canonical pose explicitly via a
+           ``<keyframe>`` element - LIBERO-authored hand-written scenes
+           (the ones in upstream ``libero/libero/assets/scenes/``) ship one.
+        2. **Snapshot-and-restore** (``model.nkey == 0``): cache
+           ``data.qpos`` / ``data.qvel`` on the FIRST episode after a
+           scene compile (after ``super().on_episode_start`` and
+           ``_install_libero_cameras`` have run); restore the cached
+           snapshot on every subsequent episode. The procedurally-
+           generated MJCFs from :meth:`_generate_scene_from_bddl` (PR #165)
+           don't carry a keyframe, so this branch is the one that
+           actually fires on the codepath ``examples/libero_mujoco.py``
+           exercises today (#166's reported symptom).
+
+        Both branches end with ``mj_forward`` so derived state
+        (``xpos`` / ``xquat`` / sensor data) reflects the canonical
+        ``qpos`` before the next ``get_observation`` / ``render`` call.
 
         Best-effort:
 
-        * Sims without an exposed compiled MuJoCo model (non-MuJoCo
-          backends) → debug-log + skip.
-        * Models with no ``<keyframe>`` → debug-log + skip (the joint-
-          default qpos0 is then assumed to be canonical).
-        * ``scene_keyframe_index`` out of range → log at WARNING and skip
-          (out-of-range is a config error, not a quietly silent miss).
-        * ``mujoco`` not importable → debug-log + skip (mirrors the
-          fallback behaviour of :meth:`_existing_camera_names`).
+        * Sims without an exposed compiled MuJoCo model → debug-log + skip.
+        * ``scene_keyframe_index`` out of range when ``nkey > 0`` → log
+          at WARNING and skip (out-of-range is a config error).
+        * ``mujoco`` not importable → debug-log + skip.
+        * Snapshot shape mismatches the current ``qpos`` (e.g. the
+          model recompiled with a different ``nq`` between episodes,
+          which is unusual) → re-capture instead of restoring.
 
-        Holds ``sim._lock`` if the sim exposes one - matches the locking
-        contract of ``Simulation.reset`` so we don't race a worker holding
-        a stale qpos pointer.
+        Holds ``sim._lock`` if the sim exposes one to match the locking
+        contract of :meth:`Simulation.reset` and :meth:`Simulation.send_action`
+        - prevents racing a worker holding a stale qpos pointer.
         """
         world = getattr(sim, "_world", None)
         model = getattr(world, "_model", None) if world is not None else None
         data = getattr(world, "_data", None) if world is not None else None
         if model is None or data is None:
-            logger.debug("LiberoAdapter: sim has no compiled MuJoCo model/data; skipping keyframe application")
+            logger.debug("LiberoAdapter: sim has no compiled MuJoCo model/data; skipping canonical-state apply")
+            return
+
+        try:
+            import mujoco as _mj
+        except ImportError:
+            logger.debug("LiberoAdapter: mujoco not importable; skipping canonical-state apply")
             return
 
         nkey = int(getattr(model, "nkey", 0))
-        if nkey <= 0:
-            logger.debug("LiberoAdapter: model has no <keyframe>; relying on qpos0 from joint defaults")
-            return
+        lock = getattr(sim, "_lock", None)
+
+        if nkey > 0:
+            self._apply_keyframe_branch(sim, model, data, _mj, lock, nkey)
+        else:
+            self._apply_snapshot_branch(sim, model, data, _mj, lock)
+
+    def _apply_keyframe_branch(
+        self,
+        sim: SimEngine,  # noqa: ARG002 - kept for symmetry with _apply_snapshot_branch
+        model: Any,
+        data: Any,
+        mj: Any,
+        lock: Any,
+        nkey: int,
+    ) -> None:
+        """Keyframe branch of :meth:`_apply_canonical_state`."""
         if self._scene_keyframe_index < 0 or self._scene_keyframe_index >= nkey:
             logger.warning(
                 "LiberoAdapter: scene_keyframe_index=%d out of range [0, %d); skipping",
@@ -778,37 +832,94 @@ class LiberoAdapter(BenchmarkProtocol):
                 nkey,
             )
             return
-
-        try:
-            import mujoco as _mj
-        except ImportError:
-            logger.debug("LiberoAdapter: mujoco not importable; skipping keyframe application")
-            return
-
-        lock = getattr(sim, "_lock", None)
         try:
             if lock is not None:
                 with lock:
-                    _mj.mj_resetDataKeyframe(model, data, self._scene_keyframe_index)
-                    # Ensure derived state (xpos / xquat / sensor data) reflects
-                    # the new qpos so the very next get_observation / render
-                    # sees the canonical world without needing a step() first.
-                    _mj.mj_forward(model, data)
+                    mj.mj_resetDataKeyframe(model, data, self._scene_keyframe_index)
+                    mj.mj_forward(model, data)
             else:
-                _mj.mj_resetDataKeyframe(model, data, self._scene_keyframe_index)
-                _mj.mj_forward(model, data)
-        except Exception as e:  # noqa: BLE001 - never fatal during keyframe application
+                mj.mj_resetDataKeyframe(model, data, self._scene_keyframe_index)
+                mj.mj_forward(model, data)
+        except Exception as e:  # noqa: BLE001 - never fatal
             logger.warning(
                 "LiberoAdapter: mj_resetDataKeyframe(%d) failed: %s",
                 self._scene_keyframe_index,
                 e,
             )
             return
-
         logger.debug(
             "LiberoAdapter: applied <keyframe> %d to canonical qpos",
             self._scene_keyframe_index,
         )
+
+    def _apply_snapshot_branch(
+        self,
+        sim: SimEngine,  # noqa: ARG002 - kept for symmetry with _apply_keyframe_branch
+        model: Any,
+        data: Any,
+        mj: Any,
+        lock: Any,
+    ) -> None:
+        """Snapshot-and-restore branch of :meth:`_apply_canonical_state`.
+
+        First episode: capture ``data.qpos`` / ``data.qvel``. Subsequent
+        episodes: restore the cached snapshot via ``np.copyto`` and
+        ``mj_forward``. Procedurally-generated MJCFs (#165) hit this
+        branch because they don't ship a ``<keyframe>``.
+        """
+        try:
+            qpos = data.qpos
+            qvel = data.qvel
+        except AttributeError as e:
+            logger.debug("LiberoAdapter: data has no qpos/qvel attrs: %s", e)
+            return
+
+        # First episode (or model recompile changed nq) -> capture, don't
+        # restore. The snapshot is taken after super() + _install_libero_cameras
+        # so it reflects the post-setup canonical state.
+        needs_capture = (
+            self._canonical_qpos is None
+            or self._canonical_qpos.shape != qpos.shape
+            or self._canonical_qvel is None
+            or self._canonical_qvel.shape != qvel.shape
+        )
+        if needs_capture:
+            try:
+                self._canonical_qpos = np.array(qpos, copy=True)
+                self._canonical_qvel = np.array(qvel, copy=True)
+            except Exception as e:  # noqa: BLE001 - capture is best-effort
+                logger.debug("LiberoAdapter: snapshot capture failed: %s", e)
+                self._canonical_qpos = None
+                self._canonical_qvel = None
+                return
+            logger.debug(
+                "LiberoAdapter: captured canonical qpos snapshot (nq=%d, nv=%d)",
+                self._canonical_qpos.shape[0],
+                self._canonical_qvel.shape[0],
+            )
+            return
+
+        # Subsequent episode - restore the snapshot. The needs_capture
+        # check above guarantees the snapshot fields are non-None here;
+        # narrow for mypy.
+        assert self._canonical_qpos is not None
+        assert self._canonical_qvel is not None
+        canonical_qpos = self._canonical_qpos
+        canonical_qvel = self._canonical_qvel
+        try:
+            if lock is not None:
+                with lock:
+                    np.copyto(qpos, canonical_qpos)
+                    np.copyto(qvel, canonical_qvel)
+                    mj.mj_forward(model, data)
+            else:
+                np.copyto(qpos, canonical_qpos)
+                np.copyto(qvel, canonical_qvel)
+                mj.mj_forward(model, data)
+        except Exception as e:  # noqa: BLE001 - never fatal
+            logger.warning("LiberoAdapter: snapshot restore failed: %s", e)
+            return
+        logger.debug("LiberoAdapter: restored canonical qpos snapshot")
 
     def _apply_init_jitter(self, sim: SimEngine, rng: random.Random) -> None:
         """Apply ±jitter to xy of every body referenced by ``(:init (on A B))``.

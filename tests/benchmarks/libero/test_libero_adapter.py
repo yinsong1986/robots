@@ -1054,7 +1054,7 @@ class TestRenameMjcfCameras:
 
 
 class TestApplySceneKeyframe:
-    """``LiberoAdapter._apply_scene_keyframe_to_sim`` calls
+    """``LiberoAdapter._apply_canonical_state`` calls
     ``mj_resetDataKeyframe`` after every ``load_scene`` so qpos starts at
     the canonical home pose RoboSuite encoded in the MJCF ``<keyframe>``.
     Without this, ``mj_makeData`` and ``mj_resetData`` initialise from
@@ -1112,7 +1112,10 @@ class TestApplySceneKeyframe:
         assert ("mj_forward", 0) in calls
 
     def test_no_keyframe_in_model_skips_application(self, tmp_path):
-        """Model with nkey==0 (e.g. a stub MJCF) must skip without warning."""
+        """Model with ``nkey == 0`` AND data without qpos/qvel attrs (e.g. a
+        non-MuJoCo backend) must skip the keyframe path entirely - no
+        ``mj_resetDataKeyframe`` calls fire. The snapshot fallback also
+        no-ops because the data object has no ``qpos`` to capture."""
 
         class _FakeModel:
             nkey = 0
@@ -1131,14 +1134,16 @@ class TestApplySceneKeyframe:
 
         sim = FakeSim(data_config="panda")
         sim._world._model = _FakeModel()  # type: ignore[attr-defined]
-        sim._world._data = object()  # type: ignore[attr-defined]
+        sim._world._data = object()  # no qpos/qvel  # type: ignore[attr-defined]
 
         mock_mj, calls = self._make_mock_mujoco()
         with patch.dict("sys.modules", {"mujoco": mock_mj}):
             adapter.on_episode_start(sim, random.Random(0))
 
-        # No keyframe in the model -> nothing to apply.
+        # Keyframe branch never fires (nkey==0); snapshot branch can't
+        # capture because data has no qpos attr -> overall no-op.
         assert calls == []
+        assert adapter._canonical_qpos is None
 
     def test_apply_scene_keyframe_false_disables(self, tmp_path):
         """Opt-out: apply_scene_keyframe=False skips the call even when
@@ -1324,7 +1329,274 @@ class TestApplySceneKeyframe:
             auto_generate_scene=False,
         )
         # Direct exercise of the helper - must not raise.
-        adapter._apply_scene_keyframe_to_sim(_BareSim())  # type: ignore[arg-type]
+        adapter._apply_canonical_state(_BareSim())  # type: ignore[arg-type]
+
+
+# Snapshot-and-restore branch (#166 follow-up review)
+
+
+class TestApplyCanonicalStateSnapshot:
+    """``_apply_canonical_state`` falls back to snapshot-and-restore when
+    ``model.nkey == 0`` (procedurally-generated MJCFs from #165 don't ship
+    a ``<keyframe>``). First episode after super() + camera install
+    captures ``data.qpos`` / ``data.qvel``; subsequent episodes restore
+    via ``np.copyto`` + ``mj_forward``. This is what actually fixes #166's
+    ``success_rate=0.00`` symptom on ``examples/libero_mujoco.py``.
+    """
+
+    def _make_mock_mujoco(self, calls: list[tuple[str, Any]] | None = None):
+        """Stub ``mujoco`` that records mj_resetDataKeyframe + mj_forward calls."""
+        if calls is None:
+            calls = []
+
+        class _Module:
+            @staticmethod
+            def mj_resetDataKeyframe(model, data, key):  # noqa: ARG004
+                calls.append(("mj_resetDataKeyframe", int(key)))
+
+            @staticmethod
+            def mj_forward(model, data):  # noqa: ARG004
+                calls.append(("mj_forward", None))
+
+        return _Module(), calls
+
+    def _make_data(self, qpos_vals: list[float], qvel_vals: list[float] | None = None):
+        """Bare ``data``-like object with mutable ``qpos`` / ``qvel`` arrays."""
+        import numpy as _np
+
+        class _D:
+            qpos: Any
+            qvel: Any
+
+        d = _D()
+        d.qpos = _np.array(qpos_vals, dtype=_np.float64)
+        d.qvel = _np.array(qvel_vals if qvel_vals is not None else [], dtype=_np.float64)
+        return d
+
+    def test_first_call_captures_snapshot_no_restore(self, tmp_path):
+        """First episode after a scene compile: snapshot is captured but
+        no ``np.copyto`` / ``mj_forward`` runs (nothing to restore TO yet)."""
+
+        class _FakeModel:
+            nkey = 0
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            install_cameras=False,
+        )
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        assert bddl_path is not None
+        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
+
+        sim = FakeSim(data_config="panda")
+        sim._world._model = _FakeModel()  # type: ignore[attr-defined]
+        sim._world._data = self._make_data([1.0, 2.0, 3.0], [0.1, 0.2])  # type: ignore[attr-defined]
+
+        mock_mj, calls = self._make_mock_mujoco()
+        with patch.dict("sys.modules", {"mujoco": mock_mj}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # Snapshot captured; no restore-side calls fired.
+        assert adapter._canonical_qpos is not None
+        assert list(adapter._canonical_qpos) == [1.0, 2.0, 3.0]
+        assert adapter._canonical_qvel is not None
+        assert list(adapter._canonical_qvel) == [0.1, 0.2]
+        # Neither mj_resetDataKeyframe (nkey=0) nor mj_forward (no
+        # restore on first capture) should have fired.
+        assert calls == []
+
+    def test_second_call_restores_from_snapshot_and_calls_mj_forward(self, tmp_path):
+        """Second episode after the same scene compile: snapshot is
+        ``np.copyto``'d into ``data.qpos`` and ``mj_forward`` runs so
+        derived state reflects the canonical pose."""
+        import numpy as _np
+
+        class _FakeModel:
+            nkey = 0
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            install_cameras=False,
+        )
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        assert bddl_path is not None
+        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
+
+        # Pre-seed the snapshot to simulate "this is episode 2+".
+        adapter._canonical_qpos = _np.array([10.0, 20.0, 30.0], dtype=_np.float64)
+        adapter._canonical_qvel = _np.array([1.1, 2.2], dtype=_np.float64)
+
+        sim = FakeSim(data_config="panda")
+        sim._world._model = _FakeModel()  # type: ignore[attr-defined]
+        # Current data is at "post-rollout state" - non-canonical.
+        sim._world._data = self._make_data([99.0, 99.0, 99.0], [9.9, 9.9])  # type: ignore[attr-defined]
+
+        mock_mj, calls = self._make_mock_mujoco()
+        with patch.dict("sys.modules", {"mujoco": mock_mj}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # qpos / qvel must now equal the canonical snapshot, not the
+        # 99.0 values that were there before.
+        assert list(sim._world._data.qpos) == [10.0, 20.0, 30.0]
+        assert list(sim._world._data.qvel) == [1.1, 2.2]
+        # mj_forward MUST have fired so derived state (xpos/xquat) is current.
+        assert ("mj_forward", None) in calls
+        # mj_resetDataKeyframe MUST NOT have fired (nkey == 0).
+        assert not any(c[0] == "mj_resetDataKeyframe" for c in calls)
+
+    def test_snapshot_shape_mismatch_recaptures(self, tmp_path):
+        """If a model recompile between episodes changed ``nq`` (unusual
+        but possible), the snapshot-shape check re-captures instead of
+        crashing on a copyto length mismatch."""
+        import numpy as _np
+
+        class _FakeModel:
+            nkey = 0
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            install_cameras=False,
+        )
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        assert bddl_path is not None
+        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
+
+        # Pre-seed a 5-element snapshot.
+        adapter._canonical_qpos = _np.zeros(5, dtype=_np.float64)
+        adapter._canonical_qvel = _np.zeros(4, dtype=_np.float64)
+
+        sim = FakeSim(data_config="panda")
+        sim._world._model = _FakeModel()  # type: ignore[attr-defined]
+        # Current data has 3-element qpos - shape mismatch.
+        sim._world._data = self._make_data([1.0, 2.0, 3.0], [0.1, 0.2])  # type: ignore[attr-defined]
+
+        mock_mj, calls = self._make_mock_mujoco()
+        with patch.dict("sys.modules", {"mujoco": mock_mj}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # Snapshot was re-captured (now 3 elements).
+        assert adapter._canonical_qpos.shape == (3,)
+        assert list(adapter._canonical_qpos) == [1.0, 2.0, 3.0]
+        # No mj_forward since this counts as a "first call" for the new shape.
+        assert calls == []
+
+    def test_apply_scene_keyframe_false_disables_snapshot_branch_too(self, tmp_path):
+        """``apply_scene_keyframe=False`` MUST disable BOTH branches -
+        keyframe AND snapshot. Otherwise users opting out can't actually
+        opt out."""
+
+        class _FakeModel:
+            nkey = 0
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            install_cameras=False,
+            apply_scene_keyframe=False,  # opt out
+        )
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        assert bddl_path is not None
+        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
+
+        sim = FakeSim(data_config="panda")
+        sim._world._model = _FakeModel()  # type: ignore[attr-defined]
+        sim._world._data = self._make_data([1.0, 2.0, 3.0])  # type: ignore[attr-defined]
+
+        mock_mj, calls = self._make_mock_mujoco()
+        with patch.dict("sys.modules", {"mujoco": mock_mj}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # Snapshot branch never ran.
+        assert adapter._canonical_qpos is None
+        assert calls == []
+
+    def test_keyframe_branch_takes_priority_over_snapshot_when_nkey_positive(self, tmp_path):
+        """When ``model.nkey > 0`` AND a snapshot has been previously
+        captured, the keyframe branch wins - we don't restore an old
+        snapshot over a model that explicitly declares its canonical
+        state via a ``<keyframe>``."""
+        import numpy as _np
+
+        class _FakeModel:
+            nkey = 1
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_cache_dir=str(cache_dir),
+            install_cameras=False,
+        )
+        bddl_path = adapter._resolve_bddl_path_for_libero()
+        assert bddl_path is not None
+        sha = hashlib.sha256(bddl_path.read_bytes()).hexdigest()
+        (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
+
+        # Pre-seed a stale snapshot.
+        adapter._canonical_qpos = _np.array([99.0], dtype=_np.float64)
+        adapter._canonical_qvel = _np.array([9.9], dtype=_np.float64)
+
+        sim = FakeSim(data_config="panda")
+        sim._world._model = _FakeModel()  # type: ignore[attr-defined]
+        sim._world._data = self._make_data([1.0], [0.1])  # type: ignore[attr-defined]
+
+        mock_mj, calls = self._make_mock_mujoco()
+        with patch.dict("sys.modules", {"mujoco": mock_mj}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # Keyframe path fired; data NOT mutated by the snapshot-restore path.
+        assert ("mj_resetDataKeyframe", 0) in calls
+        # qpos was NOT clobbered with the stale snapshot value.
+        assert list(sim._world._data.qpos) == [1.0]
+
+
+# init_jitter default (#167 Probe 2 folded into #168 per review)
+
+
+class TestInitJitterDefault:
+    """``init_jitter`` defaults to 0.0 to match LIBERO's deterministic-reset
+    convention. The GR00T-LIBERO checkpoint trains against fixed init
+    states per ``(task, seed)``; positive default jitter pushes the
+    policy slightly out-of-distribution from t=0.
+    """
+
+    def test_default_is_zero(self):
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        assert adapter._init_jitter == 0.0
+
+    def test_default_is_zero_via_from_file(self, tmp_path):
+        p = tmp_path / "task.bddl"
+        p.write_text(PICK_CUBE_BDDL)
+        adapter = LiberoAdapter.from_file(p)
+        assert adapter._init_jitter == 0.0
+
+    def test_default_is_zero_via_direct_constructor(self):
+        from strands_robots.benchmarks.libero.bddl_parser import parse_bddl
+
+        problem = parse_bddl(PICK_CUBE_BDDL)
+        adapter = LiberoAdapter(problem)
+        assert adapter._init_jitter == 0.0
+
+    def test_explicit_value_still_works(self):
+        """``init_jitter=0.02`` still works for users who want
+        per-episode randomization (e.g. evaluating *generalization*)."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, init_jitter=0.02)
+        assert adapter._init_jitter == 0.02
 
 
 # PolicyRunner + evaluate_benchmark integration
