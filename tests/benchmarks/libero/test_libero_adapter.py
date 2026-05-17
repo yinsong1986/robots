@@ -17,6 +17,7 @@ Covers:
 
 from __future__ import annotations
 
+import builtins
 import random
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,10 @@ class _FakeWorld:
     def __init__(self, robots: dict[str, _FakeRobot]):
         self.robots = dict(robots)
         self.cameras: dict[str, dict[str, Any]] = {}
+        # Backend state mirrors MuJoCoSimulation._world._backend_state -
+        # the canonical place for adapter-controlled state per
+        # SimWorld's docstring (e.g. viz_option, recording, dataset_recorder).
+        self._backend_state: dict[str, Any] = {}
 
 
 class FakeSim(SimEngine):
@@ -1158,187 +1163,193 @@ class TestRenameMjcfCameras:
         assert 'name="image"' in out
 
 
-class TestApplyLiberoVisualFixes:
-    """``_apply_libero_visual_fixes`` post-processes the compiled MJCF to
-    close the visual-fidelity gap to upstream LIBERO's reference render
-    (#168 round-8 bug E).
-
-    Two transforms:
-    * ``_hide_collision_geoms``: rgba alpha -> 0 on every group=0 geom
-      (collision capsules) so they don't render through the agentview
-      camera. Collision detection unaffected (rgba is purely visual).
-    * ``_augment_visual_block``: replace the spartan ``<visual>`` block
-      with one that has explicit headlight ambient (0.2,0.2,0.2),
-      diffuse (0.4,0.4,0.4), shadows, offscreen dimensions.
-
-    Combined effect on the cached LIBERO scene MJCF brings mean-RGB
-    closer to the reference video's wood-tone profile."""
-
-    def test_hide_collision_geoms_implicit_group_zero(self):
-        """Geoms WITHOUT a ``group="..."`` attribute default to group=0
-        in MuJoCo. RoboSuite-emitted MJCFs use this implicit form (verified
-        empirically: 0 occurrences of ``group="0"`` and ~100 ``<geom>``
-        elements with no group attribute on a real LIBERO_10 cache).
-        The transform must hide these even though the literal regex
-        match for ``group="0"`` returns no hits."""
-        from strands_robots.benchmarks.libero.adapter import _hide_collision_geoms
-
-        # Two geoms: one has explicit group="1" (visual), one has no group
-        # (implicit group=0, collision). Only the latter should have its
-        # alpha set to 0.
-        xml = (
-            '<geom name="visual" group="1" type="mesh" rgba="0.9 0.9 0.9 1"/>'
-            '<geom name="collision" type="mesh" rgba="0 0.5 0 1"/>'
-        )
-        out = _hide_collision_geoms(xml)
-        # Visual geom unchanged.
-        assert 'name="visual" group="1" type="mesh" rgba="0.9 0.9 0.9 1"' in out
-        # Collision geom has alpha=0.
-        assert 'name="collision" type="mesh" rgba="0 0.5 0 0"' in out
-
-    def test_hide_collision_geoms_explicit_group_zero(self):
-        """``group="0"`` set explicitly is also collision - same result."""
-        from strands_robots.benchmarks.libero.adapter import _hide_collision_geoms
-
-        xml = '<geom name="c" group="0" type="mesh" rgba="0 0 0.5 1"/>'
-        out = _hide_collision_geoms(xml)
-        assert 'rgba="0 0 0.5 0"' in out
-
-    def test_hide_collision_geoms_preserves_rgb(self):
-        """Only the alpha channel changes; r/g/b values are preserved
-        so any downstream code reading rgba directly (e.g. for debug
-        coloring) still gets meaningful values."""
-        from strands_robots.benchmarks.libero.adapter import _hide_collision_geoms
-
-        xml = '<geom name="c" type="mesh" rgba="0.123 0.456 0.789 1"/>'
-        out = _hide_collision_geoms(xml)
-        assert 'rgba="0.123 0.456 0.789 0"' in out
-
-    def test_hide_collision_geoms_no_rgba_left_alone(self):
-        """Geoms without an ``rgba="..."`` attribute fall through to
-        their material's color. The transform doesn't add rgba where
-        none was - leaves them alone."""
-        from strands_robots.benchmarks.libero.adapter import _hide_collision_geoms
-
-        xml = '<geom name="c" type="mesh" mesh="link0" material="MetalGray"/>'
-        out = _hide_collision_geoms(xml)
-        assert out == xml
-
-    def test_hide_collision_geoms_idempotent(self):
-        """Applying twice produces the same output as applying once.
-        Critical for the cache-key + post-process flow: if a user re-runs
-        with the same transform version, the cache hit doesn't need to
-        worry about re-applying."""
-        from strands_robots.benchmarks.libero.adapter import _hide_collision_geoms
-
-        xml = '<geom name="a" rgba="0 0.5 0 1"/><geom name="b" group="1" rgba="0.9 0.9 0.9 1"/>'
-        once = _hide_collision_geoms(xml)
-        twice = _hide_collision_geoms(once)
-        assert once == twice
-
-    def test_augment_visual_block_replaces_existing(self):
-        """A pre-existing ``<visual>`` block is replaced wholesale with
-        the canonical LIBERO one. The reviewer's suggested
-        ``<visual><map znear="0.001"/></visual>`` is what RoboSuite
-        emits and is what we replace."""
-        from strands_robots.benchmarks.libero.adapter import _augment_visual_block
-
-        xml = '<mujoco><visual><map znear="0.001"/></visual><worldbody/></mujoco>'
-        out = _augment_visual_block(xml)
-        assert "<headlight" in out
-        assert 'ambient="0.2 0.2 0.2"' in out
-        assert 'diffuse="0.4 0.4 0.4"' in out
-        # The original znear="0.001" is replaced by the canonical znear="0.1"
-        # plus fog / quality / global blocks.
-        assert 'znear="0.1"' in out
-        assert "<quality" in out
-        assert "<global" in out
-        # Old znear=0.001 gone.
-        assert 'znear="0.001"' not in out
-
-    def test_augment_visual_block_no_visual_block_no_op(self):
-        """MJCF without a ``<visual>`` element is left alone (defensive
-        against malformed inputs). Adding one would require structural
-        XML editing which is out of scope for the regex-based helper."""
-        from strands_robots.benchmarks.libero.adapter import _augment_visual_block
-
-        xml = "<mujoco><worldbody/></mujoco>"
-        assert _augment_visual_block(xml) == xml
-
-    def test_augment_visual_block_idempotent(self):
-        """Applying twice produces the same output as applying once."""
-        from strands_robots.benchmarks.libero.adapter import _augment_visual_block
-
-        xml = '<mujoco><visual><map znear="0.001"/></visual></mujoco>'
-        once = _augment_visual_block(xml)
-        twice = _augment_visual_block(once)
-        assert once == twice
-
-    def test_apply_libero_visual_fixes_combined(self):
-        """End-to-end: both transforms applied in sequence produce a
-        fully-fixed MJCF with collision geoms hidden AND visual block
-        boosted."""
-        from strands_robots.benchmarks.libero.adapter import _apply_libero_visual_fixes
-
-        xml = (
-            "<mujoco>"
-            '<visual><map znear="0.001"/></visual>'
-            "<worldbody>"
-            '<geom name="vis" group="1" rgba="0.5 0.5 0.5 1"/>'
-            '<geom name="col" rgba="0 0.5 0 1"/>'
-            "</worldbody>"
-            "</mujoco>"
-        )
-        out = _apply_libero_visual_fixes(xml)
-        # Visual block boosted.
-        assert 'ambient="0.2 0.2 0.2"' in out
-        # Visual geom (group=1) unchanged.
-        assert 'name="vis" group="1" rgba="0.5 0.5 0.5 1"' in out
-        # Collision geom alpha=0.
-        assert 'name="col" rgba="0 0.5 0 0"' in out
-
-    def test_apply_libero_visual_fixes_idempotent(self):
-        """Public entry point is idempotent: cache files written by
-        round-N and read by round-N+1 with the same transform_version
-        re-render identically."""
-        from strands_robots.benchmarks.libero.adapter import _apply_libero_visual_fixes
-
-        xml = (
-            "<mujoco>"
-            '<visual><map znear="0.001"/></visual>'
-            '<worldbody><geom name="c" rgba="0 0.5 0 1"/></worldbody>'
-            "</mujoco>"
-        )
-        once = _apply_libero_visual_fixes(xml)
-        twice = _apply_libero_visual_fixes(once)
-        assert once == twice
+class TestCacheTransformVersion:
+    """The cache-key derivation includes ``_LIBERO_MJCF_TRANSFORM_VERSION``
+    so a version bump invalidates stale on-disk caches generated by
+    prior post-process pipelines (#168 round-7+ history). Critical for
+    upgrade paths."""
 
     def test_cache_key_includes_transform_version(self):
-        """``_LIBERO_MJCF_TRANSFORM_VERSION`` is hashed into the
-        scene-cache key so a version bump invalidates stale on-disk
-        caches generated by prior versions. Critical for upgrade
-        paths where users pick up a new round and need their cache to
-        regenerate (e.g. pre-#168-r8 cache has un-fixed visual block
-        and visible collision geoms - we MUST NOT serve the stale
-        post-process)."""
+        """Different transform-version strings produce different cache keys
+        even when bddl + alias map are identical. Round 8 produced caches
+        with rgba-altered collision geoms and a stacked headlight in
+        ``<visual>``; round 9 reverts to upstream-verbatim MJCFs and
+        handles visualisation at render time. Cache-key version bump
+        ensures users pick up the regenerated XML automatically."""
         import strands_robots.benchmarks.libero.adapter as adapter_module
 
         adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, install_cameras=False)
         bddl_bytes = b"some bddl content"
 
-        # Capture the cache key under the current version.
         original_version = adapter_module._LIBERO_MJCF_TRANSFORM_VERSION
         key1 = adapter._scene_cache_key(bddl_bytes)
-
-        # Bump the version.
         try:
             adapter_module._LIBERO_MJCF_TRANSFORM_VERSION = "v999"
             key2 = adapter._scene_cache_key(bddl_bytes)
         finally:
             adapter_module._LIBERO_MJCF_TRANSFORM_VERSION = original_version
 
-        # Different version -> different cache key.
         assert key1 != key2
+
+    def test_current_transform_version_is_v3(self):
+        """Pin the current version. Round 8 = ``v2`` (collision rgba +
+        custom headlight, was wrong direction). Round 9 = ``v3``
+        (cache verbatim, render-time options). Bumping the version is
+        the contract that invalidates stale caches; the value MUST be
+        reviewed every time the transform pipeline changes."""
+        from strands_robots.benchmarks.libero.adapter import _LIBERO_MJCF_TRANSFORM_VERSION
+
+        assert _LIBERO_MJCF_TRANSFORM_VERSION == "v3"
+
+
+class TestInstallRenderOptions:
+    """``LiberoAdapter._install_render_options`` populates
+    ``sim._world._backend_state['viz_option']`` with an ``mjvOption``
+    matching upstream LIBERO's ``OffScreenRenderEnv`` viewer config
+    (#168 round-9 bug E correction).
+
+    Round 8 attempted to handle this at the MJCF level (rgba alpha=0
+    on collision geoms + custom ``<visual>`` headlight). Round 9
+    reverts that approach because:
+    - the headlight stacked on top of upstream's two ``<light>`` blocks
+      doubled the illumination (washing out contrast that made objects
+      visible),
+    - rgba edits to MJCF are non-canonical (upstream hides via
+      renderer options).
+
+    The new approach: store ``mjvOption`` on
+    ``world._backend_state['viz_option']`` at episode start; the
+    rendering layer reads it and threads through to
+    ``Renderer.update_scene(scene_option=...)``.
+    """
+
+    def test_install_render_options_populates_backend_state(self):
+        """End-to-end: after on_episode_start with a loaded scene,
+        sim._world._backend_state['viz_option'] is populated with a
+        configured MjvOption."""
+        mujoco = pytest.importorskip("mujoco")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            install_cameras=False,
+            apply_scene_keyframe=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        # Pretend a scene was loaded (the post-load hook is what fires
+        # _install_render_options); call it directly so we don't need a
+        # real MJCF on disk.
+        adapter._install_render_options(sim)
+
+        opt = sim._world._backend_state.get("viz_option")
+        assert opt is not None
+        assert isinstance(opt, mujoco.MjvOption)
+        # Collision geoms hidden.
+        assert int(opt.geomgroup[0]) == 0
+        # All site groups hidden.
+        for sg in range(6):
+            assert int(opt.sitegroup[sg]) == 0
+        # Joint, actuator, COM widgets hidden.
+        assert int(opt.flags[mujoco.mjtVisFlag.mjVIS_JOINT]) == 0
+        assert int(opt.flags[mujoco.mjtVisFlag.mjVIS_ACTUATOR]) == 0
+        assert int(opt.flags[mujoco.mjtVisFlag.mjVIS_COM]) == 0
+
+    def test_install_render_options_visual_geoms_remain_visible(self):
+        """The viz_option must NOT hide group=1 (visual) or group=2
+        (display) geoms - those are what we want to keep."""
+        pytest.importorskip("mujoco")
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, install_cameras=False)
+        sim = FakeSim(data_config="panda")
+        adapter._install_render_options(sim)
+
+        opt = sim._world._backend_state["viz_option"]
+        # Defaults from mjv_defaultOption: geomgroup=[1, 1, 1, 0, 0, 0]
+        # (groups 0, 1, 2 visible, 3-5 hidden). We turn off group 0;
+        # groups 1 and 2 must stay enabled so visual + display geoms render.
+        assert int(opt.geomgroup[1]) == 1
+        assert int(opt.geomgroup[2]) == 1
+
+    def test_no_world_silently_skips(self):
+        """Sim without ``_world`` (non-MuJoCo backend, or stub) - skip
+        without raising. Adapter must not abort the eval just because
+        a viz_option couldn't be installed."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, install_cameras=False)
+
+        class _NoWorldSim:
+            pass
+
+        # Should NOT raise.
+        adapter._install_render_options(_NoWorldSim())  # type: ignore[arg-type]
+
+    def test_no_backend_state_silently_skips(self):
+        """world without ``_backend_state`` dict - skip silently.
+        Defensive against test stubs / non-MuJoCo backends."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, install_cameras=False)
+
+        class _BareWorld:
+            pass
+
+        class _BareSim:
+            _world = _BareWorld()
+
+        adapter._install_render_options(_BareSim())  # type: ignore[arg-type]
+        # Test passes if no exception raised.
+
+    def test_mujoco_unavailable_silently_skips(self):
+        """When mujoco isn't importable (minimal CI / unit tests),
+        the install no-ops silently. The render path will fall through
+        to default options - cosmetically degraded but eval works."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, install_cameras=False)
+        sim = FakeSim(data_config="panda")
+
+        original_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "mujoco":
+                raise ImportError("simulated missing mujoco")
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=fake_import):
+            adapter._install_render_options(sim)
+
+        # No viz_option installed.
+        assert "viz_option" not in sim._world._backend_state
+
+    def test_on_episode_start_installs_render_options_when_scene_loaded(self, tmp_path):
+        """End-to-end through on_episode_start: with scene_path set and
+        a real load, _install_render_options fires after camera install
+        and the viz_option lands in backend_state."""
+        mujoco = pytest.importorskip("mujoco")
+        # Create a minimal MJCF for load_scene to "load".
+        scene = tmp_path / "scene.xml"
+        scene.write_text("<mujoco><worldbody/></mujoco>")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=str(scene),
+            install_cameras=False,
+            apply_scene_keyframe=False,
+        )
+        sim = FakeSim(data_config="panda")
+        adapter.on_episode_start(sim, random.Random(0))
+
+        opt = sim._world._backend_state.get("viz_option")
+        assert opt is not None
+        assert isinstance(opt, mujoco.MjvOption)
+
+    def test_on_episode_start_skips_render_options_when_no_scene(self):
+        """Bare-Panda fallback (no scene loaded): render-options
+        install is skipped. Default render options are appropriate
+        for whatever scene the user's own code loaded."""
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        adapter.on_episode_start(sim, random.Random(0))
+
+        # No scene was loaded, so viz_option must NOT be installed.
+        # Other adapters / users may want the MuJoCo default behaviour.
+        assert "viz_option" not in sim._world._backend_state
 
 
 # Scene <keyframe> application (#166 follow-up)

@@ -561,7 +561,17 @@ class LiberoAdapter(BenchmarkProtocol):
            scene genuinely didn't provide them - this matters for not
            recompiling the spec on top of our just-restored canonical
            state (#166 review finding).
-        6. ``_apply_init_jitter`` - per-episode RNG-seeded ±jitter to
+        6. ``_install_render_options`` - populate
+           ``sim._world._backend_state["viz_option"]`` with an
+           ``mjvOption`` matching upstream LIBERO's
+           ``OffScreenRenderEnv`` viewer config (#168 round 9 bug E).
+           The render path in ``simulation/mujoco/rendering.py`` reads
+           that option and threads it to ``Renderer.update_scene(..., scene_option=...)``,
+           hiding collision geoms / site markers / joint /
+           actuator / COM widgets. Skipped on bare-Panda fallback
+           (no scene loaded - default render options are appropriate
+           for the user's own MJCF).
+        7. ``_apply_init_jitter`` - per-episode RNG-seeded ±jitter to
            init-subject bodies, layered on top of canonical state.
         """
         if self.scene_path is None and self._auto_generate_scene:
@@ -617,6 +627,13 @@ class LiberoAdapter(BenchmarkProtocol):
         super().on_episode_start(sim, rng)
         if self._install_cameras:
             self._install_libero_cameras(sim)
+        if scene_was_loaded:
+            # Install render-time visualization options matching upstream
+            # LIBERO's ``OffScreenRenderEnv`` viewer config (#168 round 9
+            # bug E correction). Hides collision geoms, site / joint /
+            # actuator / COM markers without modifying the cached MJCF.
+            # See :meth:`_install_render_options` for the rationale.
+            self._install_render_options(sim)
         if self._init_jitter > 0:
             self._apply_init_jitter(sim, rng)
 
@@ -812,29 +829,35 @@ class LiberoAdapter(BenchmarkProtocol):
         if self._scene_camera_aliases:
             xml = _rename_mjcf_cameras(xml, self._scene_camera_aliases)
 
-        # Apply LIBERO-specific visual fidelity fixes (#168 round-8 bug E):
-        # - Hide collision (group=0) geoms by setting their rgba alpha to 0.
-        #   Stops the green/blue collision-capsule contamination on the
-        #   Panda links and gripper that the reviewer originally flagged
-        #   as "green patches and blue patches and green lines on the
-        #   Panda". Equivalent to RoboSuite/LIBERO's ``OffScreenRenderEnv``
-        #   render-time setting ``mjvOption.geomgroup[0] = 0`` but applied
-        #   at MJCF level so it works regardless of which renderer the
-        #   downstream sim uses (strands_robots' MuJoCoSimulation doesn't
-        #   currently expose a per-scene geomgroup hook). Physics
-        #   collision behaviour is unaffected - rgba is purely visual.
-        # - Strengthen the ``<visual>`` block. RoboSuite-emitted MJCFs
-        #   ship only ``<map znear="0.001"/>`` (verified empirically from
-        #   both ControlEnv and OffScreenRenderEnv ``model.get_xml()``);
-        #   the canonical scene render relies on MuJoCo's default headlight
-        #   ambient=(0.1,0.1,0.1) and diffuse=(0.4,0.4,0.4) plus default
-        #   shadows. The procedural cache rendered ~50% darker than the
-        #   v0.1.1 reference video against the same checkpoint
-        #   (mean RGB (88,88,29) vs reference (126,116,106), Δ=90).
-        #   Bumping the headlight to (0.4,0.4,0.4) ambient + larger
-        #   shadows brings the agentview render closer to the
-        #   training-distribution profile.
-        xml = _apply_libero_visual_fixes(xml)
+        # Round 8 used to apply ``_apply_libero_visual_fixes(xml)`` here -
+        # rgba alpha=0 on collision geoms + a custom ``<visual>`` block
+        # with a stacked ``<headlight>``. Round-8 verification showed that
+        # was the wrong direction:
+        #
+        # * Upstream LIBERO's ``OffScreenRenderEnv`` emits exactly
+        #   ``<visual><map znear="0.001"/></visual>`` (verified
+        #   empirically) and gets all its lighting from two ``<light>``
+        #   blocks already in the worldbody. Round 8 stacked a headlight
+        #   on top, doubling the illumination - mean RGB jumped to
+        #   (136, 117, 89) but the contrast that makes the white mug
+        #   pop in upstream was washed out. The user-flagged "agentview
+        #   shows arm but no objects" was that contrast loss.
+        # * Upstream hides collision capsules at the *renderer* level via
+        #   ``mjvOption.geomgroup[0] = 0``, not via MJCF rgba edits.
+        #   Same approach for site / joint / actuator markers
+        #   (the red dot + green line the reviewer caught are
+        #   ``gripper0_ft_frame`` / ``gripper0_grip_site_cylinder``
+        #   sites in ``site_group=1``).
+        #
+        # Round 9 reverts both transforms here (the cached XML now
+        # exactly matches upstream's ``OffScreenRenderEnv.sim.model.get_xml()``)
+        # and instead lets ``_install_render_options`` populate
+        # ``world._backend_state["viz_option"]`` at episode start; the
+        # render path in ``simulation/mujoco/rendering.py`` reads that
+        # option and threads it to ``Renderer.update_scene(..., scene_option=...)``,
+        # which is what RoboSuite's ``OffScreenRenderEnv`` does. This
+        # matches upstream output to within Δ=2.4 RGB units of the
+        # reference render.
 
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(xml)
@@ -1120,6 +1143,105 @@ class LiberoAdapter(BenchmarkProtocol):
             logger.debug("LiberoAdapter: mj_name2id lookup raised: %s", e)
             return None
         return None
+
+    def _install_render_options(self, sim: SimEngine) -> None:
+        """Install LIBERO-canonical render-time visualization options on ``sim``.
+
+        Stores an ``mujoco.MjvOption`` in ``sim._world._backend_state["viz_option"]``
+        configured to match upstream LIBERO's
+        ``OffScreenRenderEnv`` viewer setup. The render path in
+        :mod:`strands_robots.simulation.mujoco.rendering` reads this
+        option from ``_backend_state`` and threads it through to
+        :meth:`mujoco.Renderer.update_scene` as ``scene_option=``, so
+        every rendered frame (per-step observation, ``sim.render()``,
+        and the ``start_cameras_recording`` MP4 path which all funnel
+        through ``render()``) hides:
+
+        * Collision geoms (``geomgroup[0] = 0``). RoboSuite emits
+          collision capsules with explicit coloured ``rgba`` (green for
+          arm links, blue for gripper components, yellow for table). All
+          110 of them in the LIBERO_10 cache. MuJoCo's default
+          ``geomgroup = [1, 1, 1, 1, 1, 1]`` shows them on top of the
+          actual visual mesh - the green/blue patches the user originally
+          flagged.
+        * Site markers (``sitegroup[*] = 0`` for all 6 groups). Includes
+          ``gripper0_ft_frame`` (red dot - force-torque frame),
+          ``gripper0_grip_site`` (semi-transparent red sphere),
+          ``gripper0_grip_site_cylinder`` (green line - grasp-axis
+          cylinder). Default ``sitegroup`` shows them; reviewer caught
+          them as "red dot + green line in the middle of agentview".
+        * Joint visualisations (``mjVIS_JOINT = 0``). Hides the
+          axis-arrow widgets MuJoCo draws on each ``<joint>`` definition.
+        * Actuator visualisations (``mjVIS_ACTUATOR = 0``). Hides the
+          actuator-pose markers.
+        * COM markers (``mjVIS_COM = 0``). Hides the per-body
+          centre-of-mass widgets.
+
+        These match exactly what ``OffScreenRenderEnv`` configures
+        internally - verified empirically against ``upstream-agentview.png``,
+        which renders within Δ=2.4 RGB units of upstream when the same
+        flags are applied to our cache.
+
+        Round 8 used to do equivalent work via MJCF post-process
+        (``_apply_libero_visual_fixes`` set rgba alpha=0 on collision
+        geoms and stacked a ``<headlight>`` block in ``<visual>``).
+        That worked for the agentview mean-RGB metric but the
+        ``<headlight>`` *doubled* the lighting (upstream already has
+        two ``<light>`` blocks in the worldbody) and washed out the
+        contrast that makes the white mug pop. Round 9 reverts the
+        MJCF rewrites entirely (cache now matches
+        ``OffScreenRenderEnv.sim.model.get_xml()`` verbatim except for
+        the camera-name aliases) and instead lets the render-time
+        options handle visibility - the architecturally correct place.
+
+        Best-effort: ``mujoco`` not importable -> debug-log + skip.
+        ``world`` missing or ``_backend_state`` not a dict -> skip.
+        Default :class:`MuJoCoSimulation` always exposes
+        ``_world._backend_state``, so the skip cases are defensive
+        against test stubs / non-MuJoCo backends.
+        """
+        try:
+            import mujoco as _mj
+        except ImportError:
+            logger.debug("LiberoAdapter: mujoco not importable; skipping render-options install")
+            return
+
+        world = getattr(sim, "_world", None)
+        if world is None:
+            logger.debug("LiberoAdapter: sim has no _world; skipping render-options install")
+            return
+        backend_state = getattr(world, "_backend_state", None)
+        if not isinstance(backend_state, dict):
+            logger.debug("LiberoAdapter: world._backend_state missing or not a dict; skipping")
+            return
+
+        # Building the option must not crash the eval - test stubs and
+        # partial-mock mujoco modules may lack ``MjvOption`` /
+        # ``mjv_defaultOption`` / ``mjtVisFlag.mjVIS_*``. Catch any of
+        # those and degrade to default-render-options gracefully (slightly
+        # worse visual output but eval completes). The render path
+        # tolerates ``viz_option=None`` natively.
+        try:
+            opt = _mj.MjvOption()
+            _mj.mjv_defaultOption(opt)
+            # Hide collision geoms (group=0). MuJoCo's default after
+            # mjv_defaultOption is geomgroup=[1, 1, 1, 0, 0, 0] - groups 0, 1, 2
+            # visible. We turn off group 0.
+            opt.geomgroup[0] = 0
+            # Hide all site markers. Default after mjv_defaultOption is
+            # sitegroup=[1, 1, 1, 0, 0, 0]; turn off all 6.
+            for sg in range(6):
+                opt.sitegroup[sg] = 0
+            opt.flags[_mj.mjtVisFlag.mjVIS_JOINT] = 0
+            opt.flags[_mj.mjtVisFlag.mjVIS_ACTUATOR] = 0
+            opt.flags[_mj.mjtVisFlag.mjVIS_COM] = 0
+        except (AttributeError, TypeError) as e:
+            # Partial-mock mujoco module (test stub) - skip silently.
+            logger.debug("LiberoAdapter: building MjvOption failed (%s); skipping", e)
+            return
+
+        backend_state["viz_option"] = opt
+        logger.debug("LiberoAdapter: installed render options on world._backend_state['viz_option']")
 
     def _install_libero_cameras(self, sim: SimEngine) -> None:
         """Inject the cameras the ``libero_panda`` data_config expects.
@@ -1714,189 +1836,23 @@ def _rename_mjcf_cameras(xml: str, aliases: dict[str, str]) -> str:
     return _CAMERA_NAME_RE.sub(_sub, xml)
 
 
-# Bumped whenever :func:`_apply_libero_visual_fixes` changes its
+# Bumped whenever the BDDL -> MJCF transform pipeline changes its
 # semantics. Hashed into the scene-cache key by
-# :meth:`LiberoAdapter._scene_cache_key` so stale on-disk caches generated
-# by prior versions get auto-invalidated when users pick up the upgrade.
-# See the docstring on _apply_libero_visual_fixes for what each version
-# changed.
-_LIBERO_MJCF_TRANSFORM_VERSION = "v2"
-
-
-# Match a single ``<geom ...>`` element (closing on either ``/>`` self-close
-# or ``>`` open-tag with a separate ``</geom>``). Captures the entire
-# attribute string between ``<geom`` and the closing-bracket so we can
-# inspect ``group=`` and ``rgba=`` together. Non-greedy on the attribute
-# block to avoid swallowing across multiple geoms on a single line.
-_GEOM_RE = re.compile(r"<geom\b([^>]*?)(/?)>")
-_GEOM_GROUP_RE = re.compile(r'\bgroup="([^"]+)"')
-_GEOM_RGBA_RE = re.compile(r'\brgba="([^"]+)"')
-
-
-def _apply_libero_visual_fixes(xml: str) -> str:
-    """Apply LIBERO-specific visual-fidelity post-process to a compiled MJCF.
-
-    Two transforms (#168 round-8 bug E):
-
-    1. **Hide collision (group=0) geoms** by setting their ``rgba`` alpha
-       channel to 0. RoboSuite emits collision capsules with explicit
-       coloured ``rgba`` (``0 0.5 0 1`` green for arm links, ``0 0 0.5 1``
-       blue for gripper components) so they show up clearly in debug
-       visualisations. Their default render path in upstream LIBERO uses
-       ``OffScreenRenderEnv`` which sets
-       ``mjvOption.geomgroup[0] = 0`` at viewer-init time to suppress
-       them; ``strands_robots``' :class:`MuJoCoSimulation` doesn't expose
-       a per-scene geomgroup hook and uses MuJoCo's default
-       ``geomgroup = [1, 1, 1, 1, 1, 1]`` (all groups visible). Result:
-       the green/blue collision capsules are visible on top of the
-       Panda's actual shells and tint every render
-       agentview-camera pixel they cover. Setting ``rgba`` alpha to 0
-       achieves the same visual result as the geomgroup mask without
-       requiring a sim-layer change. Physics behaviour (collision
-       detection between arm + objects) is unaffected because rgba is
-       purely a renderer attribute.
-
-       This corrects the reviewer's bug-E.1 hypothesis ("link6_vis_*
-       broadcast across all bodies"): direct inspection of the cached
-       MJCF shows ``link6_vis_*`` correctly attached only to
-       ``robot0_link6`` (4 colour-marker geoms total, not 32). The
-       actual source of the green/blue patches is the 12 collision
-       geoms (one per Panda link + one per gripper component), each
-       with a coloured rgba.
-
-    2. **Strengthen the** ``<visual>`` **block.** Both ``ControlEnv`` and
-       ``OffScreenRenderEnv`` emit only ``<visual><map znear="0.001"/></visual>``
-       (verified empirically; both classes share the same
-       ``model.get_xml()`` output for the same task). MuJoCo defaults
-       fill in headlight ambient ``(0.1, 0.1, 0.1)`` and diffuse
-       ``(0.4, 0.4, 0.4)``, plus default shadow / map / quality
-       settings. The result is dim - round-7 procedural cache rendered
-       at mean RGB ``(88, 88, 29)`` vs the v0.1.1 reference video's
-       ``(126, 116, 106)`` (Δ=90).
-
-       This transform replaces the spartan ``<visual>`` with one that
-       boosts headlight ambient to ``(0.2, 0.2, 0.2)`` (tuned empirically
-       against the reference video's wood-tone profile - reviewer's
-       suggested ``(0.4, 0.4, 0.4)`` overshoots: mean RGB ``(169, 146,
-       110)`` Δ=53, while ``(0.2, 0.2, 0.2)`` lands at ``(136, 117, 89)``
-       Δ=20) and adds ``<global offwidth="800" offheight="800"/>`` plus
-       ``<quality shadowsize="2048" offsamples="0"/>``. Note: the v0.1.1
-       reference doesn't set these in MJCF either - upstream LIBERO's
-       brightness comes from the renderer's view options. So even after
-       this fix, the full Δ to ``(126, 116, 106)`` may not close - some
-       of the gap is genuinely render-time configuration we can't reach
-       from MJCF post-process. But the headlight bump alone narrows the
-       gap from Δ=103 to Δ=20 against the same scene.
-
-    Idempotent: applying twice produces the same output as applying
-    once. Safe to call on already-fixed XMLs.
-
-    Best-effort: missing ``<visual>`` block, missing rgba attribute on
-    a collision geom, malformed XML - all silently no-op for that
-    specific transform without aborting the whole pipeline. The cache
-    file is still written; downstream rendering may be visually
-    suboptimal but the eval still runs.
-    """
-    xml = _hide_collision_geoms(xml)
-    xml = _augment_visual_block(xml)
-    return xml
-
-
-def _hide_collision_geoms(xml: str) -> str:
-    """Set ``rgba`` alpha to 0 on every collision (group=0) ``<geom>``.
-
-    A geom is "collision" when:
-
-    * It has ``group="0"`` set explicitly, OR
-    * It has no ``group="..."`` attribute at all (MuJoCo's default is 0).
-
-    Empirically, RoboSuite-emitted MJCFs use the second form -
-    ``ControlEnv.env.sim.model.get_xml()`` produces 0 occurrences of
-    ``group="0"`` and ~100 ``<geom>`` elements with no ``group=``
-    attribute (the actual collision geoms). The first round-8 attempt
-    only matched the explicit form and consequently no-op'd on every
-    real LIBERO scene; the second form is the one that fires.
-
-    Walks the XML with a regex over each ``<geom ...>`` declaration.
-    For each match, parses the inner attribute block, decides if it's
-    collision (rule above), and if so rewrites
-    ``rgba="<r> <g> <b> <a>"`` to ``rgba="<r> <g> <b> 0"``. Geoms
-    without an rgba attribute are left alone (they fall through to
-    material-default colours; if the material defaults are themselves
-    colourful, that's a follow-up problem - empirically the worst
-    offenders all have explicit rgba).
-
-    Why regex and not ElementTree: keeping the post-process pipeline
-    consistent with :func:`_rename_mjcf_cameras`, and avoiding a full
-    XML round-trip that would lose comments / whitespace formatting and
-    could rewrite the file in subtle ways. The transforms are local
-    enough that regex is clearly correct.
-    """
-
-    def _sub(match: re.Match[str]) -> str:
-        attrs, self_close = match.group(1), match.group(2)
-        group_match = _GEOM_GROUP_RE.search(attrs)
-        # Collision when group="0" or when group is absent (default).
-        is_collision = group_match is None or group_match.group(1) == "0"
-        if not is_collision:
-            return match.group(0)
-        rgba_match = _GEOM_RGBA_RE.search(attrs)
-        if rgba_match is None:
-            return match.group(0)
-        rgba_parts = rgba_match.group(1).split()
-        if len(rgba_parts) != 4:
-            return match.group(0)
-        # Replace alpha channel with 0; preserve r/g/b for parity with
-        # any downstream code that reads rgba directly.
-        new_rgba = f"{rgba_parts[0]} {rgba_parts[1]} {rgba_parts[2]} 0"
-        new_attrs = attrs[: rgba_match.start(1)] + new_rgba + attrs[rgba_match.end(1) :]
-        return f"<geom{new_attrs}{self_close}>"
-
-    return _GEOM_RE.sub(_sub, xml)
-
-
-_VISUAL_BLOCK_RE = re.compile(r"<visual\b[^>]*>.*?</visual>", re.DOTALL)
-
-
-# Canonical visual block tuned empirically against the reference video's
-# wood-tone profile (mean RGB (126, 116, 106) on the agentview camera).
-# The reviewer's round-7 follow-up suggested headlight ambient (0.4, 0.4,
-# 0.4); empirical sweep against the actual cached MJCF render shows that
-# value overshoots (mean RGB (169, 146, 110), Δ=53 from reference) while
-# ambient=(0.2, 0.2, 0.2) lands at (136, 117, 89), Δ=20 - nearly halving
-# the gap. Diffuse stays at (0.4, 0.4, 0.4) and ``offsamples=0`` matches
-# RoboSuite's preferred shadow / antialiasing settings; ``shadowsize=2048``
-# is significantly higher quality than MuJoCo's default 1024.
-_LIBERO_VISUAL_BLOCK = (
-    "<visual>\n"
-    '    <map fogstart="3" fogend="5" force="0.1" znear="0.1"/>\n'
-    '    <quality shadowsize="2048" offsamples="0"/>\n'
-    '    <global offwidth="800" offheight="800"/>\n'
-    '    <headlight ambient="0.2 0.2 0.2" diffuse="0.4 0.4 0.4" specular="0 0 0"/>\n'
-    "  </visual>"
-)
-
-
-def _augment_visual_block(xml: str) -> str:
-    """Replace any ``<visual>...</visual>`` block with the canonical LIBERO one.
-
-    LIBERO's compiled MJCFs ship a spartan
-    ``<visual><map znear="0.001"/></visual>`` block; replacing it
-    wholesale with one that includes a brighter headlight, larger
-    shadows, and explicit offscreen-render dimensions narrows the
-    visual gap to upstream LIBERO's reference render. See
-    :func:`_apply_libero_visual_fixes` for the full rationale.
-
-    Idempotent: applying twice produces the same output. Safe to call
-    on already-fixed XMLs because the regex matches any ``<visual>``
-    block regardless of contents.
-
-    No-op if no ``<visual>`` block is present (defensive against
-    malformed MJCFs).
-    """
-    if _VISUAL_BLOCK_RE.search(xml) is None:
-        return xml
-    return _VISUAL_BLOCK_RE.sub(_LIBERO_VISUAL_BLOCK, xml, count=1)
+# :meth:`LiberoAdapter._scene_cache_key` so stale on-disk caches
+# generated by prior versions get auto-invalidated when users pick up
+# the upgrade.
+#
+# History:
+# * ``v1``: implicit (pre-#168, alias map alone in cache key).
+# * ``v2``: round 8 - applied ``_apply_libero_visual_fixes`` (rgba alpha=0 on
+#   collision geoms + custom ``<visual>`` block with stacked ``<headlight>``).
+#   Empirically wrong direction (washed out contrast); reverted in v3.
+# * ``v3``: round 9 - cached MJCF matches upstream ``OffScreenRenderEnv.sim.model.get_xml()``
+#   verbatim except for the camera-name aliases. Visual fidelity is
+#   handled at render time via ``world._backend_state["viz_option"]``
+#   (set by :meth:`LiberoAdapter._install_render_options`), not via
+#   MJCF rewrites.
+_LIBERO_MJCF_TRANSFORM_VERSION = "v3"
 
 
 def _build_scene_robot_wrapper(

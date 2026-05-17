@@ -113,4 +113,125 @@ def test_status_when_idle_is_success() -> None:
     r = sim.get_cameras_recording_status()
     assert r["status"] == "success"
     assert "⚪" in r["content"][0]["text"]
+
+
+# Render-time scene_option pass-through (#168 round 9 bug E)
+
+
+def test_get_viz_option_returns_none_when_unset() -> None:
+    """``RenderingMixin._get_viz_option`` returns ``None`` when no
+    adapter has populated ``world._backend_state['viz_option']``. This
+    is the default path for non-LIBERO sims; ``Renderer.update_scene``
+    accepts ``scene_option=None`` as the no-op meaning."""
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    sim.create_world()
+    assert sim._get_viz_option() is None
+    sim.destroy()
+
+
+def test_get_viz_option_reads_from_backend_state() -> None:
+    """When an adapter (e.g. LiberoAdapter) sets
+    ``world._backend_state['viz_option']``, the rendering layer reads it
+    via ``_get_viz_option`` and threads it through to
+    ``Renderer.update_scene(scene_option=...)``."""
+    import mujoco
+
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    sim.create_world()
+    opt = mujoco.MjvOption()
+    mujoco.mjv_defaultOption(opt)
+    opt.geomgroup[0] = 0  # any non-default value to verify pass-through
+    assert sim._world is not None
+    sim._world._backend_state["viz_option"] = opt
+
+    retrieved = sim._get_viz_option()
+    assert retrieved is opt
+    assert int(retrieved.geomgroup[0]) == 0
+    sim.destroy()
+
+
+def test_get_viz_option_handles_missing_backend_state() -> None:
+    """Defensive: ``world._backend_state`` not being a dict (e.g. unusual
+    test stub) returns None silently rather than raising."""
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    sim.create_world()
+    # Force backend_state into an unexpected shape.
+    assert sim._world is not None
+    sim._world._backend_state = "oops not a dict"  # type: ignore[assignment]
+    assert sim._get_viz_option() is None
+    sim.destroy()
+
+
+def test_get_viz_option_handles_missing_world() -> None:
+    """``self._world is None`` -> _get_viz_option returns None.
+    Reaches this state pre-create_world; defensive guard."""
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    # Don't call create_world - self._world stays None.
+    assert sim._get_viz_option() is None
+
+
+@_requires_mujoco
+def test_render_passes_scene_option_to_renderer(tmp_path: Path) -> None:
+    """End-to-end: ``Simulation.render(camera_name=...)`` reads
+    viz_option from backend_state and threads it through to the
+    underlying ``Renderer.update_scene`` so the rendered frame
+    reflects the option (e.g. group=0 geoms hidden).
+
+    Pin for #168 round 9: the round-9 fix moves collision-geom hiding
+    from MJCF rgba edits to renderer-level mjvOption. Without
+    backend_state -> Renderer threading, viz_option would be
+    populated by adapters but ignored at render time."""
+    os.environ.setdefault("MUJOCO_GL", "glfw")
+    import mujoco
+
+    from strands_robots.simulation import Simulation
+
+    sim = Simulation()
+    sim.create_world()
+    sim.add_robot("arm", data_config="so101", position=[0.0, 0.0, 0.0])
+    sim.add_camera("cam", position=[-0.3, -0.3, 0.4], target=[0.0, 0.0, 0.1])
+
+    # Default render (no viz_option) - just verify it returns success.
+    default = sim.render(camera_name="cam", width=64, height=64)
+    assert default["status"] == "success"
+
+    # Install a viz_option that turns OFF every visible group. The
+    # rendered frame should be uniform / nearly-empty (no geoms drawn).
+    opt = mujoco.MjvOption()
+    mujoco.mjv_defaultOption(opt)
+    for g in range(6):
+        opt.geomgroup[g] = 0  # hide ALL geom groups
+    for sg in range(6):
+        opt.sitegroup[sg] = 0
+    assert sim._world is not None
+    sim._world._backend_state["viz_option"] = opt
+
+    masked = sim.render(camera_name="cam", width=64, height=64)
+    assert masked["status"] == "success"
+    # The rendered image should have very low pixel variance now that
+    # everything is hidden - just background sky / floor.
+    masked_var = next(
+        c["json"]["pixel_variance"]
+        for c in masked["content"]
+        if isinstance(c, dict) and "json" in c and "pixel_variance" in c["json"]
+    )
+    default_var = next(
+        c["json"]["pixel_variance"]
+        for c in default["content"]
+        if isinstance(c, dict) and "json" in c and "pixel_variance" in c["json"]
+    )
+    # Hiding everything should significantly reduce variance.
+    assert masked_var < default_var, (
+        f"viz_option not honoured: masked variance {masked_var} should be < default {default_var}"
+    )
+
+    sim.destroy()
     sim.destroy()

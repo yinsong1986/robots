@@ -129,6 +129,41 @@ class RenderingMixin:
             renderers[key] = mj.Renderer(self._world._model, height=height, width=width)
         return renderers[key]
 
+    def _get_viz_option(self) -> Any:
+        """Return an ``mujoco.MjvOption`` from ``world._backend_state["viz_option"]``, or ``None``.
+
+        The optional ``viz_option`` override lets benchmark adapters (e.g.
+        :class:`~strands_robots.benchmarks.libero.adapter.LiberoAdapter`)
+        configure render-time visualisation flags - things like
+        ``mjvOption.geomgroup[0] = 0`` to hide collision geoms,
+        ``sitegroup[*] = 0`` to hide site markers, ``mjVIS_JOINT/mjVIS_ACTUATOR/mjVIS_COM = 0``
+        to hide joint/actuator/COM debug widgets - without changing the
+        loaded MJCF or affecting non-LIBERO callers. RoboSuite /
+        ``OffScreenRenderEnv`` set these in their viewer; when adapters
+        running through ``MuJoCoSimulation`` need parity, they populate
+        ``_backend_state["viz_option"]`` and the render path here threads
+        the option through to ``Renderer.update_scene(..., scene_option=...)``.
+
+        Returns ``None`` (the default) when no adapter has set the
+        override. ``Renderer.update_scene`` accepts ``scene_option=None``
+        as the no-op meaning, so non-LIBERO callers see zero behaviour
+        change.
+
+        Storing the option on ``world._backend_state`` (per the convention
+        documented at :class:`~strands_robots.simulation.models.SimWorld`)
+        ties its lifecycle to the loaded scene: a subsequent
+        :meth:`Simulation.load_scene` replaces ``self._world`` and the
+        option goes with it. Matches the lifecycle of the other state
+        keys in ``_backend_state`` (``spec``, ``xml``, ``scene_loaded``,
+        etc.).
+        """
+        if self._world is None:
+            return None
+        state = getattr(self._world, "_backend_state", None)
+        if not isinstance(state, dict):
+            return None
+        return state.get("viz_option")
+
     def _get_sim_observation(self, robot_name: str, *, skip_images: bool = False) -> dict[str, Any]:
         """Get observation from sim: joint state + cameras (unless skipped).
 
@@ -177,10 +212,11 @@ class RenderingMixin:
                 renderer = self._get_renderer(w, h)
                 if renderer is None:
                     continue
+                viz_option = self._get_viz_option()
                 if cam_id >= 0:
-                    renderer.update_scene(data, camera=cam_id)
+                    renderer.update_scene(data, camera=cam_id, scene_option=viz_option)
                 else:
-                    renderer.update_scene(data)
+                    renderer.update_scene(data, scene_option=viz_option)
                 obs[cname] = renderer.render().copy()
             except (RuntimeError, ValueError) as e:
                 # Individual camera failure shouldn't stop joint state collection.
@@ -284,9 +320,9 @@ class RenderingMixin:
                 label = camera_name
 
             if cam_id >= 0:
-                renderer.update_scene(self._world._data, camera=cam_id)
+                renderer.update_scene(self._world._data, camera=cam_id, scene_option=self._get_viz_option())
             else:
-                renderer.update_scene(self._world._data)
+                renderer.update_scene(self._world._data, scene_option=self._get_viz_option())
 
             img = renderer.render().copy()
 
@@ -359,9 +395,9 @@ class RenderingMixin:
                     ],
                 }
             if cam_id >= 0:
-                renderer.update_scene(self._world._data, camera=cam_id)
+                renderer.update_scene(self._world._data, camera=cam_id, scene_option=self._get_viz_option())
             else:
-                renderer.update_scene(self._world._data)
+                renderer.update_scene(self._world._data, scene_option=self._get_viz_option())
             # MuJoCo prints a one-time ARB_clip_control warning on macOS
             # when depth precision is reduced. Capture stderr on the first
             # depth render so we can surface the warning in the response
