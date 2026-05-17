@@ -2623,6 +2623,14 @@ class _LiberoOSCController:
     fresh per episode.
     """
 
+    # Tells the SimEngine that this controller drives ``mj_step`` itself
+    # (round 27): one ``apply()`` advances physics by
+    # ``physics_substeps_per_control`` steps, recomputing OSC torques each
+    # step. Without this flag, ``_apply_sim_action`` would call ``mj_step``
+    # again after ``apply()`` and double-step (or worse, leave a stale
+    # ``data.ctrl`` write between policy steps).
+    owns_stepping: bool = True
+
     def __init__(
         self,
         controller: Any,
@@ -2632,6 +2640,7 @@ class _LiberoOSCController:
         gripper_actuator_ids: list[int],
         model: Any,
         data: Any,
+        physics_substeps_per_control: int = 25,
     ) -> None:
         self.controller = controller
         self.sim_shim = sim_shim
@@ -2640,6 +2649,12 @@ class _LiberoOSCController:
         self.gripper_actuator_ids = list(gripper_actuator_ids)
         self.model = model
         self.data = data
+        # LIBERO trains at 20 Hz control with 500 Hz physics → 25 physics
+        # substeps per policy action. Mismatch ⇒ the OSC controller
+        # under-/over-shoots its delta target every step, manifesting as
+        # `success_rate=0` even though motion looks correct in cameras.
+        # See PR #168 round-26 verification + round-27 fix.
+        self.physics_substeps_per_control = max(1, int(physics_substeps_per_control))
 
     @classmethod
     def from_sim(
@@ -2774,6 +2789,16 @@ class _LiberoOSCController:
         controller_config["actuator_range"] = (ctrl_low, ctrl_high)
         controller = controller_factory("OSC_POSE", controller_config)
 
+        # Compute physics-substeps-per-control from sim's actual timestep.
+        # LIBERO trains at 20 Hz control rate. With dt=0.002 (default 500 Hz
+        # physics), substeps = 25. This matches RoboSuite's standard step
+        # loop in ``robosuite.environments.base.step``:
+        #   for i in range(int(self.control_timestep / self.model_timestep)):
+        #       self.sim.forward(); self._pre_action(...); self.sim.step()
+        # which is what LIBERO's training data was generated with.
+        dt = float(getattr(model.opt, "timestep", 0.002))
+        substeps = max(1, int(round((1.0 / 20.0) / dt)))
+
         return cls(
             controller=controller,
             sim_shim=sim_shim,
@@ -2782,6 +2807,7 @@ class _LiberoOSCController:
             gripper_actuator_ids=gripper_actuator_ids,
             model=model,
             data=data,
+            physics_substeps_per_control=substeps,
         )
 
     def apply(
@@ -2803,6 +2829,32 @@ class _LiberoOSCController:
         this is first called (otherwise xpos/xmat are uninitialized).
         Round-15's ``mj_forward`` in ``Simulation.load_scene``
         guarantees this.
+
+        **Round-27 control-rate fix.** LIBERO trains at 20 Hz control
+        with 500 Hz physics → 25 physics substeps per policy action.
+        We mirror RoboSuite's standard step loop
+        (``robosuite.environments.base.Base.step``):
+
+            set_goal(delta)                          # once
+            for _ in range(physics_substeps):
+                torques = controller.run_controller()
+                data.ctrl[arm] = torques
+                data.ctrl[gripper] = gripper_value
+                mj_step(model, data)
+
+        Each ``run_controller`` re-reads xpos/xmat/qpos/qvel/Jacobian
+        via ``controller.update()`` (gated by the ``new_update`` flag
+        which is set every iteration by the base class), so the OSC
+        torques track the integrated state. Without the substep loop
+        we ran OSC at 500 Hz (the physics rate) — the controller
+        designed each torque profile for a 25-step horizon but only
+        applied it for 1 step before the policy delivered a fresh
+        delta, leading to the round-26 "robot moves but never
+        converges" symptom.
+
+        ``owns_stepping = True`` tells the SimEngine not to call
+        ``mj_step`` again after this returns; we've already advanced
+        physics by the full control timestep.
 
         Best-effort against bad inputs: missing keys default to 0
         (no-op delta); shape mismatches log at WARNING and skip
@@ -2833,48 +2885,81 @@ class _LiberoOSCController:
             ],
             dtype=np.float64,
         )
+        gripper_value = _to_scalar(action_dict.get("gripper", 0.0))
 
-        # OSC controller: set goal from delta + run controller →
-        # joint torques. set_goal accepts the 6-vector as a Cartesian
-        # delta in fixed-impedance mode (the LIBERO default).
+        # set_goal once per policy step. Subsequent run_controller
+        # calls in the substep loop interpolate / hold this goal.
         try:
             self.controller.set_goal(delta)
-            torques = self.controller.run_controller()
         except Exception as e:  # noqa: BLE001 - log + skip rather than crash eval
             logger.warning(
-                "_LiberoOSCController.apply: OSC controller raised %s; this step's arm action will be no-op",
+                "_LiberoOSCController.apply: set_goal raised %s; this step's arm action will be no-op",
                 e,
             )
-            torques = None
+            # Without a valid goal we still need to advance physics by the
+            # full control timestep so the eval loop's timing is preserved
+            # (otherwise sim time falls behind real time and benchmark
+            # success criteria evaluated against ``cur_time`` go stale).
+            import mujoco as mj
 
-        if torques is not None:
-            torques = np.asarray(torques, dtype=np.float64)
-            if torques.shape[0] != len(self.arm_actuator_ids):
+            for _ in range(self.physics_substeps_per_control):
+                mj.mj_step(model, data)
+            return
+
+        # Cache mujoco module reference for the substep loop. Lazy import
+        # is required because the OSC controller path is only exercised
+        # under the `[sim-libero]` extra; the top-level adapter import
+        # must work without mujoco available.
+        import mujoco as mj
+
+        n_arm = len(self.arm_actuator_ids)
+
+        # Substep loop: re-run OSC + step physics N times per policy step.
+        # Cache gripper ctrlrange once outside the loop (immutable per
+        # episode) — pulling it from model.actuator_ctrlrange every
+        # iteration is a needless 25× slowdown.
+        gripper_lo_hi = [
+            (
+                float(model.actuator_ctrlrange[gi, 0]),
+                float(model.actuator_ctrlrange[gi, 1]),
+            )
+            for gi in self.gripper_actuator_ids
+        ]
+
+        for _ in range(self.physics_substeps_per_control):
+            # OSC: compute torques from current state (controller.update
+            # is called inside run_controller via the new_update flag).
+            try:
+                torques = self.controller.run_controller()
+            except Exception as e:  # noqa: BLE001
                 logger.warning(
-                    "_LiberoOSCController.apply: torques shape %s != %d arm actuators; skipping arm ctrl write",
-                    torques.shape,
-                    len(self.arm_actuator_ids),
+                    "_LiberoOSCController.apply: run_controller raised %s; "
+                    "leaving previous data.ctrl in place for this substep",
+                    e,
                 )
-            else:
-                for ai, tq in zip(self.arm_actuator_ids, torques, strict=True):
-                    data.ctrl[ai] = float(tq)
+                torques = None
 
-        # Gripper passthrough: the 7th GR00T action channel is
-        # an open/close signal. Most LIBERO checkpoints output a
-        # scalar in [-1, +1]; positive = close, negative = open.
-        # GR00T-LIBERO actually packs it as a 2-element list (PR
-        # #162's training-shape match) - same _to_scalar helper
-        # handles it correctly.
-        #
-        # Write to all gripper actuators (RoboSuite's gripper
-        # config typically has 2 finger actuators tied via a
-        # tendon, so this works either way).
-        gripper_value = _to_scalar(action_dict.get("gripper", 0.0))
-        for gi in self.gripper_actuator_ids:
-            # Clip to actuator ctrlrange to avoid driving past limits.
-            lo = float(model.actuator_ctrlrange[gi, 0])
-            hi = float(model.actuator_ctrlrange[gi, 1])
-            data.ctrl[gi] = max(lo, min(hi, gripper_value))
+            if torques is not None:
+                torques_arr = np.asarray(torques, dtype=np.float64)
+                if torques_arr.shape[0] != n_arm:
+                    logger.warning(
+                        "_LiberoOSCController.apply: torques shape %s != %d arm actuators; skipping arm ctrl write",
+                        torques_arr.shape,
+                        n_arm,
+                    )
+                else:
+                    for ai, tq in zip(self.arm_actuator_ids, torques_arr, strict=True):
+                        data.ctrl[ai] = float(tq)
+
+            # Gripper passthrough: the 7th GR00T action channel is an
+            # open/close signal. Most LIBERO checkpoints output a scalar
+            # in [-1, +1]; positive = close, negative = open. Held
+            # constant across substeps (matches RoboSuite which writes
+            # gripper ctrl once per policy step in _pre_action).
+            for gi, (lo, hi) in zip(self.gripper_actuator_ids, gripper_lo_hi, strict=True):
+                data.ctrl[gi] = max(lo, min(hi, gripper_value))
+
+            mj.mj_step(model, data)
 
 
 def _to_scalar(value: Any) -> float:

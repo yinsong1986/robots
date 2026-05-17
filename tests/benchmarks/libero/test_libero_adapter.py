@@ -2244,6 +2244,315 @@ class TestInstallActionController:
         assert _to_scalar({"key": "value"}) == 0.0
         assert _to_scalar("not a number") == 0.0
 
+    def test_controller_owns_stepping_flag_is_true(self, libero_scene_xml):
+        """Round 27 (#168): the LIBERO OSC controller declares
+        ``owns_stepping = True`` so the SimEngine skips its outer
+        ``mj_step`` loop and lets the controller advance physics at
+        the policy's required substep rate (25 substeps per policy
+        step at LIBERO's 20 Hz control / 500 Hz physics).
+
+        Pin so a future refactor that drops the flag silently
+        regresses to 1 substep per apply (the round-26 bug where
+        the robot moved but never converged because OSC was running
+        at the physics rate, not the control rate)."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import mujoco
+
+        from strands_robots.benchmarks.libero.adapter import _LiberoOSCController
+
+        # Class-level flag - cheaper to assert than building a sim.
+        assert _LiberoOSCController.owns_stepping is True
+
+        # Instance-level too (paranoia: subclasses may override).
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+        adapter._install_action_controller(sim)
+        ctrl = sim._world._backend_state.get("action_controller")
+        if ctrl is None:
+            pytest.skip("action_controller install failed")
+        assert ctrl.owns_stepping is True
+
+    def test_controller_physics_substeps_matches_libero_20hz_500hz(self, libero_scene_xml):
+        """Round 27 (#168): with the default 0.002s timestep (500 Hz
+        physics), ``physics_substeps_per_control`` should be 25 — i.e.
+        ``int(round((1/20) / 0.002)) == 25``. Pin so a future change to
+        the default timestep doesn't silently break LIBERO's 20 Hz
+        training-data convention.
+
+        25 substeps is the value RoboSuite's ``Base.step`` loop uses
+        in ``robosuite.environments.base`` for ``control_freq=20``,
+        which is what LIBERO's training data was generated with."""
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        # Sanity-check the libero scene XML uses 0.002s (the LIBERO
+        # default). If upstream changes this we want a noisy failure.
+        assert abs(float(sim._world._model.opt.timestep) - 0.002) < 1e-9, (  # type: ignore[attr-defined]
+            f"libero scene timestep changed: {sim._world._model.opt.timestep}"  # type: ignore[attr-defined]
+        )
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        adapter._install_action_controller(sim)
+        ctrl = sim._world._backend_state.get("action_controller")
+        if ctrl is None:
+            pytest.skip("action_controller install failed")
+
+        assert ctrl.physics_substeps_per_control == 25
+
+    def test_apply_advances_data_time_by_full_control_timestep(self, libero_scene_xml):
+        """Round 27 (#168): one ``apply()`` call advances ``data.time``
+        by the FULL control timestep (1/20 s = 0.05 s with default
+        500 Hz physics). Pin the round-27 control-rate fix so a future
+        refactor that re-introduces the round-26 single-substep bug
+        fails loudly here.
+
+        Pre-fix behaviour: 1 ``mj_step`` per apply ⇒ ``data.time``
+        advances by ``model.opt.timestep`` = 0.002 s only. Post-fix:
+        25 ``mj_step`` calls ⇒ 0.05 s. Anything < 0.04 s indicates the
+        substep loop didn't run (substeps must be ≥ 20 to be plausible
+        — exact number depends on timestep, but 1 vs 25 is unmistakable).
+        """
+        pytest.importorskip("mujoco")
+        pytest.importorskip("robosuite")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        adapter._install_action_controller(sim)
+        ctrl = sim._world._backend_state.get("action_controller")
+        if ctrl is None:
+            pytest.skip("action_controller install failed")
+
+        t0 = float(sim._world._data.time)  # type: ignore[attr-defined]
+        action = {
+            "x": [0.0, 0.0],
+            "y": [0.0, 0.0],
+            "z": [0.0, 0.0],
+            "roll": [0.0, 0.0],
+            "pitch": [0.0, 0.0],
+            "yaw": [0.0, 0.0],
+            "gripper": [0.0, 0.0],
+        }
+        ctrl.apply(action, sim._world._model, sim._world._data, "robot")  # type: ignore[attr-defined]
+        t1 = float(sim._world._data.time)  # type: ignore[attr-defined]
+
+        dt_advance = t1 - t0
+        # 25 substeps × 0.002s = 0.05s. Allow some slack for floating
+        # point but the 1-substep regression case (0.002s) must fail.
+        assert dt_advance > 0.04, (
+            f"apply() advanced data.time by only {dt_advance:.4f}s; "
+            f"expected ~0.05s for LIBERO 20 Hz / 500 Hz substep ratio. "
+            f"Round-27 substep loop may not be running."
+        )
+        assert dt_advance < 0.06, (
+            f"apply() advanced data.time by {dt_advance:.4f}s; "
+            f"expected ~0.05s. Possible double-step or wrong substep count."
+        )
+
+    def test_apply_sim_action_skips_outer_mj_step_when_controller_owns_stepping(self):
+        """Round 27 (#168): when ``controller.owns_stepping = True``,
+        the SimEngine's ``_apply_sim_action`` skips its own ``mj_step``
+        loop so we don't double-step on top of the controller's substep
+        loop.
+
+        Mechanism: install a stub controller that:
+        - declares ``owns_stepping = True`` and
+          ``physics_substeps_per_control = 7``,
+        - on apply, records mj_step calls but doesn't actually step,
+        and verify ``_apply_sim_action`` calls ``mj_step`` zero times
+        (the outer loop is skipped) and updates ``step_count`` by 7
+        (the controller's declared substep count).
+
+        Without the ``owns_stepping`` check, the outer loop would
+        call ``mj_step`` once more, advancing physics past what the
+        controller's substep loop intended."""
+        pytest.importorskip("mujoco")
+
+        from strands_robots.simulation import Simulation
+
+        # Build a minimal Simulation. We don't need a robot — just a
+        # compiled model + data. We sidestep ``add_robot`` (which
+        # requires asset downloads) by injecting a minimal robot stub
+        # into ``world.robots`` directly. The stub only needs a
+        # ``namespace`` attribute (read by _apply_sim_action's
+        # name-lookup fallback path, which we bypass anyway).
+        sim = Simulation()
+        result = sim.create_world()
+        assert result["status"] == "success", result
+        assert sim._world is not None
+
+        # Compile a trivial 1-DoF MuJoCo model so we have a valid
+        # model + data. We never write to it (the controller stub is
+        # a no-op), so the contents don't matter beyond being valid.
+        import mujoco
+
+        trivial_xml = """
+        <mujoco>
+          <worldbody>
+            <body name="b">
+              <joint name="j" type="hinge" axis="0 0 1"/>
+              <geom type="sphere" size="0.1"/>
+            </body>
+          </worldbody>
+          <actuator><motor joint="j" ctrlrange="-1 1"/></actuator>
+        </mujoco>
+        """
+        sim._world._model = mujoco.MjModel.from_xml_string(trivial_xml)
+        sim._world._data = mujoco.MjData(sim._world._model)
+        mujoco.mj_forward(sim._world._model, sim._world._data)
+
+        # Inject a robot stub. The send_action path checks
+        # ``robot_name not in self._world.robots`` (returns early
+        # if missing) and then reads ``robot.namespace`` for the
+        # name-lookup fallback (which the controller stub bypasses).
+        class _RobotStub:
+            namespace = ""
+
+        sim._world.robots["arm"] = _RobotStub()  # type: ignore[assignment]
+
+        call_count = [0]
+        original = mujoco.mj_step
+
+        def _counting_step(model, data, *args, **kwargs):
+            call_count[0] += 1
+            return original(model, data, *args, **kwargs)
+
+        class _OwnsSteppingStub:
+            owns_stepping = True
+            physics_substeps_per_control = 7
+
+            def apply(self, action_dict, model, data, robot_name):
+                # Deliberately don't step. The whole point is to
+                # detect whether _apply_sim_action's outer loop fires.
+                pass
+
+        sim._world._backend_state["action_controller"] = _OwnsSteppingStub()
+        step_count_before = sim._world.step_count
+
+        try:
+            mujoco.mj_step = _counting_step  # type: ignore[assignment]
+            sim.send_action({"x": 0.0}, robot_name="arm", n_substeps=3)
+        finally:
+            mujoco.mj_step = original  # type: ignore[assignment]
+
+        # 0 mj_step calls: the stub's apply doesn't step; the outer
+        # loop is skipped because owns_stepping=True.
+        assert call_count[0] == 0, (
+            f"expected 0 mj_step calls when controller owns_stepping=True with no-op apply, "
+            f"got {call_count[0]}. Outer mj_step loop in _apply_sim_action may not be skipping."
+        )
+        # step_count increments by physics_substeps_per_control (7),
+        # NOT by n_substeps (3) — because the controller declared its
+        # own substep count.
+        delta_step = sim._world.step_count - step_count_before
+        assert delta_step == 7, (
+            f"expected step_count to advance by 7 (controller's physics_substeps_per_control), "
+            f"got {delta_step}. _apply_sim_action may not be reading the controller's declared count."
+        )
+
+        sim.destroy()
+
+    def test_apply_sim_action_no_owns_stepping_keeps_outer_loop(self):
+        """Round 27 (#168) backwards compat: when a controller does NOT
+        declare ``owns_stepping = True``, ``_apply_sim_action`` keeps
+        its existing outer ``mj_step`` loop. Pin so the round-27 change
+        doesn't accidentally skip stepping for non-LIBERO controllers
+        (which would be a silent regression for any future benchmark
+        adapter that uses the action_controller hook without the LIBERO
+        substep semantics)."""
+        pytest.importorskip("mujoco")
+
+        from strands_robots.simulation import Simulation
+
+        sim = Simulation()
+        result = sim.create_world()
+        assert result["status"] == "success", result
+        assert sim._world is not None
+
+        import mujoco
+
+        trivial_xml = """
+        <mujoco>
+          <worldbody>
+            <body name="b">
+              <joint name="j" type="hinge" axis="0 0 1"/>
+              <geom type="sphere" size="0.1"/>
+            </body>
+          </worldbody>
+          <actuator><motor joint="j" ctrlrange="-1 1"/></actuator>
+        </mujoco>
+        """
+        sim._world._model = mujoco.MjModel.from_xml_string(trivial_xml)
+        sim._world._data = mujoco.MjData(sim._world._model)
+        mujoco.mj_forward(sim._world._model, sim._world._data)
+
+        class _RobotStub:
+            namespace = ""
+
+        sim._world.robots["arm"] = _RobotStub()  # type: ignore[assignment]
+
+        call_count = [0]
+        original = mujoco.mj_step
+
+        def _counting_step(model, data, *args, **kwargs):
+            call_count[0] += 1
+            return original(model, data, *args, **kwargs)
+
+        class _PlainController:
+            # owns_stepping ABSENT (defaults to False via getattr)
+
+            def apply(self, action_dict, model, data, robot_name):
+                pass
+
+        sim._world._backend_state["action_controller"] = _PlainController()
+        step_count_before = sim._world.step_count
+
+        try:
+            mujoco.mj_step = _counting_step  # type: ignore[assignment]
+            sim.send_action({"x": 0.0}, robot_name="arm", n_substeps=3)
+        finally:
+            mujoco.mj_step = original  # type: ignore[assignment]
+
+        # Outer loop fires for n_substeps=3 — the legacy contract.
+        assert call_count[0] == 3, (
+            f"expected 3 mj_step calls (outer loop, n_substeps=3) for plain controller "
+            f"without owns_stepping, got {call_count[0]}."
+        )
+        delta_step = sim._world.step_count - step_count_before
+        assert delta_step == 3, (
+            f"expected step_count to advance by n_substeps=3 for plain controller, got {delta_step}."
+        )
+
+        sim.destroy()
+
 
 class TestPrewarmFreshEpisodeZero:
     """Round 17: ``on_episode_start`` detects the prewarm-fresh ep0

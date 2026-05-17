@@ -250,6 +250,16 @@ class RenderingMixin:
         Default (no controller installed) preserves the existing
         actuator/joint-name lookup path verbatim. Non-LIBERO callers
         and existing tests see zero behaviour change.
+
+        Owns-stepping flag (#168 round 27): controllers may declare
+        ``owns_stepping = True`` on the controller object to signal
+        that ``apply()`` itself advances physics by the correct number
+        of substeps for the policy step (LIBERO: 25 mj_step calls per
+        ``apply()`` so OSC torques recompute every physics step at
+        500 Hz while policy commands arrive at 20 Hz). When the flag
+        is true the outer ``mj_step`` loop here is skipped to avoid
+        double-stepping. The default (flag absent / False) preserves
+        the original 1-substep-per-apply contract.
         """
         mj = _ensure_mujoco()
         assert self._world is not None  # callers must check
@@ -263,9 +273,21 @@ class RenderingMixin:
         # full responsibility for the data.ctrl update; the
         # actuator/joint-name lookup loop is skipped.
         controller = self._get_action_controller()
+        controller_handled_stepping = False
         if controller is not None:
             try:
                 controller.apply(action_dict, model, data, robot_name)
+                # Round 27 (#168): some controllers (e.g. LIBERO's
+                # OSC_POSE wrapper) need to advance physics themselves
+                # at a controller-defined rate (e.g. 25 substeps per
+                # policy step at 20 Hz LIBERO control / 500 Hz physics).
+                # When the controller declares ``owns_stepping = True``,
+                # skip the outer ``mj_step`` loop below — the controller
+                # has already advanced ``data.time`` by the full control
+                # timestep. Without this, we'd double-step (the outer
+                # loop would run an extra mj_step on top of the
+                # controller's substeps), corrupting trajectories.
+                controller_handled_stepping = bool(getattr(controller, "owns_stepping", False))
             except Exception as e:  # noqa: BLE001 - never abort eval on a controller failure
                 logger.warning(
                     "_apply_sim_action: action_controller.apply raised %s; falling through to "
@@ -276,12 +298,21 @@ class RenderingMixin:
         else:
             self._apply_action_by_name(model, data, action_dict, pfx, mj)
 
-        for _ in range(max(1, n_substeps)):
-            mj.mj_step(model, data)
+        if not controller_handled_stepping:
+            for _ in range(max(1, n_substeps)):
+                mj.mj_step(model, data)
 
         assert self._world is not None
         self._world.sim_time = data.time
-        self._world.step_count += n_substeps
+        # When the controller advanced physics itself, ``step_count``
+        # should reflect the actual number of mj_step calls (typically
+        # 25 for LIBERO @ 20 Hz / 500 Hz), not the policy-step count.
+        if controller_handled_stepping:
+            self._world.step_count = int(getattr(self._world, "step_count", 0)) + int(
+                getattr(controller, "physics_substeps_per_control", n_substeps)
+            )
+        else:
+            self._world.step_count += n_substeps
 
         if hasattr(self, "_viewer_handle") and self._viewer_handle is not None:
             self._viewer_handle.sync()
