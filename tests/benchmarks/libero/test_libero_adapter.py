@@ -1352,6 +1352,163 @@ class TestInstallRenderOptions:
         assert "viz_option" not in sim._world._backend_state
 
 
+class TestPrewarm:
+    """``LiberoAdapter.prewarm(sim)`` is the public hook for installing
+    render-time options BEFORE ``sim.start_cameras_recording`` (#168
+    round-10 / bug D').
+
+    The recorder thread captures its first frame immediately on
+    ``start_cameras_recording``, before
+    :meth:`evaluate_benchmark` (and therefore
+    :meth:`on_episode_start`) runs. Without ``viz_option`` already
+    installed via ``prewarm``, that first frame renders with MuJoCo's
+    default visualization options - collision capsules + sites + joint
+    axes visible. Subsequent frames are clean. The user reported this
+    in round-9 verification: t=0.00 frame mean RGB ``(88, 88, 29)``,
+    t=0.05+ frames mean RGB ``(79, 64, 57)``.
+    """
+
+    def test_prewarm_populates_viz_option(self):
+        """End-to-end: after ``prewarm(sim)``,
+        ``sim._world._backend_state["viz_option"]`` is populated. This
+        is the headline #168 round-10 fix - subsequent
+        ``start_cameras_recording`` will see the option on the first
+        frame."""
+        pytest.importorskip("mujoco")
+        # scene_path explicitly set so prewarm can run (auto-gen path
+        # would defer to on_episode_start).
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/path/to/some/scene.xml",  # presence matters, content doesn't for prewarm
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        adapter.prewarm(sim)
+
+        assert "viz_option" in sim._world._backend_state
+        opt = sim._world._backend_state["viz_option"]
+        # Same flags as _install_render_options - collision off, sites off, etc.
+        assert int(opt.geomgroup[0]) == 0
+        for sg in range(6):
+            assert int(opt.sitegroup[sg]) == 0
+
+    def test_prewarm_idempotent(self):
+        """Calling ``prewarm`` twice produces the same end state -
+        critical because the recommended call site (between
+        ``add_robot`` and ``start_cameras_recording``) might be hit
+        on each fresh evaluate, and ``on_episode_start`` will call
+        the same internals again. Both must be no-op-on-prior-state safe."""
+        pytest.importorskip("mujoco")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        adapter.prewarm(sim)
+        # First call installed viz_option; capture what we'd compare against.
+        assert "viz_option" in sim._world._backend_state
+        adapter.prewarm(sim)
+        second_opt = sim._world._backend_state["viz_option"]
+        # Each call builds a fresh MjvOption (overwrite is harmless).
+        # Importantly: no exception, no duplicate cameras, no duplicate robot.
+        assert int(second_opt.geomgroup[0]) == 0
+        # Robot wrapper still in place (single entry, no duplicate).
+        assert "robot" in sim._world.robots or "fake_panda" in sim._world.robots
+
+    def test_prewarm_no_scene_path_is_noop(self):
+        """When ``scene_path`` is None (auto-gen deferred to
+        on_episode_start), prewarm silently no-ops. Required so the
+        prewarm call doesn't crash adapters that haven't yet resolved
+        a scene_path."""
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        assert adapter.scene_path is None
+        sim = FakeSim(data_config="panda")
+        # Must not raise.
+        adapter.prewarm(sim)
+        # Nothing installed.
+        assert "viz_option" not in sim._world._backend_state
+
+    def test_prewarm_does_not_break_subsequent_on_episode_start(self, tmp_path):
+        """Calling ``prewarm`` then ``on_episode_start`` works as
+        expected - prewarm doesn't poison state for the per-episode
+        lifecycle. Pin to ensure the recommended call sequence
+        (prewarm before recording, on_episode_start per-episode) is
+        safe."""
+        pytest.importorskip("mujoco")
+        # Use a real scene file that load_scene can succeed on.
+        scene = tmp_path / "scene.xml"
+        scene.write_text("<mujoco><worldbody/></mujoco>")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=str(scene),
+            install_cameras=False,
+            apply_scene_keyframe=False,
+        )
+        sim = FakeSim(data_config="panda")
+
+        adapter.prewarm(sim)
+        adapter.on_episode_start(sim, random.Random(0))
+
+        # Both phases populated viz_option (overwrite is harmless).
+        assert "viz_option" in sim._world._backend_state
+
+    def test_prewarm_individual_step_failure_does_not_abort(self):
+        """If one of the three internal steps raises, prewarm logs a
+        WARNING but continues to the next step. Critical because
+        prewarm is best-effort - any failure here only degrades
+        rendering, doesn't crash the eval (on_episode_start retries
+        the same setup per-episode)."""
+        pytest.importorskip("mujoco")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+
+        # Make _register_default_robot raise via patching.
+        with patch.object(
+            LiberoAdapter,
+            "_register_default_robot",
+            side_effect=RuntimeError("simulated failure"),
+        ):
+            # Must NOT raise - failure is caught + logged.
+            adapter.prewarm(sim)
+
+        # _install_render_options STILL ran and populated viz_option.
+        assert "viz_option" in sim._world._backend_state
+
+    def test_prewarm_install_cameras_disabled(self):
+        """When ``install_cameras=False`` was passed to constructor,
+        prewarm respects the flag and skips the camera install step
+        (parallels :meth:`on_episode_start`'s behaviour)."""
+        pytest.importorskip("mujoco")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+
+        # Mark adapter not to install cameras (already set via constructor).
+        assert adapter._install_cameras is False
+
+        with patch.object(LiberoAdapter, "_install_libero_cameras") as mock_install:
+            adapter.prewarm(sim)
+        mock_install.assert_not_called()
+        # viz_option still installed - independent of camera install.
+        assert "viz_option" in sim._world._backend_state
+
+
 # Scene <keyframe> application (#166 follow-up)
 
 

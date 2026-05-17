@@ -637,6 +637,88 @@ class LiberoAdapter(BenchmarkProtocol):
         if self._init_jitter > 0:
             self._apply_init_jitter(sim, rng)
 
+    def prewarm(self, sim: SimEngine) -> None:
+        """Idempotent setup that should run BEFORE ``sim.start_cameras_recording``.
+
+        Why this exists (#168 round-10 / bug D'): the recorder thread
+        spawned by :meth:`Simulation.start_cameras_recording` captures
+        its first frame *immediately*, before
+        :meth:`evaluate_benchmark` (and therefore
+        :meth:`on_episode_start`) runs. Without ``viz_option`` already
+        in ``world._backend_state``, that first frame renders with
+        MuJoCo's default visualization options - collision capsules,
+        site markers (``gripper0_ft_frame`` red dot,
+        ``gripper0_grip_site_cylinder`` green line), joint axes, and
+        actuator widgets all visible. Subsequent frames are clean
+        because :meth:`_install_render_options` runs as part of
+        ``on_episode_start``.
+
+        Concrete symptom in round-9 verification: t=0.00 frame mean
+        RGB ``(88, 88, 29)`` (round-7-style contamination), t=0.05+
+        frames mean RGB ``(79, 64, 57)`` (round-9 clean). The first
+        recorded frame consistently differs from the rest.
+
+        This method exposes the *idempotent subset* of
+        :meth:`on_episode_start` setup that should run before recording
+        starts. Each call is no-op-on-prior-state safe:
+
+        * :meth:`_register_default_robot` - early-returns if
+          ``"robot"`` is already in ``world.robots``.
+        * :meth:`_install_libero_cameras` - skips cameras already
+          present in the model or registry.
+        * :meth:`_install_render_options` - overwrites
+          ``world._backend_state["viz_option"]`` with a freshly-built
+          ``MjvOption``; semantically equivalent on every call.
+
+        Calling :meth:`prewarm` does NOT replace
+        :meth:`on_episode_start` - the latter still runs the full
+        per-episode lifecycle (canonical-state apply, init jitter,
+        super-class compatibility check, etc.). Prewarm is just an
+        early-rendering hint.
+
+        Recommended call site (e.g. ``examples/libero_mujoco.py``)::
+
+            sim.load_scene(spec.scene_path)
+            sim.add_robot("robot", data_config="panda")
+            spec.prewarm(sim)                  # NEW: install viz_option early
+            sim.start_cameras_recording(...)   # recorder's first frame is now clean
+            result = sim.evaluate_benchmark(...)
+
+        Assumes ``sim`` already has the scene loaded (via
+        ``sim.load_scene``). Adapters built from a BDDL without a
+        scene will see ``self.scene_path is None``; in that case
+        prewarm is a no-op since there's nothing to install
+        render-options against.
+
+        Best-effort: any individual step's failure is caught and
+        logged at WARNING - never aborts the whole prewarm because a
+        failure here would just degrade rendering, not crash eval
+        (the per-episode :meth:`on_episode_start` will retry).
+        """
+        if not self.scene_path:
+            logger.debug(
+                "LiberoAdapter.prewarm: scene_path is None; skipping (scene auto-generation defers to on_episode_start)"
+            )
+            return
+
+        # Each step is independently idempotent - if the scene's Panda
+        # is already wrapped, _register_default_robot early-returns;
+        # if cameras are already in the model, _install_libero_cameras
+        # skips them; viz_option overwrite is harmless.
+        try:
+            self._register_default_robot(sim)
+        except Exception as e:  # noqa: BLE001 - never abort prewarm on a single-step failure
+            logger.warning("LiberoAdapter.prewarm: _register_default_robot raised: %s", e)
+        if self._install_cameras:
+            try:
+                self._install_libero_cameras(sim)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("LiberoAdapter.prewarm: _install_libero_cameras raised: %s", e)
+        try:
+            self._install_render_options(sim)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("LiberoAdapter.prewarm: _install_render_options raised: %s", e)
+
     def on_step(
         self,
         sim: SimEngine,
