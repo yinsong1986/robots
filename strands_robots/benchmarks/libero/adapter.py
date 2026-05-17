@@ -48,6 +48,7 @@ from strands_robots.benchmarks.libero.bddl_parser import (
     parse_bddl_file,
 )
 from strands_robots.simulation.benchmark import BenchmarkProtocol, StepInfo
+from strands_robots.simulation.models import SimRobot
 from strands_robots.utils import get_base_dir, require_optional
 
 if TYPE_CHECKING:
@@ -138,6 +139,7 @@ class LiberoAdapter(BenchmarkProtocol):
         scene_camera_aliases: dict[str, str] | None = None,
         apply_scene_keyframe: bool = True,
         scene_keyframe_index: int = 0,
+        scene_robot_prefix: str = "robot0_",
         bddl_source: str | None = None,
         bddl_path: str | None = None,
     ):
@@ -243,6 +245,17 @@ class LiberoAdapter(BenchmarkProtocol):
                 to ``0`` (first keyframe), which is the LIBERO convention.
                 Pass a different index to select a non-default home pose.
                 Ignored when the snapshot fallback fires.
+            scene_robot_prefix: Body / joint / actuator name prefix that
+                identifies the scene-supplied Panda when the adapter
+                pre-registers it in ``world.robots`` (#166 round-4
+                fix). Default ``"robot0_"`` matches RoboSuite / LIBERO's
+                canonical naming for the upstream MJCFs (both
+                hand-authored and procedurally-generated). Set to ``""``
+                or change to a different prefix when working with a
+                custom scene that names its Panda differently. The
+                pre-register step no-ops silently when no body matches
+                the prefix - super() then falls back to its standard
+                ``add_robot`` path.
             bddl_source: Original BDDL text - stored on the adapter so
                 the scene generator can pass it back to ``libero`` (which
                 only accepts a *file* path). Set automatically by
@@ -292,6 +305,7 @@ class LiberoAdapter(BenchmarkProtocol):
         )
         self._apply_canonical_state_enabled = bool(apply_scene_keyframe)
         self._scene_keyframe_index = int(scene_keyframe_index)
+        self._scene_robot_prefix = str(scene_robot_prefix)
         # Snapshot-and-restore fallback for procedurally-generated MJCFs that
         # don't ship a <keyframe> (the case the post-#168 verification
         # exposed). Captured on the first episode after super() +
@@ -323,6 +337,7 @@ class LiberoAdapter(BenchmarkProtocol):
         scene_camera_aliases: dict[str, str] | None = None,
         apply_scene_keyframe: bool = True,
         scene_keyframe_index: int = 0,
+        scene_robot_prefix: str = "robot0_",
     ) -> LiberoAdapter:
         """Parse a ``.bddl`` file from disk and build an adapter.
 
@@ -346,6 +361,7 @@ class LiberoAdapter(BenchmarkProtocol):
             scene_camera_aliases=scene_camera_aliases,
             apply_scene_keyframe=apply_scene_keyframe,
             scene_keyframe_index=scene_keyframe_index,
+            scene_robot_prefix=scene_robot_prefix,
             bddl_path=str(bddl_path),
         )
 
@@ -367,6 +383,7 @@ class LiberoAdapter(BenchmarkProtocol):
         scene_camera_aliases: dict[str, str] | None = None,
         apply_scene_keyframe: bool = True,
         scene_keyframe_index: int = 0,
+        scene_robot_prefix: str = "robot0_",
     ) -> LiberoAdapter:
         """Parse a BDDL string directly - useful in tests."""
         problem = parse_bddl(bddl_text)
@@ -385,6 +402,7 @@ class LiberoAdapter(BenchmarkProtocol):
             scene_camera_aliases=scene_camera_aliases,
             apply_scene_keyframe=apply_scene_keyframe,
             scene_keyframe_index=scene_keyframe_index,
+            scene_robot_prefix=scene_robot_prefix,
             bddl_source=bddl_text,
         )
 
@@ -736,69 +754,85 @@ class LiberoAdapter(BenchmarkProtocol):
         return tmp
 
     def _register_default_robot(self, sim: SimEngine) -> None:
-        """Pre-register the default robot in ``sim._world.robots`` if absent.
+        """Wrap the scene-supplied Panda in ``world.robots`` WITHOUT recompiling.
 
         Goal: make ``sim.list_robots()`` return non-empty BEFORE
         ``super().on_episode_start`` runs, so the base
         :class:`BenchmarkProtocol` skips its unconditional
         ``sim.add_robot(name="robot", ...)`` call. Otherwise that
-        unconditional call recompiles the spec on every episode (the
-        scene-supplied Panda is a *separate* kinematic chain from the
-        injected ``robot/`` namespaced one — both end up in the merged
-        model at ``nq = N1 + 9``).
+        unconditional call injects a *second* Panda into the spec
+        (scene-supplied + injected = two kinematic chains, ``nq``
+        jumps ``44 → 53`` on LIBERO SCENE5) and leaves the redundant
+        Panda's plastic shells right in front of the ``image`` camera
+        — that's #166 round-4's smoking gun: every "real-render" frame
+        is yellow-saturated by the second Panda's links 5/6.
 
-        That recompile is what invalidates the qpos snapshot across
-        episodes (#166 round-3 verification: ``model.nq`` jumps
-        ``44 → 53`` on the LIBERO SCENE5 task). By pre-registering with
-        the SAME name super() would have used (``"robot"``), super()
-        finds ``list_robots() == ["robot"]`` and goes straight to the
-        compatibility check.
+        The fix has to register a wrapper for the **existing** Panda
+        without recompiling. Two-step detection:
+
+        1. Walk the compiled MuJoCo model's body names looking for the
+           robosuite/LIBERO ``robot0_`` prefix (the standard naming
+           convention for the hand-authored and procedurally-generated
+           LIBERO scenes alike).
+        2. If found, build a :class:`SimRobot` whose ``namespace`` matches
+           the discovered prefix and whose ``joint_names`` /
+           ``actuator_ids`` come from filtering the model's joint /
+           actuator pools by the same prefix. Register it directly in
+           ``world.robots`` under the canonical key ``"robot"`` so
+           super() finds it.
 
         Best-effort:
 
-        * Sims without ``add_robot`` (non-MuJoCo backends) → debug-log
-          + skip; super() will then fall through to its own ``add_robot``
-          path which the backend handles however it likes.
-        * ``add_robot`` returns an error dict → log WARNING and skip;
-          super() will retry with the same kwargs and surface the same
-          error consistently.
-        * Robot already registered (from a prior episode where the
-          adapter pre-registered AND the world has been preserved across
-          ``load_scene`` calls — currently never the case but defensive)
-          → no-op.
+        * Sim without a compiled MuJoCo model → debug-log + skip.
+          super() will fall through to its own add_robot path; that
+          path is the bug we're trying to avoid, but on a non-MuJoCo
+          backend it's the only correct behaviour anyway.
+        * No body matches the ``robot0_`` prefix → debug-log + skip.
+          The scene didn't supply a Panda; super() should add one.
+        * Robot already registered under ``"robot"`` (defensive) →
+          no-op.
         """
-        list_robots = getattr(sim, "list_robots", None)
-        add_robot = getattr(sim, "add_robot", None)
-        if list_robots is None or add_robot is None:
-            logger.debug("LiberoAdapter: sim missing list_robots / add_robot; skipping pre-register")
+        world = getattr(sim, "_world", None)
+        if world is None or not hasattr(world, "robots"):
             return
-
-        try:
-            existing = list(list_robots())
-        except Exception as e:  # noqa: BLE001 - defensive
-            logger.debug("LiberoAdapter: list_robots() raised: %s", e)
-            return
-        if "robot" in existing:
+        if "robot" in world.robots:
             return  # super() will see it and skip its own add
 
         try:
-            result = add_robot(name="robot", data_config=self.default_robot)
-        except Exception as e:  # noqa: BLE001 - never abort eval on a setup-time error
+            import mujoco as _mj
+        except ImportError:
+            logger.debug("LiberoAdapter: mujoco not importable; skipping pre-register")
+            return
+
+        model = getattr(world, "_model", None)
+        if model is None:
+            logger.debug("LiberoAdapter: no compiled model; skipping pre-register")
+            return
+
+        try:
+            wrapper = _build_scene_robot_wrapper(_mj, model, prefix=self._scene_robot_prefix)
+        except Exception as e:  # noqa: BLE001 - never abort eval on a discovery failure
             logger.warning(
-                "LiberoAdapter: pre-register sim.add_robot('robot', %r) raised: %s; "
-                "super() will retry and surface the same error",
-                self.default_robot,
+                "LiberoAdapter: scene-Panda discovery failed: %s; super() will fall back to its add_robot path",
                 e,
             )
             return
-        if isinstance(result, dict) and result.get("status") == "error":
-            msg = (result.get("content") or [{}])[0].get("text", "")
-            logger.warning(
-                "LiberoAdapter: pre-register sim.add_robot('robot', %r) failed: %s; "
-                "super() will retry and surface the same error",
-                self.default_robot,
-                msg,
+        if wrapper is None:
+            logger.debug(
+                "LiberoAdapter: no body with prefix %r found in scene; super() will add a Panda",
+                self._scene_robot_prefix,
             )
+            return
+
+        # Register under the key super() would have used so its
+        # list_robots() check finds it.
+        world.robots["robot"] = wrapper
+        logger.debug(
+            "LiberoAdapter: registered scene-supplied Panda %r as 'robot' (joints=%d, actuators=%d)",
+            self._scene_robot_prefix,
+            len(wrapper.joint_names),
+            len(wrapper.actuator_ids),
+        )
 
     def _install_libero_cameras(self, sim: SimEngine) -> None:
         """Inject the cameras the ``libero_panda`` data_config expects.
@@ -1287,6 +1321,95 @@ def _rename_mjcf_cameras(xml: str, aliases: dict[str, str]) -> str:
         return head + aliases.get(name, name) + tail
 
     return _CAMERA_NAME_RE.sub(_sub, xml)
+
+
+def _build_scene_robot_wrapper(mj: Any, model: Any, *, prefix: str) -> SimRobot | None:
+    """Construct a :class:`SimRobot` for an existing scene-supplied Panda.
+
+    Walks the compiled MuJoCo ``model`` looking for bodies / joints /
+    actuators whose names start with ``prefix`` (default ``"robot0_"``,
+    matching RoboSuite / LIBERO's canonical naming). Returns a
+    :class:`SimRobot` whose IDs and namespace are filled in from the
+    discovered names, or ``None`` when no body matches.
+
+    The returned wrapper is only useful for **populating
+    ``world.robots``** so ``BenchmarkProtocol.on_episode_start``'s
+    ``list_robots()`` check returns non-empty. It is NOT a substitute
+    for the wrapper that ``Simulation.add_robot`` builds via
+    ``inject_robot_into_scene`` — that call also recompiles the spec
+    and registers tendon / actuator side-effects we don't want here.
+    The whole point of this discovery path is to avoid that recompile.
+
+    Body / joint / actuator IDs are read from the *current* compiled
+    model. If the spec is recompiled later (e.g. by
+    ``_install_libero_cameras``), the IDs may no longer be valid; the
+    adapter relies on its model-side camera detection (#167 / #166
+    follow-up) to keep that recompile from firing.
+
+    Returns ``None`` when:
+
+    * No body name starts with ``prefix``.
+    * ``model`` doesn't expose ``nbody`` / ``njnt`` / ``nu`` (e.g. a
+      stub injected by tests).
+
+    Discovery never raises - any unexpected MuJoCo error is caught at
+    the call site in :meth:`LiberoAdapter._register_default_robot` and
+    surfaced as a WARNING-and-continue.
+    """
+    nbody = int(getattr(model, "nbody", 0))
+    njnt = int(getattr(model, "njnt", 0))
+    nu = int(getattr(model, "nu", 0))
+    if nbody == 0 or njnt == 0:
+        return None
+
+    # Find the root body of the scene-supplied robot - the first body
+    # whose name starts with ``prefix`` and whose parent is the world
+    # body (id 0). Falls back to the first match if no clear root is
+    # found, which is acceptable for the wrapper's purposes (we only
+    # need IDs for the compatibility check, not for kinematic queries).
+    root_body_id = -1
+    for i in range(nbody):
+        name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, i)
+        if not isinstance(name, str) or not name.startswith(prefix):
+            continue
+        if root_body_id < 0:
+            root_body_id = i
+        # Prefer a body whose parent is the world; treat that as canonical.
+        body_parentid = getattr(model, "body_parentid", None)
+        if body_parentid is not None:
+            try:
+                if int(body_parentid[i]) == 0:
+                    root_body_id = i
+                    break
+            except (IndexError, TypeError):
+                pass
+    if root_body_id < 0:
+        return None
+
+    joint_names: list[str] = []
+    joint_ids: list[int] = []
+    for i in range(njnt):
+        name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT, i)
+        if isinstance(name, str) and name.startswith(prefix):
+            joint_names.append(name)
+            joint_ids.append(i)
+
+    actuator_ids: list[int] = []
+    for i in range(nu):
+        name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_ACTUATOR, i)
+        if isinstance(name, str) and name.startswith(prefix):
+            actuator_ids.append(i)
+
+    return SimRobot(
+        name="robot",  # registered key matches super()'s default
+        urdf_path="",  # scene-supplied, no upstream URDF
+        data_config="panda",  # LIBERO is Panda-only
+        body_id=root_body_id,
+        joint_names=joint_names,
+        joint_ids=joint_ids,
+        actuator_ids=actuator_ids,
+        namespace=prefix,
+    )
 
 
 __all__ = [

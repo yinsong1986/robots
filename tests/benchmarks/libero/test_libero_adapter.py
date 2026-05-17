@@ -1695,13 +1695,59 @@ class TestInitJitterDefault:
 
 
 class TestPreRegisterDefaultRobot:
-    """``LiberoAdapter._register_default_robot`` calls ``sim.add_robot`` AFTER
-    ``load_scene`` so ``super().on_episode_start`` sees a non-empty
-    ``list_robots()`` and skips its own unconditional add. Otherwise
-    super()'s add fires every episode and recompiles the spec, jumping
-    ``model.nq`` (#166 verification: 44 → 53 on LIBERO SCENE5) and
-    invalidating any qpos snapshot.
+    """``LiberoAdapter._register_default_robot`` scans the loaded MJCF for a
+    scene-supplied Panda (bodies prefixed with ``robot0_`` per RoboSuite /
+    LIBERO convention) and registers a :class:`SimRobot` wrapper directly
+    in ``world.robots`` — *without* recompiling.
+
+    Goal: make ``sim.list_robots()`` return ``["robot"]`` BEFORE
+    ``super().on_episode_start`` runs, so the base BenchmarkProtocol
+    skips its unconditional ``sim.add_robot`` call. That unconditional
+    call would otherwise inject a SECOND Panda (the redundant-Panda bug
+    confirmed in #166 round 4 — the second Panda's plastic shells sit
+    right in front of the ``image`` camera and contaminate every
+    real-render frame).
     """
+
+    def _make_panda_model(
+        self, prefix: str = "robot0_", body_count: int = 3, joint_count: int = 9, actuator_count: int = 8
+    ):
+        """Build a stub MuJoCo model with the right body/joint/actuator names."""
+
+        class _FakeMjEnum:
+            mjOBJ_BODY = 1
+            mjOBJ_JOINT = 3
+            mjOBJ_ACTUATOR = 5
+
+        body_names = ["world"] + [f"{prefix}link{i}" for i in range(body_count - 1)]
+        joint_names = [f"{prefix}joint{i}" for i in range(joint_count)]
+        actuator_names = [f"{prefix}actuator{i}" for i in range(actuator_count)]
+        # body_parentid: 0 = world, all other panda links are children of 0
+        body_parentid = [0] + [0] * (body_count - 1)
+
+        class _FakeMjModel:
+            nbody = body_count
+            njnt = joint_count
+            nu = actuator_count
+            body_parentid: list[int] = []  # set below; placeholder for class layout
+
+        model = _FakeMjModel()
+        model.body_parentid = body_parentid
+
+        class _FakeMjModule:
+            mjtObj = _FakeMjEnum()
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                if obj_type == _FakeMjEnum.mjOBJ_BODY:
+                    return body_names[idx] if 0 <= idx < len(body_names) else None
+                if obj_type == _FakeMjEnum.mjOBJ_JOINT:
+                    return joint_names[idx] if 0 <= idx < len(joint_names) else None
+                if obj_type == _FakeMjEnum.mjOBJ_ACTUATOR:
+                    return actuator_names[idx] if 0 <= idx < len(actuator_names) else None
+                return None
+
+        return model, _FakeMjModule()
 
     def _scene_path_setup(self, tmp_path):
         """Create a cached scene XML so on_episode_start hits the load_scene path."""
@@ -1711,7 +1757,7 @@ class TestPreRegisterDefaultRobot:
             PICK_CUBE_BDDL,
             scene_cache_dir=str(cache_dir),
             install_cameras=False,
-            apply_scene_keyframe=False,  # focus on the pre-register flow
+            apply_scene_keyframe=False,  # focus on pre-register
         )
         bddl_path = adapter._resolve_bddl_path_for_libero()
         assert bddl_path is not None
@@ -1719,37 +1765,17 @@ class TestPreRegisterDefaultRobot:
         (cache_dir / f"{sha}.xml").write_text("<mujoco/>")
         return adapter
 
-    def test_super_skips_add_when_pre_registered(self, tmp_path):
-        """The full on_episode_start path: pre-register fires, super() finds
-        ``robot`` already in ``list_robots()``, no redundant add_robot."""
+    def test_scene_panda_detected_and_registered(self, tmp_path):
+        """When the loaded model has bodies / joints / actuators with the
+        canonical ``robot0_`` prefix, the adapter MUST construct a
+        SimRobot wrapper and register it under ``"robot"`` — no
+        ``sim.add_robot`` call required."""
         adapter = self._scene_path_setup(tmp_path)
+        model, mj = self._make_panda_model()
+
         sim = FakeSim(data_config="panda")
-        # Empty registry to simulate post-load_scene state.
         sim._world.robots.clear()
-        add_robot_calls: list[dict[str, Any]] = []
-        original_add = sim.add_robot
-
-        def tracking_add_robot(self_, name, **kw):  # noqa: ARG002
-            add_robot_calls.append({"name": name, **kw})
-            return original_add(name, **kw)
-
-        with patch.object(FakeSim, "add_robot", tracking_add_robot, create=False):
-            adapter.on_episode_start(sim, random.Random(0))
-
-        # Only the pre-register fires - super() sees the robot present and skips.
-        assert len(add_robot_calls) == 1
-        assert add_robot_calls[0]["name"] == "robot"
-        assert add_robot_calls[0]["data_config"] == "panda"
-
-    def test_pre_register_skipped_when_robot_already_present(self, tmp_path):
-        """If a previous episode left the robot registered (or the scene
-        somehow registered it pre-load), don't double-add."""
-        adapter = self._scene_path_setup(tmp_path)
-        sim = FakeSim(data_config="panda")
-        # Pre-populate as if from a prior episode.
-        # FakeSim's _FakeWorld.robots already has 'fake_panda'; add 'robot'
-        # explicitly so list_robots() returns it.
-        sim._world.robots["robot"] = _FakeRobot("panda")
+        sim._world._model = model  # type: ignore[attr-defined]
 
         add_robot_calls: list[str] = []
 
@@ -1758,103 +1784,197 @@ class TestPreRegisterDefaultRobot:
             return {"status": "success", "content": [{"text": "ok"}]}
 
         with patch.object(FakeSim, "add_robot", tracking_add_robot, create=False):
-            adapter.on_episode_start(sim, random.Random(0))
+            with patch.dict("sys.modules", {"mujoco": mj}):
+                adapter.on_episode_start(sim, random.Random(0))
 
-        # No add_robot calls at all - both pre-register and super() find
-        # the robot already present.
+        # Critical: NO add_robot calls fired (no recompile, no redundant Panda).
         assert add_robot_calls == []
+        # Wrapper landed in the registry under the canonical key.
+        assert "robot" in sim._world.robots
+        wrapper = sim._world.robots["robot"]
+        assert wrapper.data_config == "panda"
+        assert wrapper.namespace == "robot0_"
+        assert len(wrapper.joint_names) == 9
+        assert all(n.startswith("robot0_") for n in wrapper.joint_names)
+        assert len(wrapper.actuator_ids) == 8
+
+    def test_no_scene_panda_falls_back_to_super_add_robot(self, tmp_path):
+        """When the loaded MJCF doesn't have a ``robot0_`` body, the adapter
+        leaves ``world.robots`` alone and super() does its normal add."""
+        adapter = self._scene_path_setup(tmp_path)
+
+        # Model without any robot0_ prefix bodies.
+        class _NoRobotModel:
+            nbody = 1
+            njnt = 0
+            nu = 0
+            body_parentid = [0]
+
+        class _NoRobotMj:
+            class mjtObj:
+                mjOBJ_BODY = 1
+                mjOBJ_JOINT = 3
+                mjOBJ_ACTUATOR = 5
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                return "world" if obj_type == 1 and idx == 0 else None
+
+        sim = FakeSim(data_config="panda")
+        sim._world.robots.clear()
+        sim._world._model = _NoRobotModel()  # type: ignore[attr-defined]
+
+        add_robot_calls: list[str] = []
+
+        def tracking_add_robot(self_, name, **kw):  # noqa: ARG002
+            add_robot_calls.append(name)
+            sim._world.robots[name] = _FakeRobot(kw.get("data_config", "panda"))
+            return {"status": "success", "content": [{"text": "ok"}]}
+
+        with patch.object(FakeSim, "add_robot", tracking_add_robot, create=False):
+            with patch.dict("sys.modules", {"mujoco": _NoRobotMj()}):
+                adapter.on_episode_start(sim, random.Random(0))
+
+        # super() did the add - this is the bare-Panda fallback.
+        assert add_robot_calls == ["robot"]
+
+    def test_robot_already_registered_noop(self, tmp_path):
+        """If ``"robot"`` is already in the registry (defensive), the
+        scan path is skipped entirely."""
+        adapter = self._scene_path_setup(tmp_path)
+        # No fake model needed - the early-return on registry check fires
+        # before the scan.
+        sim = FakeSim(data_config="panda")
+        sim._world.robots["robot"] = _FakeRobot("panda")
+
+        # Don't patch mujoco — if the scan ran, it would fail.
+        adapter.on_episode_start(sim, random.Random(0))
+
+        # Registration unchanged.
+        assert sim._world.robots["robot"].data_config == "panda"
 
     def test_pre_register_skipped_when_no_scene_loaded(self):
         """Bare-Panda fallback (no scene_path): pre-register MUST NOT fire
-        because there's no scene-supplied panda to align with. Let super()
-        do its normal add_robot."""
+        because there's no scene-supplied panda to wrap. super() does the
+        normal add."""
         adapter = LiberoAdapter.from_text(
             PICK_CUBE_BDDL,
             install_cameras=False,
             auto_generate_scene=False,  # no scene
         )
         sim = FakeSim(data_config="panda")
-        sim._world.robots.clear()  # super() should add
+        sim._world.robots.clear()
 
         add_robot_calls: list[str] = []
 
         def tracking_add_robot(self_, name, **kw):  # noqa: ARG002
             add_robot_calls.append(name)
-            return {"status": "success", "content": [{"text": "ok"}]}
-
-        with patch.object(FakeSim, "add_robot", tracking_add_robot, create=False):
-            adapter.on_episode_start(sim, random.Random(0))
-
-        # super() did its normal add (single call).
-        assert add_robot_calls == ["robot"]
-
-    def test_pre_register_failure_falls_through_to_super(self, tmp_path, caplog):
-        """If pre-register's add_robot fails (e.g. backend rejects), log
-        WARNING and let super() retry with the same args - we don't
-        introduce a new failure mode."""
-        adapter = self._scene_path_setup(tmp_path)
-        sim = FakeSim(data_config="panda")
-        sim._world.robots.clear()
-
-        attempt = {"n": 0}
-
-        def flaky_add_robot(self_, name, **kw):  # noqa: ARG002
-            attempt["n"] += 1
-            if attempt["n"] == 1:
-                return {"status": "error", "content": [{"text": "spec injection failed"}]}
-            # super() retries; allow it to succeed.
             sim._world.robots[name] = _FakeRobot(kw.get("data_config", "panda"))
             return {"status": "success", "content": [{"text": "ok"}]}
 
-        with caplog.at_level("WARNING"):
-            with patch.object(FakeSim, "add_robot", flaky_add_robot, create=False):
-                adapter.on_episode_start(sim, random.Random(0))
-
-        # Pre-register tried, failed (logged), then super() retried and succeeded.
-        assert attempt["n"] == 2
-        assert any(
-            "pre-register" in rec.message and "failed" in rec.message
-            for rec in caplog.records
-            if rec.levelname == "WARNING"
-        )
-
-    def test_pre_register_no_add_robot_method_skipped(self, tmp_path):
-        """Backends without add_robot at all (future engines) skip silently."""
-        adapter = self._scene_path_setup(tmp_path)
-
-        class _NoAddRobotSim(FakeSim):
-            add_robot = None  # type: ignore[assignment]
-
-        sim = _NoAddRobotSim(data_config="panda")
-        # Pre-register MUST NOT raise even though sim.add_robot is None.
-        # The downstream super() may or may not raise depending on its
-        # own handling; the contract here is just that pre-register's
-        # ``getattr(sim, "add_robot", None)`` short-circuits cleanly.
-        adapter._register_default_robot(sim)
-        # No exception, no crash. The robot wasn't registered (sim has no
-        # add_robot to do it), but that's super()'s problem if/when it
-        # runs - pre-register's contract is met.
-
-    def test_robot_name_matches_super_default(self, tmp_path):
-        """Pre-register MUST use ``name="robot"`` to match super()'s default,
-        otherwise super() still won't recognize the registration and will
-        add a SECOND robot."""
-        adapter = self._scene_path_setup(tmp_path)
-        sim = FakeSim(data_config="panda")
-        sim._world.robots.clear()
-
-        add_robot_names: list[str] = []
-        original_add = sim.add_robot
-
-        def tracking_add_robot(self_, name, **kw):  # noqa: ARG002
-            add_robot_names.append(name)
-            return original_add(name, **kw)
-
         with patch.object(FakeSim, "add_robot", tracking_add_robot, create=False):
             adapter.on_episode_start(sim, random.Random(0))
 
-        # Single call, named exactly "robot" (not "panda" or anything else).
-        assert add_robot_names == ["robot"]
+        # super() did its normal add (single call) - pre-register no-op'd.
+        assert add_robot_calls == ["robot"]
+
+    def test_custom_scene_robot_prefix(self, tmp_path):
+        """Custom ``scene_robot_prefix`` lets the adapter wrap pandas
+        named differently (e.g. for non-LIBERO scenes that use a
+        different convention)."""
+        adapter = self._scene_path_setup(tmp_path)
+        adapter._scene_robot_prefix = "myrobot_"
+        model, mj = self._make_panda_model(prefix="myrobot_")
+
+        sim = FakeSim(data_config="panda")
+        sim._world.robots.clear()
+        sim._world._model = model  # type: ignore[attr-defined]
+
+        with patch.dict("sys.modules", {"mujoco": mj}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        assert "robot" in sim._world.robots
+        assert sim._world.robots["robot"].namespace == "myrobot_"
+
+    def test_no_compiled_model_skipped(self, tmp_path):
+        """Sim without ``world._model`` (non-MuJoCo backend, or stub) - skip."""
+        adapter = self._scene_path_setup(tmp_path)
+        sim = FakeSim(data_config="panda")
+        sim._world.robots.clear()
+        sim._world._model = None  # type: ignore[attr-defined]
+
+        # super() falls back to its normal add path.
+        with patch.dict("sys.modules", {"mujoco": MagicMock()}):
+            adapter.on_episode_start(sim, random.Random(0))
+
+        # No wrapper from the scan path; super() did the regular add.
+        # FakeSim's add_robot registers under name="robot".
+        assert "robot" in sim._world.robots
+
+    def test_module_helper_build_scene_robot_wrapper_returns_none_on_no_match(self):
+        """``_build_scene_robot_wrapper`` returns None when no body matches."""
+        from strands_robots.benchmarks.libero.adapter import _build_scene_robot_wrapper
+
+        class _Mj:
+            class mjtObj:
+                mjOBJ_BODY = 1
+                mjOBJ_JOINT = 3
+                mjOBJ_ACTUATOR = 5
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                return "world" if idx == 0 else None
+
+        class _Model:
+            nbody = 2
+            njnt = 0
+            nu = 0
+            body_parentid = [0, 0]
+
+        wrapper = _build_scene_robot_wrapper(_Mj(), _Model(), prefix="robot0_")
+        assert wrapper is None
+
+    def test_module_helper_build_scene_robot_wrapper_filters_correctly(self):
+        """``_build_scene_robot_wrapper`` only includes bodies / joints /
+        actuators with the matching prefix."""
+        from strands_robots.benchmarks.libero.adapter import _build_scene_robot_wrapper
+
+        body_names = ["world", "robot0_base", "table", "robot0_link0", "mug_1"]
+        joint_names = ["robot0_joint1", "table_joint", "robot0_finger_joint1"]
+        actuator_names = ["robot0_act1", "table_act", "robot0_act2"]
+
+        class _Mj:
+            class mjtObj:
+                mjOBJ_BODY = 1
+                mjOBJ_JOINT = 3
+                mjOBJ_ACTUATOR = 5
+
+            @staticmethod
+            def mj_id2name(model, obj_type, idx):  # noqa: ARG004
+                if obj_type == 1:
+                    return body_names[idx] if idx < len(body_names) else None
+                if obj_type == 3:
+                    return joint_names[idx] if idx < len(joint_names) else None
+                if obj_type == 5:
+                    return actuator_names[idx] if idx < len(actuator_names) else None
+                return None
+
+        class _Model:
+            nbody = len(body_names)
+            njnt = len(joint_names)
+            nu = len(actuator_names)
+            body_parentid = [0, 0, 0, 0, 0]
+
+        wrapper = _build_scene_robot_wrapper(_Mj(), _Model(), prefix="robot0_")
+        assert wrapper is not None
+        # Only 2 robot0_ joints (joint1, finger_joint1)
+        assert wrapper.joint_names == ["robot0_joint1", "robot0_finger_joint1"]
+        # Only 2 robot0_ actuators
+        assert len(wrapper.actuator_ids) == 2
+        # Wrapper namespace is the prefix.
+        assert wrapper.namespace == "robot0_"
+        # Wrapper name is the canonical "robot" key.
+        assert wrapper.name == "robot"
 
 
 # PolicyRunner + evaluate_benchmark integration
