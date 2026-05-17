@@ -1236,6 +1236,171 @@ class TestAugmentObservation:
                 f"{expected}. Round-32 split-source contract may have regressed back to site_xmat."
             )
 
+    def test_state_gripper_joint_names_default_matches_libero_convention(self):
+        """Round 33 (#168): default ``state_gripper_joint_names`` is
+        ``["<scene_gripper_prefix>finger_joint1",
+           "<scene_gripper_prefix>finger_joint2"]``
+        ⇒ ``["gripper0_finger_joint1", "gripper0_finger_joint2"]``
+        for LIBERO. These are the joints LIBERO's
+        ``robot0_gripper_qpos`` observable indexes."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL)
+        assert adapter.state_gripper_joint_names == [
+            "gripper0_finger_joint1",
+            "gripper0_finger_joint2",
+        ]
+
+    def test_state_gripper_joint_names_user_override(self):
+        """Round 33 (#168): user-supplied joint names override the
+        auto-derived default."""
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            state_gripper_joint_names=["my_left_finger", "my_right_finger"],
+        )
+        assert adapter.state_gripper_joint_names == ["my_left_finger", "my_right_finger"]
+
+    def test_state_gripper_joint_names_tracks_scene_gripper_prefix(self):
+        """Round 33 (#168): when ``scene_gripper_prefix`` is changed,
+        the auto-derived ``state_gripper_joint_names`` follows."""
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, scene_gripper_prefix="custom_grip_")
+        assert adapter.state_gripper_joint_names == [
+            "custom_grip_finger_joint1",
+            "custom_grip_finger_joint2",
+        ]
+
+    def test_read_gripper_qpos_returns_both_fingers_with_opposite_signs(self, libero_scene_xml):
+        """Round 33 (#168) — primary regression for the duplicated-finger bug.
+
+        With a real LIBERO scene compiled into the sim,
+        ``_read_gripper_qpos`` returns
+        ``[gripper0_finger_joint1.qpos, gripper0_finger_joint2.qpos]``
+        directly from ``data.qpos[jnt_qposadr]``. Their values have
+        OPPOSITE signs by physical convention (the Panda gripper's
+        two fingers move apart, with mirrored ctrlranges).
+
+        Pre-round-33 the adapter packed ``[gripper_value, gripper_value]``
+        (both positive) which was structurally OOD from training data.
+        Pin so the duplicate-packing bug can't sneak back."""
+        pytest.importorskip("mujoco")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        # Find both finger joints and compute their qpos addresses.
+        j1 = mujoco.mj_name2id(sim._world._model, mujoco.mjtObj.mjOBJ_JOINT, "gripper0_finger_joint1")  # type: ignore[attr-defined]
+        j2 = mujoco.mj_name2id(sim._world._model, mujoco.mjtObj.mjOBJ_JOINT, "gripper0_finger_joint2")  # type: ignore[attr-defined]
+        if j1 < 0 or j2 < 0:
+            pytest.skip("scene XML missing gripper0_finger_joint1/2")
+        adr1 = int(sim._world._model.jnt_qposadr[j1])  # type: ignore[attr-defined]
+        adr2 = int(sim._world._model.jnt_qposadr[j2])  # type: ignore[attr-defined]
+        # Set them to canonical opposite-sign values for the test (the
+        # initial mj_forward leaves them at 0 since no init_state is
+        # applied). LIBERO at canonical ready-pose has them at
+        # ~[+0.0208, -0.0208].
+        sim._world._data.qpos[adr1] = 0.0208  # type: ignore[attr-defined]
+        sim._world._data.qpos[adr2] = -0.0208  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        qpos = adapter._read_gripper_qpos(sim)
+        assert qpos is not None, "_read_gripper_qpos should return both finger qpos"
+        assert len(qpos) == 2
+
+        # Round-33 contract: each finger's qpos read independently.
+        assert qpos[0] == pytest.approx(0.0208, abs=1e-6), f"finger1 qpos {qpos[0]} != expected 0.0208"
+        assert qpos[1] == pytest.approx(-0.0208, abs=1e-6), (
+            f"finger2 qpos {qpos[1]} != expected -0.0208 (the opposite-sign convention)"
+        )
+
+        # Sentinel: round-33 fix means qpos[0] != qpos[1]. Pre-round-33's
+        # duplicate packing would always have qpos[0] == qpos[1].
+        assert qpos[0] != qpos[1], (
+            f"both fingers reported as {qpos[0]} — round-33 duplicate-packing bug may have regressed"
+        )
+
+    def test_read_gripper_qpos_returns_none_when_joints_missing(self, libero_scene_xml):
+        """Round 33 (#168): when configured joint names don't resolve
+        in the compiled model (custom non-RoboSuite scene),
+        ``_read_gripper_qpos`` returns ``None`` so the caller's
+        single-joint duplicate fallback fires.
+
+        Pin so non-LIBERO callers keep their pre-round-33 behaviour."""
+        pytest.importorskip("mujoco")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+            # Override to joint names that don't exist.
+            state_gripper_joint_names=["nonexistent_left", "nonexistent_right"],
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        result = adapter._read_gripper_qpos(sim)
+        assert result is None, (
+            f"expected None when joint names don't resolve, got {result}; "
+            f"caller's fallback won't fire and state.gripper will be wrong"
+        )
+
+    def test_augment_observation_uses_two_finger_qpos_with_real_scene(self, libero_scene_xml):
+        """Round 33 (#168) end-to-end: ``augment_observation``'s
+        ``state.gripper`` is a 2-element list of OPPOSITE-sign finger
+        qpos values, NOT a duplicate of one finger.
+
+        This is the customer-facing assertion: the values that flow
+        into the GR00T policy server's ``state.gripper`` key must
+        match LIBERO's ``robot0_gripper_qpos`` shape and signs.
+        Confirms the round-33 fix at the public boundary."""
+        pytest.importorskip("mujoco")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+            eef_body_name="robot0_right_hand",
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        # Canonical opposite-sign finger positions.
+        j1 = mujoco.mj_name2id(sim._world._model, mujoco.mjtObj.mjOBJ_JOINT, "gripper0_finger_joint1")  # type: ignore[attr-defined]
+        j2 = mujoco.mj_name2id(sim._world._model, mujoco.mjtObj.mjOBJ_JOINT, "gripper0_finger_joint2")  # type: ignore[attr-defined]
+        if j1 < 0 or j2 < 0:
+            pytest.skip("scene XML missing gripper0_finger_joint1/2")
+        adr1 = int(sim._world._model.jnt_qposadr[j1])  # type: ignore[attr-defined]
+        adr2 = int(sim._world._model.jnt_qposadr[j2])  # type: ignore[attr-defined]
+        sim._world._data.qpos[adr1] = 0.0208  # type: ignore[attr-defined]
+        sim._world._data.qpos[adr2] = -0.0208  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        out = adapter.augment_observation(sim, {})
+        assert "gripper" in out
+        assert len(out["gripper"]) == 2
+
+        # The two values must be OPPOSITE in sign — that's the
+        # round-33 contract that distinguishes the fix from pre-fix
+        # duplicate-packing. Use a tolerance because the two fingers
+        # could be at slightly different magnitudes due to gravity.
+        assert out["gripper"][0] == pytest.approx(0.0208, abs=1e-6)
+        assert out["gripper"][1] == pytest.approx(-0.0208, abs=1e-6)
+        assert out["gripper"][0] != out["gripper"][1], (
+            f"state.gripper {out['gripper']} has duplicated value — round-33 bug regressed"
+        )
+
 
 class TestQuaternionToEuler:
     """Pure-math regression tests for ``_quat_wxyz_to_rpy_xyz`` so future

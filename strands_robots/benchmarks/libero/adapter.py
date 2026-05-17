@@ -139,6 +139,7 @@ class LiberoAdapter(BenchmarkProtocol):
         eef_body_name: str | None = None,
         eef_state_site_name: str | None = None,
         gripper_joint_name: str | None = None,
+        state_gripper_joint_names: list[str] | None = None,
         inject_eef_state: bool = True,
         auto_generate_scene: bool = True,
         scene_cache_dir: str | None = None,
@@ -395,6 +396,23 @@ class LiberoAdapter(BenchmarkProtocol):
         # touch", which preserves backwards-compat for custom scene users.
         self._user_eef_body_name: str | None = str(eef_body_name) if eef_body_name is not None else None
         self._user_gripper_joint_name: str | None = str(gripper_joint_name) if gripper_joint_name is not None else None
+        # State-side gripper joint names (round 33, #168). LIBERO trains
+        # ``state.gripper`` on a 2-element vector ``[finger1.qpos, finger2.qpos]``
+        # — the two fingers have OPPOSITE-sign qpos by physical
+        # convention (they move apart). Pre-round-33 we read ONE
+        # finger from ``obs[gripper_joint_name]`` and packed it as
+        # ``[v, v]`` (both positive), which is structurally
+        # out-of-distribution for GR00T-LIBERO and produced the
+        # near-zero deltas observed across rounds 23-32. Round 33
+        # reads both finger qpos directly from ``data.qpos[jnt_qposadr]``.
+        # Default auto-derives ``["<gripper_prefix>finger_joint1",
+        # "<gripper_prefix>finger_joint2"]`` (i.e.
+        # ``["gripper0_finger_joint1", "gripper0_finger_joint2"]`` for
+        # LIBERO scenes). User override (a list of joint names) is used
+        # as-is for non-RoboSuite gripper layouts.
+        self._user_state_gripper_joint_names: list[str] | None = (
+            [str(n) for n in state_gripper_joint_names] if state_gripper_joint_names is not None else None
+        )
         self._inject_eef_state = bool(inject_eef_state)
         self._auto_generate_scene = bool(auto_generate_scene)
         self._scene_cache_dir = scene_cache_dir
@@ -504,6 +522,7 @@ class LiberoAdapter(BenchmarkProtocol):
         eef_body_name: str | None = None,
         eef_state_site_name: str | None = None,
         gripper_joint_name: str | None = None,
+        state_gripper_joint_names: list[str] | None = None,
         inject_eef_state: bool = True,
         auto_generate_scene: bool = True,
         scene_cache_dir: str | None = None,
@@ -529,7 +548,9 @@ class LiberoAdapter(BenchmarkProtocol):
             install_cameras=install_cameras,
             cameras=cameras,
             eef_body_name=eef_body_name,
+            eef_state_site_name=eef_state_site_name,
             gripper_joint_name=gripper_joint_name,
+            state_gripper_joint_names=state_gripper_joint_names,
             inject_eef_state=inject_eef_state,
             auto_generate_scene=auto_generate_scene,
             scene_cache_dir=scene_cache_dir,
@@ -555,6 +576,7 @@ class LiberoAdapter(BenchmarkProtocol):
         eef_body_name: str | None = None,
         eef_state_site_name: str | None = None,
         gripper_joint_name: str | None = None,
+        state_gripper_joint_names: list[str] | None = None,
         inject_eef_state: bool = True,
         auto_generate_scene: bool = True,
         scene_cache_dir: str | None = None,
@@ -577,6 +599,7 @@ class LiberoAdapter(BenchmarkProtocol):
             eef_body_name=eef_body_name,
             eef_state_site_name=eef_state_site_name,
             gripper_joint_name=gripper_joint_name,
+            state_gripper_joint_names=state_gripper_joint_names,
             inject_eef_state=inject_eef_state,
             auto_generate_scene=auto_generate_scene,
             scene_cache_dir=scene_cache_dir,
@@ -623,6 +646,29 @@ class LiberoAdapter(BenchmarkProtocol):
         if self._user_eef_state_site_name is not None:
             return self._user_eef_state_site_name
         return f"{self._scene_gripper_prefix}grip_site"
+
+    @property
+    def state_gripper_joint_names(self) -> list[str]:
+        """Resolved 2-element list of finger joint names for ``state.gripper``.
+
+        Returns the user-supplied ``state_gripper_joint_names``
+        constructor argument when set, otherwise auto-derives from
+        ``scene_gripper_prefix`` as
+        ``["<prefix>finger_joint1", "<prefix>finger_joint2"]``
+        (i.e. ``["gripper0_finger_joint1", "gripper0_finger_joint2"]``
+        for LIBERO scenes).
+
+        Round 33 (#168): LIBERO trains ``state.gripper`` on a 2-element
+        vector ``[finger1.qpos, finger2.qpos]`` whose elements have
+        OPPOSITE signs by physical convention (the two fingers move
+        apart). Pre-round-33 we read ONE finger and packed it as
+        ``[v, v]`` (both positive), which fed GR00T structurally
+        out-of-distribution state. The property returns the names in
+        the order they appear in the trained state vector.
+        """
+        if self._user_state_gripper_joint_names is not None:
+            return list(self._user_state_gripper_joint_names)
+        return [f"{self._scene_gripper_prefix}finger_joint1", f"{self._scene_gripper_prefix}finger_joint2"]
 
     def on_episode_start(self, sim: SimEngine, rng: random.Random) -> None:
         """Auto-generate scene (if needed), load it, capture-or-restore
@@ -1333,32 +1379,46 @@ class LiberoAdapter(BenchmarkProtocol):
             merged.setdefault("pitch", pitch)
             merged.setdefault("yaw", yaw)
 
-        # Gripper - read from the (already collected) joint observation.
-        # The Menagerie Panda's two-finger constraint mirrors finger_joint1
-        # to finger_joint2, so reading just the first one is sufficient
-        # *as a value* — but the checkpoint was trained on
-        # ``robot0_gripper_qpos`` from LIBERO/RoboSuite which is a
-        # 2-element array (one qpos per finger), and the server
-        # boolean-masks the state vector by the per-key feature dimension.
-        # Packing ``gripper`` as a scalar fails with
-        # ``boolean index did not match indexed array along dimension 1;
-        # dimension is 1 but corresponding boolean dimension is 2``. So
-        # mirror the value into a 2-element list to match the trained
-        # shape.
-        gripper_value = obs.get(self._gripper_joint_name)
-        if gripper_value is None:
-            # Some backends namespace joint keys; try the suffix match.
-            for key, val in obs.items():
-                if isinstance(key, str) and key.endswith("/" + self._gripper_joint_name):
-                    gripper_value = val
-                    break
-        if isinstance(gripper_value, (int, float)) and not isinstance(gripper_value, bool):
-            merged.setdefault("gripper", [float(gripper_value), float(gripper_value)])
+        # Gripper — round 33 (#168). LIBERO trains ``state.gripper`` on
+        # ``robot0_gripper_qpos`` from LIBERO/RoboSuite, which is a
+        # 2-element array
+        # ``[gripper0_finger_joint1.qpos, gripper0_finger_joint2.qpos]``.
+        # The two fingers have OPPOSITE-sign qpos by physical
+        # convention (they move apart); typical at-rest values are
+        # ``[+0.0208, -0.0208]``. Pre-round-33 we read only one finger
+        # via ``obs[self._gripper_joint_name]`` and packed it as
+        # ``[v, v]`` (both positive), which fed GR00T structurally
+        # out-of-distribution state — manifest as near-zero policy
+        # deltas across rounds 23-32 of #168.
+        #
+        # Read both finger qpos directly from ``data.qpos[jnt_qposadr]``
+        # using the canonical RoboSuite joint names. Falls back to the
+        # legacy single-joint duplicate-packing for non-RoboSuite
+        # scenes that don't ship two named finger joints.
+        gripper_qpos = self._read_gripper_qpos(sim)
+        if gripper_qpos is not None:
+            merged.setdefault("gripper", gripper_qpos)
         else:
-            logger.debug(
-                "LiberoAdapter: gripper joint %r not found in obs; omitting state.gripper",
-                self._gripper_joint_name,
-            )
+            # Legacy fallback — read one joint from obs and duplicate
+            # (preserves pre-round-33 behaviour for non-RoboSuite
+            # scenes; the duplicate-packing is wrong for LIBERO but
+            # there's no better default for unknown gripper layouts).
+            gripper_value = obs.get(self._gripper_joint_name)
+            if gripper_value is None:
+                # Some backends namespace joint keys; try the suffix match.
+                for key, val in obs.items():
+                    if isinstance(key, str) and key.endswith("/" + self._gripper_joint_name):
+                        gripper_value = val
+                        break
+            if isinstance(gripper_value, (int, float)) and not isinstance(gripper_value, bool):
+                merged.setdefault("gripper", [float(gripper_value), float(gripper_value)])
+            else:
+                logger.debug(
+                    "LiberoAdapter: gripper joints %s not found via direct mujoco lookup, "
+                    "and obs key %r missing; omitting state.gripper",
+                    self.state_gripper_joint_names,
+                    self._gripper_joint_name,
+                )
 
         # Round 30 (#168) — emit one structured STATE_LOG line per
         # ``augment_observation`` call when STRANDS_LIBERO_STATE_LOG=1.
@@ -1513,6 +1573,77 @@ class LiberoAdapter(BenchmarkProtocol):
         merged_pos = site_pos if site_pos is not None else fallback_pos
         merged_quat = body_quat if body_quat is not None else fallback_quat
         return (merged_pos, merged_quat)
+
+    def _read_gripper_qpos(self, sim: SimEngine) -> list[float] | None:
+        """Read both finger qpos for the LIBERO ``state.gripper`` 2-vector.
+
+        Round 33 (#168). Returns
+        ``[finger1.qpos, finger2.qpos]`` read directly from
+        ``data.qpos[jnt_qposadr]`` for the joint names returned by
+        :attr:`state_gripper_joint_names` (default
+        ``["gripper0_finger_joint1", "gripper0_finger_joint2"]``).
+
+        LIBERO's training data records ``state.gripper`` as
+        ``robot0_gripper_qpos = [qpos[7], qpos[8]]`` for the two
+        finger joints; their values have OPPOSITE signs by physical
+        convention (the Panda gripper's two-finger MJCF puts each
+        finger on its own joint with mirrored ranges, e.g.
+        ``[0, +0.04]`` and ``[-0.04, 0]``). Pre-round-33 the adapter
+        read ONE finger's value and packed it as ``[v, v]`` (both
+        positive), which is structurally OOD from training.
+
+        Returns ``None`` (and the caller falls back to the legacy
+        single-joint duplicate path) if any of:
+        - ``sim._world._model`` / ``data`` are unavailable
+        - mujoco isn't importable
+        - any of the configured joint names doesn't resolve in the
+          compiled model
+
+        ``None`` rather than partial data so the caller's fallback
+        logic stays simple — there's no half-good case worth
+        propagating.
+        """
+        world = getattr(sim, "_world", None)
+        model = getattr(world, "_model", None) if world is not None else None
+        data = getattr(world, "_data", None) if world is not None else None
+        if model is None or data is None:
+            return None
+        try:
+            import mujoco as _mj
+        except ImportError as e:
+            logger.debug("LiberoAdapter: mujoco import failed in _read_gripper_qpos: %s", e)
+            return None
+
+        joint_names = self.state_gripper_joint_names
+        if not joint_names:
+            return None
+
+        finger_qposes: list[float] = []
+        for jname in joint_names:
+            try:
+                jid = int(_mj.mj_name2id(model, _mj.mjtObj.mjOBJ_JOINT, jname))
+            except (AttributeError, TypeError, ValueError) as e:
+                logger.debug("LiberoAdapter: mujoco joint lookup failed for %r: %s", jname, e)
+                return None
+            if jid < 0:
+                logger.debug(
+                    "LiberoAdapter: state gripper joint %r not in compiled model (jid=%d)",
+                    jname,
+                    jid,
+                )
+                return None
+            try:
+                qposadr = int(model.jnt_qposadr[jid])
+                finger_qposes.append(float(data.qpos[qposadr]))
+            except (AttributeError, IndexError, ValueError) as e:
+                logger.debug(
+                    "LiberoAdapter: failed to read qpos for joint %r (jid=%d): %s",
+                    jname,
+                    jid,
+                    e,
+                )
+                return None
+        return finger_qposes
 
     def is_success(self, sim: SimEngine) -> bool:
         return bool(self._success_fn(sim))
