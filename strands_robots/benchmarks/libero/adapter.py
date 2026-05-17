@@ -730,7 +730,26 @@ class LiberoAdapter(BenchmarkProtocol):
            for the user's own MJCF).
         7. ``_apply_init_jitter`` - per-episode RNG-seeded ±jitter to
            init-subject bodies, layered on top of canonical state.
+
+        Round 43 (#168) — :class:`LiberoOffScreenRenderEngine`
+        fast-path. When the engine implements
+        :meth:`setup_libero_task` (duck-typed check), the entire
+        scene-generation + canonical-state-apply + camera-install +
+        action-controller-install pipeline above is bypassed in favour
+        of upstream ``OffScreenRenderEnv`` semantics. The engine does
+        all that work itself via robosuite. We just hand it the BDDL
+        path and (optional) init_state and let it run. This is the
+        path that matches NVIDIA's reference eval (``success_rate=1.0``
+        in 54s for 5 eps on libero_10/SCENE5) byte-for-byte.
         """
+        # Round 43 (#168) — fast-path for the OffScreenRenderEnv-backed
+        # engine. When the engine has ``setup_libero_task``, it owns
+        # the entire physics+render lifecycle (via upstream's robosuite
+        # path); skip our auto-generated-scene + OSC controller path.
+        if hasattr(sim, "setup_libero_task"):
+            self._on_episode_start_offscreen(sim, rng)
+            return
+
         if self.scene_path is None and self._auto_generate_scene:
             try:
                 generated = self._generate_scene_from_bddl()
@@ -2435,6 +2454,111 @@ class LiberoAdapter(BenchmarkProtocol):
         except Exception as e:  # noqa: BLE001 - never fatal during camera-existence check
             logger.debug("LiberoAdapter: model-side camera enumeration failed: %s", e)
         return names
+
+    def _on_episode_start_offscreen(self, sim: SimEngine, rng: random.Random) -> None:
+        """Round 43 (#168) — on_episode_start fast-path for
+        :class:`LiberoOffScreenRenderEngine`.
+
+        The OffScreenRenderEnv-backed engine owns scene loading,
+        physics, camera rendering, and action dispatch entirely via
+        upstream robosuite. We just need to:
+
+        1. Hand the engine the BDDL file path so it can construct the
+           ``OffScreenRenderEnv``.
+        2. Optionally pass ``init_states[i]`` for canonical-state apply.
+           When ``self._init_states`` is unset, the engine uses the
+           BDDL-default state (matching NVIDIA's
+           ``run_gr00t_sim_policy`` flow which gets ``success_rate=1.0``).
+        3. Reset the env so observation_spec produces a valid initial
+           observation for the policy's first ``get_action`` call.
+        4. Run super's compatibility check (Panda-only validation —
+           cheap on this engine since the Panda is implicit).
+
+        Skipped vs the MuJoCo-engine path: scene auto-generation,
+        ``_apply_canonical_state`` (engine handles via set_init_state),
+        ``_install_libero_cameras`` (cameras are MJCF-defined in
+        upstream), ``_install_render_options`` (upstream env owns its
+        viewer config), ``_install_action_controller`` (upstream env
+        wraps robosuite's controller internally), and
+        ``_apply_init_jitter`` (LIBERO eval doesn't use jitter when
+        ``init_jitter=0`` which is the default).
+        """
+        bddl_path = self._resolve_bddl_path()
+        if bddl_path is None:
+            raise RuntimeError(
+                "LiberoAdapter._on_episode_start_offscreen: cannot resolve BDDL "
+                "path. Construct the adapter via from_file() / from_text() so "
+                "bddl_path / bddl_source is set, or pass bddl_path= to the "
+                "constructor."
+            )
+
+        # Pick init_state per episode (RNG-seeded for determinism;
+        # episode 0 always uses idx 0). Falls through to None when
+        # init_states isn't provided, which matches NVIDIA's eval flow.
+        init_state = None
+        if self._init_states is not None and self._init_states.shape[0] > 0:
+            if self._episode_count == 0:
+                init_state = self._init_states[0]
+            else:
+                # rng-derived index (matches the legacy MuJoCo path's
+                # _apply_init_state_branch behaviour for ep ≥ 1).
+                idx = rng.randrange(self._init_states.shape[0])
+                init_state = self._init_states[idx]
+
+        setup_result = sim.setup_libero_task(bddl_path, init_state=init_state)  # type: ignore[attr-defined]
+        if isinstance(setup_result, dict) and setup_result.get("status") == "error":
+            msg = (setup_result.get("content") or [{}])[0].get("text", "")
+            raise RuntimeError(f"LiberoAdapter._on_episode_start_offscreen: setup_libero_task failed: {msg}")
+
+        # Reset the env so observation_spec returns a valid initial
+        # frame. The engine's reset() method re-applies init_state if
+        # one was provided to setup_libero_task.
+        reset_result = sim.reset()
+        if isinstance(reset_result, dict) and reset_result.get("status") == "error":
+            msg = (reset_result.get("content") or [{}])[0].get("text", "")
+            raise RuntimeError(f"LiberoAdapter._on_episode_start_offscreen: reset failed: {msg}")
+
+        # Compatibility check + register the default robot if needed.
+        # super().on_episode_start handles "no robots in sim" by
+        # auto-adding self.default_robot — that's a cheap no-op on the
+        # OffScreenRenderEnv engine since add_robot is a stub.
+        super().on_episode_start(sim, rng)
+
+        self._episode_count += 1
+
+    def _resolve_bddl_path(self) -> str | None:
+        """Return the BDDL file path used to construct this adapter.
+
+        Tries (in order):
+        1. ``self._bddl_path`` (set by ``from_file``).
+        2. Materialize ``self._bddl_source`` to a temp file (set by
+           ``from_text``). Cached for re-use across episodes.
+
+        Returns ``None`` when neither is available (e.g. caller
+        constructed via ``__init__`` directly without bddl plumbing).
+        """
+        if self._bddl_path is not None:
+            return self._bddl_path
+        if self._bddl_source is not None:
+            # Cache the materialized temp file across episodes.
+            cached = getattr(self, "_bddl_temp_path", None)
+            if cached is None or not os.path.exists(cached):
+                import tempfile
+
+                fd, tmp = tempfile.mkstemp(suffix=".bddl", prefix="libero_offscreen_", text=True)
+                try:
+                    with os.fdopen(fd, "w") as f:
+                        f.write(self._bddl_source)
+                except Exception:  # noqa: BLE001
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
+                self._bddl_temp_path: str = tmp
+                cached = tmp
+            return cached
+        return None
 
     def _apply_canonical_state(self, sim: SimEngine, rng: random.Random | None = None) -> None:
         """Restore qpos / qvel to the scene's canonical home state.
