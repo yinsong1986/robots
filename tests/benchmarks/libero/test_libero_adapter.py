@@ -963,18 +963,19 @@ class TestAugmentObservation:
         assert adapter.eef_state_site_name == "custom_grip_grip_site"
 
     def test_read_eef_pose_uses_site_when_available(self, libero_scene_xml):
-        """Round 31 (#168) — primary regression for the round-30 bug.
+        """Round 32 (#168) — pin the split-source contract.
 
-        With a real LIBERO scene compiled into the sim, ``_read_eef_pose``
-        must read from ``data.site_xpos[gripper0_grip_site_id]`` —
-        NOT from ``data.xpos[robot0_right_hand_id]``. Confirms the
-        site path is preferred over the body path when the site
-        exists.
+        With a real LIBERO scene compiled into the sim,
+        ``_read_eef_pose`` must:
+        - read POSITION from ``data.site_xpos[gripper0_grip_site_id]``
+          (matches RoboSuite's ``eef_pos`` observable)
+        - read ORIENTATION from ``data.xquat[robot0_right_hand_id]``
+          (matches RoboSuite's ``eef_quat`` observable, which uses
+          ``get_body_xquat(eef_name)``).
 
-        The two readings differ by ~9.7 cm in z + 180° rotation
-        around X (the wrist body sits ~10 cm above the gripper tip
-        with axes pointing differently); pin that the site reading
-        is what we get back."""
+        Round 31 read both from the site and produced a 90° yaw
+        offset because ``site_xmat`` ≠ body ``xquat`` for the panda
+        gripper. Round 32 splits the reads."""
         pytest.importorskip("mujoco")
         import mujoco
 
@@ -983,25 +984,39 @@ class TestAugmentObservation:
             scene_path=libero_scene_xml,
             install_cameras=False,
             auto_generate_scene=False,
+            # Round 32: explicitly set the body name so the test
+            # exercises the split-source path. (Auto-resolution
+            # happens in on_episode_start, which we bypass here.)
+            eef_body_name="robot0_right_hand",
         )
         sim = FakeSim(data_config="panda")
         sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
         sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
         mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
 
-        # Ground truth from the same model: site_xpos for gripper0_grip_site.
+        # Ground truth: site_xpos for position, body xquat for orientation.
         site_id = mujoco.mj_name2id(sim._world._model, mujoco.mjtObj.mjOBJ_SITE, "gripper0_grip_site")  # type: ignore[attr-defined]
-        if site_id < 0:
-            pytest.skip("scene XML missing 'gripper0_grip_site'; skipping site-priority test")
+        body_id = mujoco.mj_name2id(sim._world._model, mujoco.mjtObj.mjOBJ_BODY, "robot0_right_hand")  # type: ignore[attr-defined]
+        if site_id < 0 or body_id < 0:
+            pytest.skip("scene XML missing 'gripper0_grip_site' or 'robot0_right_hand'")
         expected_pos = list(sim._world._data.site_xpos[site_id])  # type: ignore[attr-defined]
+        expected_quat = list(sim._world._data.xquat[body_id])  # type: ignore[attr-defined]
 
         pos, quat = adapter._read_eef_pose(sim)
-        assert pos is not None and quat is not None, "site path should produce a pos+quat"
+        assert pos is not None, "site path should produce a position"
+        assert quat is not None, "body path should produce an orientation"
 
-        # Position must match site_xpos (within FP tolerance).
+        # Position from site (within FP tolerance).
         for axis_idx, axis_name in enumerate(["x", "y", "z"]):
             assert pos[axis_idx] == pytest.approx(expected_pos[axis_idx], abs=1e-6), (
                 f"site {axis_name} {pos[axis_idx]} != expected {expected_pos[axis_idx]}"
+            )
+
+        # Orientation from body xquat (wxyz, within FP tolerance).
+        for q_idx, q_name in enumerate(["w", "x", "y", "z"]):
+            assert quat[q_idx] == pytest.approx(expected_quat[q_idx], abs=1e-6), (
+                f"body quat.{q_name} {quat[q_idx]} != expected {expected_quat[q_idx]}; "
+                f"orientation may be coming from site_xmat instead of body xquat"
             )
 
         # Quaternion is unit-norm.
@@ -1009,13 +1024,15 @@ class TestAugmentObservation:
         assert np.linalg.norm(quat_arr) == pytest.approx(1.0, abs=1e-6)
 
     def test_read_eef_pose_site_differs_from_body(self, libero_scene_xml):
-        """Round 31 (#168): pin the round-30 finding that site readout
-        and body readout produce DIFFERENT pos values (~9.7 cm in z).
+        """Round 31/32 (#168): pin the round-30 finding that site
+        readout (used for position) and body readout differ by ~9.7 cm.
+        This sentinel ensures the test environment exhibits the
+        original bug, so the test is meaningful.
 
-        This is a regression sentinel: if a future refactor accidentally
-        falls through to the body path even when the site exists, this
-        test fails — because the test asserts the value we get back
-        matches the site, not the body."""
+        Round 32: also asserts the position we get back matches the
+        site, NOT the body — the round-30 wrong-body bug regression
+        sentinel.
+        """
         pytest.importorskip("mujoco")
         import mujoco
 
@@ -1024,6 +1041,7 @@ class TestAugmentObservation:
             scene_path=libero_scene_xml,
             install_cameras=False,
             auto_generate_scene=False,
+            eef_body_name="robot0_right_hand",
         )
         sim = FakeSim(data_config="panda")
         sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
@@ -1095,14 +1113,15 @@ class TestAugmentObservation:
         # default). Either way: no exception was raised.
 
     def test_augment_observation_uses_site_path_with_real_scene(self, libero_scene_xml):
-        """Round 31 (#168) end-to-end: ``augment_observation`` produces
-        ``state.x/y/z/roll/pitch/yaw`` from the SITE (gripper tip), not
-        the wrist body, when both are available.
+        """Round 31/32 (#168) end-to-end: ``augment_observation`` produces
+        ``state.x/y/z`` from the SITE (gripper tip) and
+        ``state.roll/pitch/yaw`` from the BODY (wrist) xquat → Euler.
 
         This is the customer-facing assertion: the values that flow
-        into the GR00T policy server's ``state.*`` keys must match the
-        site, not the body. Confirms the round-31 fix at the public
-        ``augment_observation`` boundary."""
+        into the GR00T policy server's ``state.*`` keys must match
+        RoboSuite's split-source convention. Confirms the round-32
+        fix at the public ``augment_observation`` boundary.
+        """
         pytest.importorskip("mujoco")
         import mujoco
 
@@ -1111,6 +1130,7 @@ class TestAugmentObservation:
             scene_path=libero_scene_xml,
             install_cameras=False,
             auto_generate_scene=False,
+            eef_body_name="robot0_right_hand",
         )
         sim = FakeSim(data_config="panda")
         sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
@@ -1118,17 +1138,102 @@ class TestAugmentObservation:
         mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
 
         site_id = mujoco.mj_name2id(sim._world._model, mujoco.mjtObj.mjOBJ_SITE, "gripper0_grip_site")  # type: ignore[attr-defined]
-        if site_id < 0:
-            pytest.skip("scene XML missing 'gripper0_grip_site'")
+        body_id = mujoco.mj_name2id(sim._world._model, mujoco.mjtObj.mjOBJ_BODY, "robot0_right_hand")  # type: ignore[attr-defined]
+        if site_id < 0 or body_id < 0:
+            pytest.skip("scene XML missing 'gripper0_grip_site' or 'robot0_right_hand'")
         expected_pos = list(sim._world._data.site_xpos[site_id])  # type: ignore[attr-defined]
+        expected_quat_wxyz = list(sim._world._data.xquat[body_id])  # type: ignore[attr-defined]
+        # Convert expected wxyz quat to roll/pitch/yaw using the same
+        # helper the adapter uses, so the test pins the *behaviour*
+        # (split-source) rather than the helper's exact numerics.
+        from strands_robots.benchmarks.libero.adapter import _quat_wxyz_to_rpy_xyz
+
+        expected_roll, expected_pitch, expected_yaw = _quat_wxyz_to_rpy_xyz(expected_quat_wxyz)
 
         out = adapter.augment_observation(sim, {})
 
-        # state.x/y/z must match site_xpos.
+        # state.x/y/z from site_xpos.
         for axis_idx, axis_name in enumerate(["x", "y", "z"]):
             assert out[axis_name] == pytest.approx(expected_pos[axis_idx], abs=1e-6), (
                 f"augment_observation state.{axis_name} {out[axis_name]} != "
-                f"site {expected_pos[axis_idx]}; round-31 site-priority may have regressed."
+                f"site {expected_pos[axis_idx]}; round-31 site-priority for position may have regressed."
+            )
+
+        # state.roll/pitch/yaw derived from body xquat (round-32 split).
+        # Round-31 read these from site_xmat, which was 90° off in yaw.
+        assert out["roll"] == pytest.approx(expected_roll, abs=1e-6), (
+            f"state.roll {out['roll']} != body-derived {expected_roll}; "
+            f"orientation may be coming from site_xmat (round-31 bug) instead of body xquat (round-32 fix)."
+        )
+        assert out["pitch"] == pytest.approx(expected_pitch, abs=1e-6)
+        assert out["yaw"] == pytest.approx(expected_yaw, abs=1e-6), (
+            f"state.yaw {out['yaw']} != body-derived {expected_yaw}; "
+            f"orientation source may be wrong (site vs body — round-31 had this 90° off)."
+        )
+
+    def test_read_eef_pose_uses_body_xquat_not_site_xmat(self, libero_scene_xml):
+        """Round 32 (#168) — pin the orientation source explicitly.
+
+        Round 31 read the quaternion from ``site_xmat`` (via
+        ``mju_mat2Quat``); round 32 reads it from ``data.xquat[body_id]``.
+        These differ by 90° in yaw on a LIBERO panda gripper because
+        the site coordinate frame is rotated relative to the body's.
+
+        Pin the source explicitly: returned ``quat`` matches body
+        ``xquat`` and does NOT match the site ``xmat``-derived quat.
+        Sentinel ensures the bug regression cannot pass silently.
+        """
+        pytest.importorskip("mujoco")
+        import mujoco
+
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path=libero_scene_xml,
+            install_cameras=False,
+            auto_generate_scene=False,
+            eef_body_name="robot0_right_hand",
+        )
+        sim = FakeSim(data_config="panda")
+        sim._world._model = mujoco.MjModel.from_xml_path(libero_scene_xml)  # type: ignore[attr-defined]
+        sim._world._data = mujoco.MjData(sim._world._model)  # type: ignore[attr-defined]
+        mujoco.mj_forward(sim._world._model, sim._world._data)  # type: ignore[attr-defined]
+
+        site_id = mujoco.mj_name2id(sim._world._model, mujoco.mjtObj.mjOBJ_SITE, "gripper0_grip_site")  # type: ignore[attr-defined]
+        body_id = mujoco.mj_name2id(sim._world._model, mujoco.mjtObj.mjOBJ_BODY, "robot0_right_hand")  # type: ignore[attr-defined]
+        if site_id < 0 or body_id < 0:
+            pytest.skip("scene XML missing 'gripper0_grip_site' or 'robot0_right_hand'")
+
+        # Body xquat (mujoco wxyz convention) — the round-32 source.
+        body_quat = np.array(sim._world._data.xquat[body_id])  # type: ignore[attr-defined]
+
+        # Site xmat → quat (the round-31 source). Sanity-check the
+        # two are different — otherwise the test isn't meaningful.
+        site_xmat = np.array(sim._world._data.site_xmat[site_id]).reshape(9)  # type: ignore[attr-defined]
+        site_quat = np.zeros(4)
+        mujoco.mju_mat2Quat(site_quat, site_xmat)
+
+        # Round-30 verification observed a 90° yaw offset between
+        # site_xmat-derived quat and body xquat. The two MUST differ
+        # by more than the FP tolerance — otherwise the test's
+        # round-32 vs round-31 distinction is moot.
+        # Note: quaternions q and -q represent the same rotation, so
+        # we measure orientation difference via the dot product
+        # (|q1 . q2| ≈ 1 means same rotation).
+        dot = abs(float(np.dot(body_quat, site_quat)))
+        assert dot < 0.999, (
+            f"body xquat and site_xmat-derived quat are nearly identical (|dot|={dot}); "
+            f"the scene doesn't exhibit the round-30 orientation bug, regression test is moot. "
+            f"body_quat={body_quat}, site_quat={site_quat}"
+        )
+
+        # _read_eef_pose returns the BODY xquat, not the site_xmat-derived one.
+        _, returned_quat = adapter._read_eef_pose(sim)
+        assert returned_quat is not None
+        returned_arr = np.array(returned_quat)
+        for q_idx, expected in enumerate(body_quat):
+            assert returned_arr[q_idx] == pytest.approx(float(expected), abs=1e-6), (
+                f"axis {q_idx}: returned {returned_arr[q_idx]} doesn't match body xquat "
+                f"{expected}. Round-32 split-source contract may have regressed back to site_xmat."
             )
 
 

@@ -1389,76 +1389,130 @@ class LiberoAdapter(BenchmarkProtocol):
     def _read_eef_pose(self, sim: SimEngine) -> tuple[list[float] | None, list[float] | None]:
         """Read EEF position + (wxyz) quaternion for ``augment_observation``.
 
-        Round 31 (#168): try the SITE path first
-        (``data.site_xpos[gripper0_grip_site]`` / ``data.site_xmat[...]``),
-        fall back to the BODY path
-        (``sim.get_body_state(self._eef_body_name)``) if the site doesn't
-        exist (e.g. non-RoboSuite scenes where there's no
-        ``gripper0_grip_site``).
+        **Round 32 (#168) — split sources matching RoboSuite exactly.**
+        RoboSuite's ``robosuite/robots/single_arm.py`` reads from TWO
+        DIFFERENT POINTS in the kinematic chain::
+
+            def eef_pos(obs_cache):
+                return np.array(self.sim.data.site_xpos[self.eef_site_id])
+                                                       # ↑ site (gripper tip)
+            def eef_quat(obs_cache):
+                return T.convert_quat(
+                    self.sim.data.get_body_xquat(self.robot_model.eef_name),
+                    to="xyzw",
+                )                                      # ↑ body (wrist)
+
+        The site sits at the gripper tip; the body sits at the wrist
+        (~9.7 cm above the site). Their rotation matrices have a 90°
+        offset around Z relative to each other — RoboSuite picks the
+        body's orientation deliberately because that's what the
+        downstream observable + dataset expects.
+
+        Round 30 (#168) found we read both pos AND quat from the
+        wrist body — pos was 71.8 mm off in z and orientation 180°
+        off in roll. Round 31 moved BOTH to the site, which fixed
+        position (within 5 mm) but introduced a 90° yaw offset
+        because site_xmat ≠ body xquat. Round 32 splits the reads
+        the way RoboSuite does.
 
         Returns ``(pos, quat_wxyz)``, either or both of which may be
         ``None`` on failure (logged at DEBUG; caller selectively injects
         only the keys it has).
-
-        Why site, not body: RoboSuite's
-        ``OperationalSpaceController`` reads ``robot0_eef_pos`` /
-        ``robot0_eef_quat`` from ``data.site_xpos[eef_site_id]`` —
-        the same site location LIBERO checkpoints were trained
-        against. The ``robot0_right_hand`` body is ~9.7 cm above
-        the site (the wrist) and rotated 180° around X (the wrist
-        axes don't match the gripper's pointing direction); reading
-        from the body fed GR00T out-of-distribution state for
-        rounds 23-30 of #168. See PR #168 round-30 verification +
-        round-31 fix.
         """
-        # 1. Site path (preferred). Uses direct mujoco access to the
-        # compiled model; namespace prefixing is part of the LIBERO
-        # scene's actual site name (``gripper0_grip_site``), so no
-        # backend-specific namespace handling is needed.
+        # 1. Direct-mujoco read: position from site, orientation from
+        # body. This is the LIBERO/RoboSuite path. Both lookups can
+        # independently succeed or fail; we mix the successful results
+        # with the body-fallback for whichever was missing.
         world = getattr(sim, "_world", None)
         model = getattr(world, "_model", None) if world is not None else None
         data = getattr(world, "_data", None) if world is not None else None
+
+        site_pos: list[float] | None = None
+        body_quat: list[float] | None = None
+
         if model is not None and data is not None:
-            site_name = self.eef_state_site_name
-            if site_name:
-                try:
-                    import mujoco as _mj
+            try:
+                import mujoco as _mj
+            except ImportError as e:
+                logger.debug("LiberoAdapter: mujoco import failed in _read_eef_pose: %s", e)
+                _mj = None  # type: ignore[assignment]
 
-                    site_id = int(_mj.mj_name2id(model, _mj.mjtObj.mjOBJ_SITE, site_name))
-                except (ImportError, AttributeError, TypeError, ValueError) as e:
-                    logger.debug("LiberoAdapter: mujoco site lookup failed for %r: %s", site_name, e)
-                    site_id = -1
-                if site_id >= 0:
+            if _mj is not None:
+                # 1a. SITE → position. Matches RoboSuite's
+                # ``eef_pos`` observable.
+                site_name = self.eef_state_site_name
+                if site_name:
                     try:
-                        pos_arr = np.asarray(data.site_xpos[site_id], dtype=np.float64)
-                        xmat_arr = np.asarray(data.site_xmat[site_id], dtype=np.float64).reshape(9)
-                        quat_arr = np.zeros(4, dtype=np.float64)
-                        _mj.mju_mat2Quat(quat_arr, xmat_arr)
-                        return ([float(c) for c in pos_arr], [float(c) for c in quat_arr])
-                    except (AttributeError, IndexError, ValueError) as e:
-                        logger.debug(
-                            "LiberoAdapter: failed to read site %r pose (site_id=%d): %s",
-                            site_name,
-                            site_id,
-                            e,
-                        )
+                        site_id = int(_mj.mj_name2id(model, _mj.mjtObj.mjOBJ_SITE, site_name))
+                    except (AttributeError, TypeError, ValueError) as e:
+                        logger.debug("LiberoAdapter: mujoco site lookup failed for %r: %s", site_name, e)
+                        site_id = -1
+                    if site_id >= 0:
+                        try:
+                            pos_arr = np.asarray(data.site_xpos[site_id], dtype=np.float64)
+                            site_pos = [float(c) for c in pos_arr]
+                        except (AttributeError, IndexError, ValueError) as e:
+                            logger.debug(
+                                "LiberoAdapter: failed to read site %r position (site_id=%d): %s",
+                                site_name,
+                                site_id,
+                                e,
+                            )
 
-        # 2. Body fallback (legacy / non-RoboSuite scenes). Uses the
-        # public ``sim.get_body_state`` API — namespace-aware (handles
-        # ``panda_arm/hand`` for multi-robot scenes) and matches what
-        # the round-5 implementation did before the round-31 site
-        # preference. Returns the same ``(pos, quat_wxyz)`` shape so
-        # the caller's logic is unchanged.
+                # 1b. BODY → orientation. Matches RoboSuite's
+                # ``eef_quat`` observable: ``data.xquat[eef_body_id]``
+                # (mujoco's xquat is wxyz, so no convert_quat needed
+                # — our downstream ``_quat_wxyz_to_rpy_xyz`` expects
+                # wxyz).
+                body_name = self._eef_body_name
+                if body_name:
+                    try:
+                        body_id = int(_mj.mj_name2id(model, _mj.mjtObj.mjOBJ_BODY, body_name))
+                    except (AttributeError, TypeError, ValueError) as e:
+                        logger.debug("LiberoAdapter: mujoco body lookup failed for %r: %s", body_name, e)
+                        body_id = -1
+                    if body_id >= 0:
+                        try:
+                            quat_arr = np.asarray(data.xquat[body_id], dtype=np.float64)
+                            body_quat = [float(c) for c in quat_arr]
+                        except (AttributeError, IndexError, ValueError) as e:
+                            logger.debug(
+                                "LiberoAdapter: failed to read body %r xquat (body_id=%d): %s",
+                                body_name,
+                                body_id,
+                                e,
+                            )
+
+        # 2. If both were read directly, return the split-source pair
+        # (this is the happy path on LIBERO scenes).
+        if site_pos is not None and body_quat is not None:
+            return (site_pos, body_quat)
+
+        # 3. Body-state fallback for whichever direct read failed
+        # (e.g. non-RoboSuite scenes that don't ship the canonical
+        # site, or the ``hand``-named body for bare Menagerie Panda).
+        # ``sim.get_body_state`` is namespace-aware (handles
+        # ``panda_arm/hand`` for multi-robot scenes) and returns
+        # ``(pos, quat_wxyz)`` — same shape we promise here.
         get_body_state = getattr(sim, "get_body_state", None)
-        if get_body_state is None:
+        fallback_pos: list[float] | None = None
+        fallback_quat: list[float] | None = None
+        if get_body_state is not None:
+            try:
+                state_result = get_body_state(body_name=self._eef_body_name)
+            except Exception as e:  # noqa: BLE001 - never abort eval on a state lookup
+                logger.debug("LiberoAdapter: get_body_state(%r) raised: %s", self._eef_body_name, e)
+                state_result = None
+            fallback_pos, fallback_quat = _extract_pose(state_result)
+        else:
             logger.debug("LiberoAdapter: sim has no get_body_state(); skipping EEF state injection")
-            return (None, None)
-        try:
-            state_result = get_body_state(body_name=self._eef_body_name)
-        except Exception as e:  # noqa: BLE001 - never abort eval on a state lookup
-            logger.debug("LiberoAdapter: get_body_state(%r) raised: %s", self._eef_body_name, e)
-            return (None, None)
-        return _extract_pose(state_result)
+
+        # 4. Mix direct and fallback reads — each axis populated by
+        # whichever source succeeded first. Site/body get top
+        # priority (canonical RoboSuite split); fallback fills gaps.
+        merged_pos = site_pos if site_pos is not None else fallback_pos
+        merged_quat = body_quat if body_quat is not None else fallback_quat
+        return (merged_pos, merged_quat)
 
     def is_success(self, sim: SimEngine) -> bool:
         return bool(self._success_fn(sim))
