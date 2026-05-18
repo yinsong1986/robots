@@ -1713,6 +1713,50 @@ class LiberoAdapter(BenchmarkProtocol):
         return finger_qposes
 
     def is_success(self, sim: SimEngine) -> bool:
+        """Check whether the LIBERO task goal is satisfied.
+
+        Round 44 (#168) — when the sim wraps an upstream
+        ``OffScreenRenderEnv`` (i.e. ``LiberoOffScreenRenderEngine``,
+        identified via ``hasattr(sim, '_env')`` + the env's
+        ``check_success`` method), delegate to robosuite's native
+        success check rather than walking our BDDL predicate tree.
+
+        WHY: round-44 instrumentation found that our
+        :func:`compile_goal`-produced predicate tree disagrees with
+        the env's ``check_success`` for ``libero-10/SCENE5``: the
+        policy was actually solving the task (verified via
+        ``env.check_success() == True``) but our BDDL evaluator was
+        returning ``False``, so the rollout loop kept running until
+        ``max_steps`` truncation and the run ended with
+        ``success_rate = 0``. This was the FINAL bug after rounds
+        36-43 of structural fixes.
+
+        Switching to ``env.check_success`` boosted libero-10/SCENE5
+        from 0/5 to **5/5** (round-44 verified eval, in-process
+        Gr00tPolicy, ``r44_inprocess_eval.py``). The BDDL evaluator
+        path remains as a fallback for backends without an
+        ``OffScreenRenderEnv`` (e.g. our ``MuJoCoSimEngine``); the
+        residual bug in the BDDL predicate evaluator is a separate
+        investigation track.
+
+        Best-effort: if any introspection step fails (the env
+        doesn't have ``check_success``, or ``check_success`` raises),
+        falls back to the BDDL predicate tree. This keeps
+        ``LiberoAdapter`` working on engines that don't have an
+        upstream env.
+        """
+        env = getattr(sim, "_env", None)
+        if env is not None:
+            check = getattr(env, "check_success", None)
+            if callable(check):
+                try:
+                    return bool(check())
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(
+                        "LiberoAdapter.is_success: env.check_success raised %s; "
+                        "falling back to BDDL predicate evaluator",
+                        e,
+                    )
         return bool(self._success_fn(sim))
 
     # Internals
