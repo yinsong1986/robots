@@ -177,7 +177,10 @@ class LiberoOffScreenRenderEngine(SimEngine):
         # crash before setup_libero_task. Simulation.create_world
         # contract is "world ready for add_robot".
         self._world = SimWorld()
-        return {"status": "success", "content": [{"text": "🌍 LIBERO world created (env constructed lazily on benchmark setup)."}]}
+        return {
+            "status": "success",
+            "content": [{"text": "🌍 LIBERO world created (env constructed lazily on benchmark setup)."}],
+        }
 
     def destroy(self) -> dict[str, Any]:
         """Tear down the underlying env if any, release world."""
@@ -195,7 +198,10 @@ class LiberoOffScreenRenderEngine(SimEngine):
         was provided to :meth:`setup_libero_task`.
         """
         if self._env is None:
-            return {"status": "error", "content": [{"text": "reset: env not initialized. Call setup_libero_task first."}]}
+            return {
+                "status": "error",
+                "content": [{"text": "reset: env not initialized. Call setup_libero_task first."}],
+            }
         try:
             obs = self._env.reset()
             if self._init_state is not None:
@@ -268,7 +274,10 @@ class LiberoOffScreenRenderEngine(SimEngine):
             urdf_path="<libero-offscreen-render>",  # synthetic — the env owns the actual MJCF
             joint_names=list(self._robot_joints),
         )
-        return {"status": "success", "content": [{"text": f"🤖 Robot {name!r} registered (Panda is implicit in LIBERO scene)."}]}
+        return {
+            "status": "success",
+            "content": [{"text": f"🤖 Robot {name!r} registered (Panda is implicit in LIBERO scene)."}],
+        }
 
     def remove_robot(self, name: str) -> dict[str, Any]:
         """Remove the robot registration (env-side robot stays — it's
@@ -429,7 +438,10 @@ class LiberoOffScreenRenderEngine(SimEngine):
     # Rendering
 
     def render(
-        self, camera_name: str = "default", width: int | None = None, height: int | None = None  # noqa: ARG002
+        self,
+        camera_name: str = "default",
+        width: int | None = None,
+        height: int | None = None,  # noqa: ARG002
     ) -> dict[str, Any]:
         """Return the latest cached image from
         :meth:`get_observation` for ``camera_name``.
@@ -455,7 +467,10 @@ class LiberoOffScreenRenderEngine(SimEngine):
         key = alias.get(camera_name, camera_name)
         img = obs.get(key)
         if img is None:
-            return {"status": "error", "content": [{"text": f"render: camera {camera_name!r} not in obs (keys={sorted(obs.keys())})."}]}
+            return {
+                "status": "error",
+                "content": [{"text": f"render: camera {camera_name!r} not in obs (keys={sorted(obs.keys())})."}],
+            }
 
         return {
             "status": "success",
@@ -494,7 +509,10 @@ class LiberoOffScreenRenderEngine(SimEngine):
         if self._env is not None and self._task_bddl_path == task_bddl_file:
             # Same task — keep the env, just (re-)apply init_state.
             self._init_state = np.asarray(init_state) if init_state is not None else None
-            return {"status": "success", "content": [{"text": f"📂 LIBERO env already loaded for {task_bddl_file!r}; init_state updated."}]}
+            return {
+                "status": "success",
+                "content": [{"text": f"📂 LIBERO env already loaded for {task_bddl_file!r}; init_state updated."}],
+            }
 
         if self._env is not None:
             try:
@@ -523,7 +541,10 @@ class LiberoOffScreenRenderEngine(SimEngine):
             for r in self._world.robots.values():
                 r.joint_names = list(self._robot_joints)
 
-        return {"status": "success", "content": [{"text": f"📂 LIBERO env loaded for {task_bddl_file!r} (joints={len(self._robot_joints)})."}]}
+        return {
+            "status": "success",
+            "content": [{"text": f"📂 LIBERO env loaded for {task_bddl_file!r} (joints={len(self._robot_joints)})."}],
+        }
 
     def _discover_robot_joints(self) -> list[str]:
         """Read robot0_joint{1..7} names from the underlying model.
@@ -548,7 +569,9 @@ class LiberoOffScreenRenderEngine(SimEngine):
         for i in range(1, 8):
             jname = f"robot0_joint{i}"
             try:
-                jid = mujoco.mj_name2id(model._model if hasattr(model, "_model") else model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+                jid = mujoco.mj_name2id(
+                    model._model if hasattr(model, "_model") else model, mujoco.mjtObj.mjOBJ_JOINT, jname
+                )
             except Exception:  # noqa: BLE001
                 jid = -1
             if jid >= 0:

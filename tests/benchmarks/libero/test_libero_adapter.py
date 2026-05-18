@@ -647,9 +647,7 @@ class TestPublishCameraDimsToWorld:
             pass
 
         # Must not raise.
-        LiberoAdapter._publish_camera_dims_to_world(
-            WorldlessSim(), "image", {"width": 256, "height": 256}
-        )
+        LiberoAdapter._publish_camera_dims_to_world(WorldlessSim(), "image", {"width": 256, "height": 256})
 
     def test_silent_when_cameras_attr_not_dict(self):
         """Round 40 (#168): backends with ``world.cameras`` of an
@@ -665,9 +663,7 @@ class TestPublishCameraDimsToWorld:
             _world = WeirdCameras()
 
         # Must not raise.
-        LiberoAdapter._publish_camera_dims_to_world(
-            WeirdSim(), "image", {"width": 256, "height": 256}
-        )
+        LiberoAdapter._publish_camera_dims_to_world(WeirdSim(), "image", {"width": 256, "height": 256})
 
     def test_install_libero_cameras_publishes_when_already_in_sim(self):
         """Round 40 (#168): end-to-end through ``_install_libero_cameras``.
@@ -3808,17 +3804,20 @@ class TestInstallActionController:
 
         # RLDS 0.0 = close → robosuite +1 → ramp [-0.25, +0.25] (toward closed).
         np.testing.assert_array_almost_equal(
-            _apply_one_step(0.0), np.array([-0.25, 0.25]),
+            _apply_one_step(0.0),
+            np.array([-0.25, 0.25]),
             err_msg="RLDS 0.0 should drive ramp toward [-0.25, +0.25] (close)",
         )
         # RLDS 1.0 = open → robosuite -1 → ramp [+0.25, -0.25] (toward open).
         np.testing.assert_array_almost_equal(
-            _apply_one_step(1.0), np.array([0.25, -0.25]),
+            _apply_one_step(1.0),
+            np.array([0.25, -0.25]),
             err_msg="RLDS 1.0 should drive ramp toward [+0.25, -0.25] (open)",
         )
         # RLDS 0.5 = midpoint → -sign(0) = 0 → no ramp.
         np.testing.assert_array_almost_equal(
-            _apply_one_step(0.5), np.zeros(2),
+            _apply_one_step(0.5),
+            np.zeros(2),
             err_msg="RLDS 0.5 should produce zero ramp (no motion)",
         )
 
