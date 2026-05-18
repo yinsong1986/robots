@@ -50,16 +50,13 @@ bisect history that motivated this engine.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 
 from strands_robots.simulation.base import SimEngine
 from strands_robots.simulation.models import SimRobot, SimWorld
 from strands_robots.utils import require_optional
-
-if TYPE_CHECKING:
-    from strands_robots.policies.base import Policy
 
 logger = logging.getLogger(__name__)
 
