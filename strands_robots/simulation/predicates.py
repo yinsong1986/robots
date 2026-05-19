@@ -271,18 +271,88 @@ def _contact_any() -> BoolPredicate:
     return check
 
 
+def _body_contact(sim: SimEngine, body_a: str, body_b: str) -> bool | None:
+    """Best-effort body-contact lookup.
+
+    Returns ``True`` / ``False`` when ``sim.get_contacts()`` is available
+    AND any geom of ``body_a`` is in contact with any geom of ``body_b``.
+    Returns ``None`` when ``get_contacts()`` is unavailable so the
+    caller can decide whether to gracefully degrade (fall back to
+    geometric-only checks) or hard-fail.
+
+    Heuristic: matches contacts by **geom name prefix** (``<bddl_name>_g``
+    for LIBERO scenes; works for any scene whose geoms follow the
+    ``<body_name>_g<idx>`` convention). Mirrors how upstream LIBERO's
+    ``ObjectState.check_contact`` walks the per-object geom list, but
+    avoids hard-coding the body→geom map by using the naming
+    convention.
+
+    Used by the contact-aware branch of :func:`_body_on` (LIBERO's
+    ``On(A, B)`` predicate semantics requires
+    ``arg2.check_contact(arg1)`` per
+    ``libero/libero/envs/predicates/base_predicates.py``).
+    """
+    get_contacts = getattr(sim, "get_contacts", None)
+    if get_contacts is None:
+        return None
+    try:
+        result = get_contacts()
+    except Exception as e:  # noqa: BLE001 - defensive
+        logger.debug("body_contact(%r, %r) get_contacts raised: %s", body_a, body_b, e)
+        return None
+    if not isinstance(result, dict) or result.get("status") != "success":
+        # Engine returned an error stub or a malformed payload; treat as
+        # "unknown" so the caller can degrade gracefully (False would
+        # be a false negative; we want geometric-only fallback).
+        return None
+    payload = _extract_json(result)
+    contacts = payload.get("contacts")
+    if not isinstance(contacts, list):
+        return None
+
+    prefix_a = f"{body_a}_g"
+    prefix_b = f"{body_b}_g"
+    for c in contacts:
+        if not isinstance(c, dict):
+            continue
+        g1 = c.get("geom1") or ""
+        g2 = c.get("geom2") or ""
+        # Geom-prefix matching: ``<bddl_name>_g<idx>`` is LIBERO's
+        # convention. Either direction (a-then-b or b-then-a) counts.
+        if (g1.startswith(prefix_a) and g2.startswith(prefix_b)) or (
+            g1.startswith(prefix_b) and g2.startswith(prefix_a)
+        ):
+            return True
+    return False
+
+
 def _body_on(
     body_a: str,
     body_b: str,
     z_offset: float = 0.02,
     xy_tol: float = 0.15,
+    require_contact: bool = False,
 ) -> BoolPredicate:
     """Approximate ``(on A B)`` predicate - A resting on top of B.
 
     True when ``A.z > B.z + z_offset`` AND horizontal distance ``|A.xy - B.xy|
-    < xy_tol``. The z-offset parameter accounts for B's half-height + a small
-    buffer; tune per scene. Intended for sparse-success benchmarks (LIBERO,
-    etc.) where exact geometric containment isn't required.
+    < xy_tol``. When ``require_contact=True``, ALSO requires physics
+    contact between A and B via ``sim.get_contacts()`` — matches
+    upstream LIBERO's ``ObjectState.check_ontop`` which combines a
+    geometric check with ``check_contact``. The z-offset parameter
+    accounts for B's half-height + a small buffer; tune per scene.
+    Intended for sparse-success benchmarks (LIBERO, etc.) where exact
+    geometric containment isn't required.
+
+    Contact-check graceful degradation: when
+    ``require_contact=True`` but the sim engine doesn't expose
+    ``get_contacts`` (e.g. test stubs, custom engines), the contact
+    check is skipped and only the geometric check fires. This
+    preserves backwards compatibility — engines without contact
+    support get the pre-#171 behaviour. LIBERO benchmarks running on
+    ``LiberoOffScreenRenderEngine`` or ``MuJoCoSimEngine`` (both
+    implement ``get_contacts``) get the strict upstream-matching
+    semantics.
 
     For full fidelity (MJCF geom size lookup + narrow-phase collision), write
     a scene-specific predicate and register it via :func:`register_predicate`.
@@ -297,7 +367,18 @@ def _body_on(
         dy = pos_a[1] - pos_b[1]
         if (dx * dx + dy * dy) ** 0.5 > float(xy_tol):
             return False
-        return pos_a[2] > pos_b[2] + float(z_offset)
+        if not (pos_a[2] > pos_b[2] + float(z_offset)):
+            return False
+        if require_contact:
+            in_contact = _body_contact(sim, body_a, body_b)
+            # ``None`` ⇒ engine doesn't support contacts; fall back to
+            # geometric-only verdict (preserves pre-#171 behaviour).
+            # ``False`` ⇒ engine reports no contact ⇒ predicate False.
+            # ``True`` ⇒ contact confirmed ⇒ predicate True (combined
+            # with the passing geometric check above).
+            if in_contact is False:
+                return False
+        return True
 
     return check
 

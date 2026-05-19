@@ -270,7 +270,11 @@ class TestIsSuccess:
             bodies={
                 "cube_1": {"position": [0, 0, 0.25]},
                 "plate_1": {"position": [0, 0, 0.1]},
-            }
+            },
+            # #171 sub-task 3e: ``_body_on`` now requires a contact via
+            # ``get_contacts``. Geom-prefix convention is
+            # ``<bddl_name>_g<idx>`` (matches what LIBERO scenes emit).
+            contacts=[{"geom1": "cube_1_g0", "geom2": "plate_1_g0"}],
         )
         assert adapter.is_success(sim) is True
 
@@ -448,7 +452,9 @@ class TestIsSuccessRound170Diagnostic:
             bodies={
                 "cube_1": {"position": [0.001, -0.305, 0.443]},
                 "plate_1": {"position": [-0.004, -0.323, 0.439]},
-            }
+            },
+            # #171 sub-task 3e: ``on`` predicate also requires contact.
+            contacts=[{"geom1": "cube_1_g0", "geom2": "plate_1_g0"}],
         )
         leaves = _walk_predicate_tree(problem.goal, sim)
         assert len(leaves) == 1

@@ -710,7 +710,98 @@ class LiberoOffScreenRenderEngine(SimEngine):
         return {"status": "error", "content": [{"text": "randomize: not supported on LiberoOffScreenRenderEngine."}]}
 
     def get_contacts(self) -> dict[str, Any]:
-        return {"status": "error", "content": [{"text": "get_contacts: not supported on LiberoOffScreenRenderEngine."}]}
+        """Return active geom-geom contacts at the current step.
+
+        Required by ``strands_robots.simulation.predicates._contact_between``
+        and the contact-aware variant of ``_body_on`` (see
+        :func:`strands_robots.simulation.predicates._body_contact`).
+
+        Without this method the BDDL evaluator's contact-based predicates
+        (``grasped``, the contact half of ``on``, ``inside``) silently
+        return ``False`` because ``getattr(sim, "get_contacts", None)``
+        is ``None``. Pre-#171 sub-task 3e this method returned an
+        ``"error"`` stub which had the same effect — pinned by issue
+        #170's diagnostic showing transient ``env=False bddl=True``
+        false positives at "mug-suspended-above-plate" states (no
+        contact yet, but our geometric-only ``_body_on`` fired True).
+
+        Reads contacts directly from the underlying robosuite
+        ``sim.data.contact[]`` array; mirrors
+        :meth:`MuJoCoSimEngine.get_contacts`'s schema (``status`` /
+        ``content`` / ``json`` with ``contacts`` list of
+        ``{geom1, geom2, dist, pos}`` dicts) so the
+        ``predicates._contact_between`` code path works unchanged.
+
+        We also call ``mj_forward`` first so the contact list reflects
+        the current qpos/qvel even immediately after ``reset`` (without
+        this, stale contacts from the previous step or uninitialised
+        memory can appear as phantom penetrations at t=0). Same
+        precaution as the MuJoCoSimEngine implementation.
+        """
+        if self._env is None:
+            return {
+                "status": "error",
+                "content": [{"text": "get_contacts: env not initialized. Call setup_libero_task first."}],
+            }
+        inner_env = getattr(self._env, "env", None)
+        if inner_env is None:
+            return {
+                "status": "error",
+                "content": [{"text": "get_contacts: OffScreenRenderEnv has no inner env attribute."}],
+            }
+
+        try:
+            import mujoco as _mj
+        except ImportError as e:
+            return {
+                "status": "error",
+                "content": [{"text": f"get_contacts: mujoco not importable: {e}"}],
+            }
+
+        try:
+            sim = inner_env.sim
+            # ``robosuite.utils.binding_utils.MjModel`` wraps the raw
+            # ``mujoco.MjModel`` under ``._model``. ``MjData`` is wrapped
+            # under ``._data`` similarly. We need the raw refs for
+            # ``mj_forward``.
+            model_raw = sim.model._model
+            data_raw = sim.data._data
+            _mj.mj_forward(model_raw, data_raw)
+            ncon = int(data_raw.ncon)
+        except (AttributeError, ValueError) as e:
+            return {
+                "status": "error",
+                "content": [{"text": f"get_contacts: failed to read contact array: {e}"}],
+            }
+
+        contacts: list[dict[str, Any]] = []
+        for i in range(ncon):
+            c = data_raw.contact[i]
+            g1, g2 = int(c.geom1), int(c.geom2)
+            try:
+                g1_name = _mj.mj_id2name(model_raw, _mj.mjtObj.mjOBJ_GEOM, g1) or f"geom_{g1}"
+                g2_name = _mj.mj_id2name(model_raw, _mj.mjtObj.mjOBJ_GEOM, g2) or f"geom_{g2}"
+            except (AttributeError, IndexError):
+                # Defensive: if name lookup fails, skip the contact rather
+                # than emitting a malformed record.
+                continue
+            contacts.append(
+                {
+                    "geom1": g1_name,
+                    "geom2": g2_name,
+                    "dist": float(c.dist),
+                    "pos": list(np.asarray(c.pos, dtype=np.float64).tolist()),
+                }
+            )
+
+        text = f"💥 {len(contacts)} contacts" if contacts else "No contacts."
+        return {
+            "status": "success",
+            "content": [
+                {"text": text},
+                {"json": {"contacts": contacts}},
+            ],
+        }
 
     def cleanup(self) -> None:
         if self._env is not None:
