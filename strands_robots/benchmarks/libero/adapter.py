@@ -3811,7 +3811,21 @@ class _LiberoOSCController:
             ],
             dtype=np.float64,
         )
-        gripper_value = _to_scalar(action_dict.get("gripper", 0.0))
+        # Default 0.5 (RLDS midway = no command) so an action dict
+        # WITHOUT a gripper key produces no gripper movement. Round 41
+        # added the RLDS→robosuite conversion ``-sign(2*v - 1)`` which
+        # maps a default of 0.0 (RLDS close) to +1 (LIBERO close),
+        # silently closing the gripper on every empty-dict
+        # ``send_action({})`` call. With default 0.5 the conversion
+        # gives 0 → no ramp → ``current_action`` stays at its previous
+        # value → ctrl = bias (mid-range, holds open). #171 sub-task 3c
+        # found this via the deep-rollout state parity test: gripper
+        # drifted -19.6 mm in 50 zero-action steps while upstream stayed
+        # at ~+20 mm.
+        #
+        # Production eval is unaffected — the policy always sends
+        # ``gripper`` in the action chunk so the default never fires.
+        gripper_value = _to_scalar(action_dict.get("gripper", 0.5))
 
         # Round 41 (#168) — convert RLDS gripper convention → robosuite/LIBERO
         # convention. The GR00T-N1.7-LIBERO checkpoint emits ``action.gripper``
