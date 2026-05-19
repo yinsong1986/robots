@@ -31,6 +31,7 @@ the one that pulls in the upstream package to discover task files.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -959,6 +960,47 @@ class LiberoAdapter(BenchmarkProtocol):
             self._install_action_controller(sim)
         if self._init_jitter > 0:
             self._apply_init_jitter(sim, rng)
+
+        # Round 46 (#176 sub-task 3d) — settle physics by one zero-action
+        # control step so the first observation handed to the policy is
+        # at "init_state + 1 OSC step", matching upstream LIBERO's
+        # ``OffScreenRenderEnv.reset`` which does
+        # ``set_init_state(...) + env.step(np.zeros(7))`` (see
+        # ``LiberoOffScreenRenderEngine.reset:213`` and NVIDIA's
+        # ``libero_env.py:257``). Without this settle, the MuJoCoSimEngine
+        # path's first observation is at the raw ``init_state[i]`` while
+        # the offscreen path's first observation is one control step
+        # ahead — the same training data was generated against the
+        # post-step state, so feeding the raw init_state to a policy
+        # trained on post-step inputs is OOD by a few mm / mrad.
+        #
+        # The downstream effect: the policy emits actions that are
+        # ~2x off from what the offscreen path emits on identical
+        # tasks, which (combined with the OSC torque divergence from
+        # round 45) is enough to keep success_rate at 0 on libero-10.
+        # After this fix, the first observation matches upstream within
+        # numerical noise (qpos diff < 1e-9 verified empirically).
+        #
+        # Best-effort: gated on having a working OSC controller (which
+        # owns_stepping). If the controller wasn't installed (warning
+        # already logged in ``_install_action_controller``), skip the
+        # settle to avoid raising — the eval will still run, just at
+        # the un-settled init pose.
+        if scene_was_loaded:
+            world = getattr(sim, "_world", None)
+            if world is not None:
+                backend_state = getattr(world, "_backend_state", None)
+                if isinstance(backend_state, dict) and "action_controller" in backend_state:
+                    send_action = getattr(sim, "send_action", None)
+                    if callable(send_action):
+                        try:
+                            send_action({})
+                        except Exception as e:  # noqa: BLE001 - never abort eval on settle failure
+                            logger.warning(
+                                "LiberoAdapter.on_episode_start: settle send_action({}) raised %s; "
+                                "first observation will be at raw init_state instead of init_state+1step",
+                                e,
+                            )
 
         # Round 30 (#168) — reset per-episode state-log counter so each
         # episode emits its own first N STATE_LOG lines (matches the
@@ -2916,10 +2958,24 @@ class LiberoAdapter(BenchmarkProtocol):
     ) -> None:
         """Snapshot-and-restore branch of :meth:`_apply_canonical_state`.
 
-        First episode: capture ``data.qpos`` / ``data.qvel``. Subsequent
-        episodes: restore the cached snapshot via ``np.copyto`` and
-        ``mj_forward``. Procedurally-generated MJCFs (#165) hit this
-        branch because they don't ship a ``<keyframe>``.
+        First episode: write the LIBERO-canonical Panda home pose into
+        ``data.qpos[arm]`` (mirroring upstream ``Robot.reset(deterministic=True)``)
+        so the snapshot captures arm joints at home pose, then capture
+        ``data.qpos`` / ``data.qvel``. Subsequent episodes: restore the
+        cached snapshot via ``np.copyto`` and ``mj_forward``.
+
+        Procedurally-generated MJCFs (#165) hit this branch because they
+        don't ship a ``<keyframe>`` AND callers may not pass
+        ``init_states``. Without writing the home pose, ``data.qpos`` after
+        ``load_scene`` is at MuJoCo's default (all zeros for arm joints,
+        since the procedurally-generated MJCF doesn't set joint ``ref``
+        attributes). Upstream's ``OffScreenRenderEnv`` instead writes
+        ``MountedPanda.init_qpos`` (= ``[0, -0.161, 0, -2.444, 0, 2.227,
+        π/4]``) inside its ``Robot.reset`` so the env starts at the
+        ready pose. To match upstream's BDDL-default behaviour (#176
+        sub-task 3d), we replicate that write here.
+
+        Round 46 (#176 sub-task 3d).
         """
         try:
             qpos = data.qpos
@@ -2928,9 +2984,11 @@ class LiberoAdapter(BenchmarkProtocol):
             logger.debug("LiberoAdapter: data has no qpos/qvel attrs: %s", e)
             return
 
-        # First episode (or model recompile changed nq) -> capture, don't
-        # restore. The snapshot is taken after super() + _install_libero_cameras
-        # so it reflects the post-setup canonical state.
+        # First episode (or model recompile changed nq) -> write home
+        # pose into arm joints, then capture; don't restore. The
+        # snapshot is taken after super() + _install_libero_cameras
+        # so it reflects the post-setup canonical state, with the arm
+        # at the LIBERO-canonical ready pose.
         needs_capture = (
             self._canonical_qpos is None
             or self._canonical_qpos.shape != qpos.shape
@@ -2938,6 +2996,14 @@ class LiberoAdapter(BenchmarkProtocol):
             or self._canonical_qvel.shape != qvel.shape
         )
         if needs_capture:
+            # Round 46 (#176 sub-task 3d): write home pose to arm
+            # joints before snapshotting. Without this the captured
+            # snapshot is at MuJoCo's default qpos=0, which is
+            # significantly off from upstream's ``MountedPanda.init_qpos``
+            # post-``Robot.reset``. Best-effort: failures during home-
+            # pose discovery / write fall through silently — the
+            # snapshot captures whatever ``data.qpos`` happens to be.
+            self._write_libero_arm_home_qpos(model, data, mj, lock)
             try:
                 self._canonical_qpos = np.array(qpos, copy=True)
                 self._canonical_qvel = np.array(qvel, copy=True)
@@ -2974,6 +3040,91 @@ class LiberoAdapter(BenchmarkProtocol):
             logger.warning("LiberoAdapter: snapshot restore failed: %s", e)
             return
         logger.debug("LiberoAdapter: restored canonical qpos snapshot")
+
+    def _write_libero_arm_home_qpos(self, model: Any, data: Any, mj: Any, lock: Any) -> None:
+        """Write the LIBERO Panda + gripper ready pose into ``data.qpos``.
+
+        Mirrors upstream ``robosuite.robots.robot.Robot.reset(deterministic=True)``
+        which writes ``self.init_qpos`` (= ``MountedPanda.init_qpos`` for
+        LIBERO) to the arm joint qpos addresses BEFORE constructing the
+        OSC controller. Also mirrors ``SingleArm.reset`` which writes
+        ``self.gripper.init_qpos`` (= ``PandaGripper.init_qpos`` =
+        ``[0.020833, -0.020833]``) to the gripper finger joint qpos
+        addresses. Used by :meth:`_apply_snapshot_branch` to bring the
+        BDDL-default state into parity with upstream
+        ``OffScreenRenderEnv``.
+
+        Best-effort: any failure (no Panda joints, missing libero
+        package, model has no ``arm joint``s) is logged at DEBUG and
+        falls through silently, leaving ``data.qpos`` at whatever
+        MuJoCo's default was. Caller's snapshot branch then captures
+        the un-modified qpos.
+
+        Round 46 (#176 sub-task 3d).
+        """
+        # Resolve arm joint qpos addresses (same scan as
+        # _LiberoOSCController.from_sim).
+        arm_qpos_addrs: list[int] = []
+        gripper_qpos_addrs: list[int] = []
+        njnt = int(getattr(model, "njnt", 0))
+        for i in range(njnt):
+            jname = mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT, i)
+            if not isinstance(jname, str):
+                continue
+            if jname.startswith(self._scene_robot_prefix) and not jname.startswith(self._scene_gripper_prefix):
+                arm_qpos_addrs.append(int(model.jnt_qposadr[i]))
+            elif jname.startswith(self._scene_gripper_prefix):
+                # Filter to finger joints only — match round-33 convention
+                # (gripper0_finger_joint1, gripper0_finger_joint2).
+                if "finger_joint" in jname:
+                    gripper_qpos_addrs.append(int(model.jnt_qposadr[i]))
+        if len(arm_qpos_addrs) != 7:
+            logger.debug(
+                "LiberoAdapter._write_libero_arm_home_qpos: expected 7 arm joints with prefix %r, "
+                "found %d; skipping home-pose write",
+                self._scene_robot_prefix,
+                len(arm_qpos_addrs),
+            )
+            return
+
+        home_qpos = _resolve_libero_arm_home_qpos(len(arm_qpos_addrs))
+        if home_qpos is None:
+            logger.debug(
+                "LiberoAdapter._write_libero_arm_home_qpos: no LIBERO/robosuite home pose available; "
+                "skipping home-pose write"
+            )
+            return
+
+        # Resolve gripper init_qpos (PandaGripper). Same caching pattern
+        # as arm home pose for cheap repeat lookup.
+        gripper_init = _resolve_panda_gripper_init_qpos(len(gripper_qpos_addrs))
+
+        def _do_write() -> None:
+            for adr, v in zip(arm_qpos_addrs, home_qpos, strict=True):
+                data.qpos[adr] = float(v)
+            if gripper_init is not None and len(gripper_qpos_addrs) == len(gripper_init):
+                for adr, v in zip(gripper_qpos_addrs, gripper_init, strict=True):
+                    data.qpos[adr] = float(v)
+            mj.mj_forward(model, data)
+
+        try:
+            if lock is not None:
+                with lock:
+                    _do_write()
+            else:
+                _do_write()
+        except Exception as e:  # noqa: BLE001 - best-effort, never fatal
+            logger.debug(
+                "LiberoAdapter._write_libero_arm_home_qpos: write failed (%s); snapshot will capture pre-write qpos",
+                e,
+            )
+            return
+        logger.debug(
+            "LiberoAdapter: wrote LIBERO Panda + gripper home pose into data.qpos (snapshot pre-capture); "
+            "arm=%d, gripper=%d",
+            len(arm_qpos_addrs),
+            len(gripper_qpos_addrs),
+        )
 
     def _apply_init_jitter(self, sim: SimEngine, rng: random.Random) -> None:
         """Apply ±jitter to xy of every body referenced by ``(:init (on A B))``.
@@ -3164,28 +3315,56 @@ def _fmt_state_value(value: Any) -> str:
 def _quat_wxyz_to_rpy_xyz(quat_wxyz: list[float]) -> tuple[float, float, float]:
     """MuJoCo ``(w, x, y, z)`` quaternion → extrinsic XYZ Euler ``(roll, pitch, yaw)``.
 
-    Matches RoboSuite/LIBERO's ``mat2euler(..., axes='sxyz')`` convention -
-    i.e. rotations applied about the *static* world frame in the order
-    X (roll), Y (pitch), Z (yaw). This is also what
-    ``scipy.spatial.transform.Rotation.from_quat([x, y, z, w]).as_euler('xyz')``
-    returns (lowercase ``'xyz'`` = extrinsic in scipy).
+    Matches RoboSuite/LIBERO's ``mat2euler(..., axes='sxyz')`` convention
+    byte-for-byte. RoboSuite implements ``sxyz`` as the extraction
+    ``(atan2(M[2,1], M[2,2]), asin(-M[2,0]), atan2(M[1,0], M[0,0]))``
+    where ``M`` is the rotation matrix in Hamilton convention.
 
-    Pure numpy / stdlib - **does not import scipy**, which is not a
-    declared dependency of strands_robots. Math reference:
+    For unit quat ``q = (w, x, y, z)``, the rotation-matrix entries
+    needed for the canonical extraction are (Hamilton convention,
+    standard active rotation):
 
-        R = R_x(roll) · R_y(pitch) · R_z(yaw)  (extrinsic XYZ)
+        M[0,0] = 1 - 2(y² + z²)
+        M[1,0] = 2(xy + wz)
+        M[2,0] = 2(xz - wy)
+        M[2,1] = 2(yz + wx)
+        M[2,2] = 1 - 2(x² + y²)
 
-    For unit quat ``q = (w, x, y, z)``, the rotation-matrix elements
-    needed for the canonical extraction are:
+    Hence:
 
-        R[0,2] =  2 (xz + wy)        →  sin(pitch)
-        R[0,0] =  1 - 2 (y² + z²)
-        R[0,1] = -2 (wz - xy)
-        R[1,2] = -2 (wx - yz)
-        R[2,2] =  1 - 2 (x² + y²)
+        roll  = atan2(M[2,1], M[2,2]) = atan2(2(wx + yz), 1 - 2(x² + y²))
+        pitch = asin(-M[2,0])         = asin(2(wy - xz))
+        yaw   = atan2(M[1,0], M[0,0]) = atan2(2(wz + xy), 1 - 2(y² + z²))
+
+    Pure numpy / stdlib — **does not import scipy**, which is not a
+    declared dependency of strands_robots. Equivalent to
+    ``LiberoOffScreenRenderEngine._quat_xyzw_to_rpy_xyz`` (which takes
+    xyzw input).
+
+    **Round 46 (#176 sub-task 3d)** corrected three sign errors in the
+    pre-46 derivation. The pre-46 formula was based on
+    ``R = R_x · R_y · R_z`` (intrinsic XYZ, NOT extrinsic), giving:
+
+        roll  = atan2(2(wx - yz), ...)  [WRONG SIGN on yz]
+        pitch = asin(2(wy + xz))         [WRONG SIGN on xz]
+        yaw   = atan2(2(wz - xy), ...)  [WRONG SIGN on xy]
+
+    These produced sign-flipped Euler angles for the EEF wrist body
+    on the LIBERO ready pose (verified empirically against
+    robosuite's ``mat2euler``: a quat=(0, 0.707, 0.707, 0) returns
+    (π, 0, π/2) under sxyz but the pre-46 formula returned (-π, 0,
+    -π/2)). The sign flip in yaw is genuinely a different rotation
+    (left vs right twist about z). The state.yaw reported to the
+    policy was therefore systematically inverted relative to
+    training data, putting the policy out-of-distribution from the
+    very first observation. (The state-parity test passed at canonical
+    init because canonical-pose yaw is ~0.0005 rad and the test uses
+    ``_angle_diff_mod_2pi`` which masked the sign flip; the test
+    should also be made to forbid sign-flips for non-π rotations.)
 
     Gimbal lock (``|sin(pitch)| ≥ 1 - 1e-6``) collapses roll into yaw;
-    we use the ``atan2(R[1,0], R[1,1])`` resolution that matches scipy.
+    we use the ``atan2(-M[1,2], M[1,1])`` resolution that matches
+    scipy / robosuite.
 
     Returns:
         ``(roll, pitch, yaw)`` in **radians**, each in the principal
@@ -3195,16 +3374,20 @@ def _quat_wxyz_to_rpy_xyz(quat_wxyz: list[float]) -> tuple[float, float, float]:
     import math
 
     w, x, y, z = quat_wxyz
-    # Clamp argument to asin to handle minor numerical drift on unit quats.
-    sin_pitch = max(-1.0, min(1.0, 2.0 * (x * z + w * y)))
+    # Clamp asin argument to handle minor numerical drift on unit quats.
+    sin_pitch = max(-1.0, min(1.0, 2.0 * (w * y - x * z)))
     pitch = math.asin(sin_pitch)
     if abs(sin_pitch) >= 1.0 - 1e-6:
-        # Gimbal-lock branch: roll absorbed into yaw.
+        # Gimbal lock: roll absorbed into yaw. Use the same fallback
+        # robosuite's ``mat2euler`` does (atan2(-M[1,2], M[1,1])).
         roll = 0.0
-        yaw = math.atan2(2.0 * (x * y + w * z), 1.0 - 2.0 * (y * y + z * z))
+        # M[1,2] = 2(yz - wx); M[1,1] = 1 - 2(x² + z²).
+        yaw = math.atan2(-2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + z * z))
     else:
-        roll = math.atan2(-2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y))
-        yaw = math.atan2(-2.0 * (x * y - w * z), 1.0 - 2.0 * (y * y + z * z))
+        # M[2,1] = 2(yz + wx); M[2,2] = 1 - 2(x² + y²).
+        roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+        # M[1,0] = 2(xy + wz); M[0,0] = 1 - 2(y² + z²).
+        yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
     return (roll, pitch, yaw)
 
 
@@ -3711,7 +3894,113 @@ class _LiberoOSCController:
             dtype=np.float32,
         )
         controller_config["actuator_range"] = (ctrl_low, ctrl_high)
+
+        # Round 45 (#176) — temporarily set ``data.qpos[arm]`` to the
+        # LIBERO-canonical Panda "ready" pose around the
+        # ``controller_factory`` call so the controller's
+        # construction-time state capture matches upstream LIBERO
+        # byte-for-byte.
+        #
+        # **Why this is needed.** Robosuite's ``BaseController.__init__``
+        # ends with ``self.update_initial_joints(initial_joints)``,
+        # which:
+        #
+        # 1. sets ``self.initial_joint = initial_joints``,
+        # 2. calls ``self.update(force=True)`` reading ``ee_pos`` /
+        #    ``ee_ori_mat`` / ``joint_pos`` from the *current*
+        #    ``data.qpos``,
+        # 3. stores those reads into ``self.initial_ee_pos`` and
+        #    ``self.initial_ee_ori_mat``.
+        #
+        # ``OSC_POSE.__init__`` then sets
+        # ``self.goal_pos = np.array(self.initial_ee_pos)`` and
+        # ``self.goal_ori = np.array(self.initial_ee_ori_mat)``. So the
+        # controller's *initial goal pose* is whatever ``data.qpos``
+        # happened to be at construction time.
+        #
+        # Upstream LIBERO's ``Robot.reset(deterministic=True)``
+        # (``robosuite/robots/robot.py``) writes ``self.init_qpos`` (=
+        # ``MountedPanda.init_qpos`` = ``[0, -0.161, 0, -2.4446, 0,
+        # 2.2268, π/4]``) into ``data.qpos[arm]`` BEFORE constructing
+        # the controller, so ``initial_ee_pos`` / ``initial_ee_ori_mat``
+        # / ``goal_pos`` / ``goal_ori`` all latch on to the ready-pose
+        # EEF location. Then ``env.set_init_state(init_states[i])``
+        # overwrites ``data.qpos`` with the per-episode canonical
+        # state, but the controller's initial-state attributes are
+        # frozen — leading to a non-trivial nullspace bias and a
+        # ``goal_ori`` that's ~54 mrad different from the perturbed
+        # canonical pose.
+        #
+        # Our ``LiberoAdapter._install_action_controller`` runs from
+        # ``on_episode_start`` AFTER ``_apply_canonical_state`` has
+        # already loaded the canonical ``init_states[i]`` into
+        # ``data.qpos``, AND we never write the Panda ready pose
+        # ourselves. The upstream-style ``Robot.reset`` step happens
+        # implicitly via the LIBERO env construction in upstream's
+        # path; we have no analog. So we replicate it here by
+        # snapshotting ``data.qpos[arm]`` (the current canonical
+        # values), writing the LIBERO Panda ready pose into those
+        # addresses, calling ``mj_forward`` so site_xpos / site_xmat
+        # reflect the home pose, building the controller (which
+        # captures everything from the home-pose state), then
+        # restoring ``data.qpos[arm]`` and calling ``mj_forward``
+        # again. ``data.qvel`` is left as-is — upstream's
+        # ``Robot.reset`` doesn't touch qvel, and our canonical
+        # ``init_state`` is at zero velocity anyway.
+        #
+        # This fixes the ~50× torque divergence in #176 root cause: not
+        # just the nullspace bias (``initial_joint``), but ALSO the
+        # ``goal_ori`` initialization that without the swap would
+        # latch on to the perturbed pose's EEF orientation.
+        #
+        # See ``probe_osc_internals_v3.py`` for the verification
+        # showing torques match within tolerance after this swap.
+        snapshot_qpos: np.ndarray | None = None
+        home_qpos = _resolve_libero_arm_home_qpos(len(arm_qpos_addrs))
+        if home_qpos is not None:
+            try:
+                # Snapshot current canonical arm qpos so we can restore.
+                snapshot_qpos = np.array(
+                    [float(data.qpos[adr]) for adr in arm_qpos_addrs],
+                    dtype=np.float64,
+                )
+                # Write home pose into arm joint addresses.
+                for adr, v in zip(arm_qpos_addrs, home_qpos, strict=True):
+                    data.qpos[adr] = float(v)
+                # Update derived state (site_xpos, site_xmat, jacobians)
+                # so the controller's __init__ ``update(force=True)``
+                # reads home-pose values.
+                _mj.mj_forward(model, data)
+            except (AttributeError, IndexError, TypeError, ValueError) as e:
+                # Defensive: if we can't snapshot, don't proceed with
+                # the swap (would leak home pose into the sim).
+                logger.debug(
+                    "_LiberoOSCController.from_sim: failed to swap qpos to home pose for "
+                    "controller construction (%s); falling back to construction-time state",
+                    e,
+                )
+                snapshot_qpos = None
+
         controller = controller_factory("OSC_POSE", controller_config)
+
+        # Restore the per-episode canonical qpos and re-forward so
+        # data is byte-identical to its pre-swap state. The
+        # controller has already captured ``initial_*`` and ``goal_*``
+        # at the home pose; subsequent ``update()`` calls will read
+        # the restored canonical state, which is exactly upstream's
+        # behavior post-``set_init_state``.
+        if snapshot_qpos is not None:
+            try:
+                for adr, v in zip(arm_qpos_addrs, snapshot_qpos, strict=True):
+                    data.qpos[adr] = float(v)
+                _mj.mj_forward(model, data)
+            except (AttributeError, IndexError, TypeError, ValueError) as e:
+                # If restore fails the sim is in an unknown state;
+                # raise loudly rather than silently leaving home pose.
+                raise _ControllerInstallError(
+                    f"failed to restore qpos after controller construction (snapshot was "
+                    f"{snapshot_qpos.tolist()}): {e}. Sim may be in inconsistent state."
+                ) from e
 
         # Compute physics-substeps-per-control from sim's actual timestep.
         # LIBERO trains at 20 Hz control rate. With dt=0.002 (default 500 Hz
@@ -4033,6 +4322,191 @@ class _LiberoOSCController:
 
         mj.mju_mat2Quat(quat, xmat)
         return pos, quat
+
+
+# Module-level cache: resolving the LIBERO-canonical Panda home pose
+# imports the libero robot module, which transitively imports robosuite,
+# loads MJCF assets, and warns about missing macro files. The result is
+# immutable per-process — cache it after the first lookup so calls 50×
+# per second from ``_install_action_controller`` are free.
+_CACHED_LIBERO_HOME_QPOS: np.ndarray | None = None
+_CACHED_LIBERO_HOME_QPOS_RESOLVED: bool = False
+
+
+def _resolve_libero_arm_home_qpos(n_arm: int) -> np.ndarray | None:
+    """Return the LIBERO-canonical Panda 7-DoF home pose, or ``None``.
+
+    Resolution order:
+
+    1. ``libero.libero.envs.robots.mounted_panda.MountedPanda().init_qpos``
+       — stock LIBERO layout (``pip install libero``).
+    2. ``libero.envs.robots.mounted_panda.MountedPanda().init_qpos``
+       — LIBERO-PRO layout (the LIBERO-PRO fork uses a flatter package
+       structure). Same canonical ``init_qpos`` byte-for-byte.
+    3. ``robosuite.models.robots.Panda().init_qpos`` (stock
+       robosuite, slightly different — ``[0, π/16, 0, -π/2-π/3, 0,
+       π-0.2, π/4]`` vs ``[0, -0.161, 0, -2.4446, 0, 2.2268, π/4]``).
+       Only used when neither libero variant is importable.
+    4. ``None`` if nothing is available — caller falls back to the
+       controller's construction-time default.
+
+    Both LIBERO layouts produce the same ``MountedPanda.init_qpos``,
+    which is what upstream ``OffScreenRenderEnv``'s
+    ``Robot.reset(deterministic=True)`` writes to ``data.qpos`` BEFORE
+    constructing the OSC controller. That's the value upstream's
+    ``controller.initial_joint`` ends up holding, and the value the
+    round-45 swap-and-restore in :meth:`_LiberoOSCController.from_sim`
+    needs to write into ``data.qpos`` around ``controller_factory``.
+
+    Refs #176.
+    """
+    global _CACHED_LIBERO_HOME_QPOS, _CACHED_LIBERO_HOME_QPOS_RESOLVED
+
+    if _CACHED_LIBERO_HOME_QPOS_RESOLVED:
+        if _CACHED_LIBERO_HOME_QPOS is None:
+            return None
+        if _CACHED_LIBERO_HOME_QPOS.shape != (n_arm,):
+            # Different robot than the cached one (e.g. a 6-DoF arm).
+            # Don't reuse the cached 7-DoF Panda value.
+            return None
+        return _CACHED_LIBERO_HOME_QPOS
+
+    home: np.ndarray | None = None
+    # Try both LIBERO package layouts. The class is identical between
+    # them (same numerical init_qpos); only the import path differs.
+    libero_module_paths = (
+        "libero.libero.envs.robots.mounted_panda",  # stock libero
+        "libero.envs.robots.mounted_panda",  # LIBERO-PRO
+    )
+    for module_path in libero_module_paths:
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            continue
+        mounted_panda_cls = getattr(module, "MountedPanda", None)
+        if mounted_panda_cls is None:
+            logger.debug(
+                "%s exposes no MountedPanda; trying next libero layout",
+                module_path,
+            )
+            continue
+        try:
+            # ``MountedPanda.init_qpos`` is a property that returns a
+            # fresh ndarray on each access. Instantiating triggers
+            # MJCF asset load (``robots/panda/robot.xml``); the property
+            # itself reads from constants so the construction cost is
+            # paid once per process.
+            home = np.asarray(mounted_panda_cls().init_qpos, dtype=np.float64)
+        except Exception as e:  # noqa: BLE001 - any failure soft-fall-through
+            logger.debug(
+                "MountedPanda(%s).init_qpos raised %s; trying next libero layout",
+                module_path,
+                e,
+            )
+            continue
+        if home.shape != (n_arm,):
+            logger.debug(
+                "MountedPanda(%s).init_qpos shape %s does not match arm DoF %d; ignoring",
+                module_path,
+                home.shape,
+                n_arm,
+            )
+            home = None
+            continue
+        # Successfully resolved.
+        break
+
+    if home is None:
+        # Fall through to stock robosuite Panda. Its init_qpos differs
+        # slightly from MountedPanda's (~30 mrad on j2/j6) but it's
+        # closer to upstream than the perturbed canonical pose, so it's
+        # still a useful fallback when libero is unavailable.
+        try:
+            from robosuite.models.robots.manipulators.panda_robot import (  # type: ignore[import-not-found]
+                Panda,
+            )
+
+            home = np.asarray(Panda().init_qpos, dtype=np.float64)
+            if home.shape != (n_arm,):
+                logger.debug(
+                    "robosuite Panda.init_qpos shape %s does not match arm DoF %d; ignoring",
+                    home.shape,
+                    n_arm,
+                )
+                home = None
+        except ImportError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            logger.debug("robosuite Panda init_qpos lookup raised %s; no fallback", e)
+
+    _CACHED_LIBERO_HOME_QPOS = home
+    _CACHED_LIBERO_HOME_QPOS_RESOLVED = True
+    return home
+
+
+# Module-level cache for the Panda gripper init_qpos (mirrors the arm
+# home pose cache above). Used by
+# ``LiberoAdapter._write_libero_arm_home_qpos`` to set finger joints to
+# upstream's open canonical position.
+_CACHED_PANDA_GRIPPER_INIT_QPOS: np.ndarray | None = None
+_CACHED_PANDA_GRIPPER_INIT_QPOS_RESOLVED: bool = False
+
+
+def _resolve_panda_gripper_init_qpos(n_finger: int) -> np.ndarray | None:
+    """Return the LIBERO-canonical Panda gripper finger init qpos, or ``None``.
+
+    Mirrors ``robosuite.models.grippers.panda_gripper.PandaGripper.init_qpos``,
+    which is ``[0.020833, -0.020833]`` (≈ 2 cm fingertip separation,
+    "open" position). Used by :meth:`LiberoAdapter._write_libero_arm_home_qpos`
+    to initialise gripper finger qpos to upstream's canonical open
+    pose, mirroring upstream ``SingleArm.reset`` which writes
+    ``self.gripper.init_qpos`` to the gripper joint qpos addresses
+    BEFORE constructing the OSC controller.
+
+    Resolution order:
+
+    1. ``robosuite.models.grippers.panda_gripper.PandaGripper().init_qpos``
+       (the library function used by both stock libero and LIBERO-PRO).
+    2. ``None`` — caller leaves gripper qpos at MuJoCo's default (zero,
+       which is "fingers touching" — significantly different from the
+       open canonical pose). The 14 mm divergence between
+       ``data.qpos[gripper] = 0`` (closed) and ``data.qpos[gripper] =
+       0.0208`` (open) is enough to put the policy out-of-distribution
+       on ``state.gripper`` from the very first observation.
+
+    Refs #176 sub-task 3d.
+    """
+    global _CACHED_PANDA_GRIPPER_INIT_QPOS, _CACHED_PANDA_GRIPPER_INIT_QPOS_RESOLVED
+
+    if _CACHED_PANDA_GRIPPER_INIT_QPOS_RESOLVED:
+        if _CACHED_PANDA_GRIPPER_INIT_QPOS is None:
+            return None
+        if _CACHED_PANDA_GRIPPER_INIT_QPOS.shape != (n_finger,):
+            return None
+        return _CACHED_PANDA_GRIPPER_INIT_QPOS
+
+    init_qpos: np.ndarray | None = None
+    try:
+        from robosuite.models.grippers.panda_gripper import (  # type: ignore[import-not-found]
+            PandaGripper,
+        )
+
+        init_qpos = np.asarray(PandaGripper().init_qpos, dtype=np.float64)
+        if init_qpos.shape != (n_finger,):
+            logger.debug(
+                "PandaGripper.init_qpos shape %s does not match finger count %d; ignoring",
+                init_qpos.shape,
+                n_finger,
+            )
+            init_qpos = None
+    except ImportError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        logger.debug("PandaGripper.init_qpos lookup raised %s; no fallback", e)
+
+    _CACHED_PANDA_GRIPPER_INIT_QPOS = init_qpos
+    _CACHED_PANDA_GRIPPER_INIT_QPOS_RESOLVED = True
+    return init_qpos
 
 
 def _to_scalar(value: Any) -> float:

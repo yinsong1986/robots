@@ -83,21 +83,48 @@ def _body_position(sim: SimEngine, body: str) -> list[float] | None:
     Requires the backend to implement ``get_body_state`` (MuJoCo only at time
     of writing). Future backends can add the same method signature - see
     :meth:`strands_robots.simulation.mujoco.physics.PhysicsMixin.get_body_state`.
+
+    LIBERO body-name convention: BDDL names objects without a suffix
+    (``porcelain_mug_1``), but the MJCF root body is suffixed with
+    ``_main`` (``porcelain_mug_1_main``). Upstream resolves this via
+    ``env.objects_dict[name].root_body`` (see
+    ``libero/libero/envs/bddl_base_domain.py``). We mirror that with a
+    bounded fallback: try the bare name first, then ``<name>_main`` if
+    the bare lookup fails. Round 46 (#176 sub-task 3d) — without this
+    fallback, BDDL goal predicates like ``(On porcelain_mug_1
+    plate_1)`` resolve to ``None`` (body not found) → predicate
+    silently False even when the mug is physically on the plate.
     """
     get_body_state = getattr(sim, "get_body_state", None)
     if get_body_state is None:
         return None
-    try:
-        result = get_body_state(body_name=body)
-    except Exception as e:  # noqa: BLE001 - defensive: predicates never raise
-        logger.debug("body_position(%r) failed: %s", body, e)
+
+    def _try(name: str) -> list[float] | None:
+        try:
+            result = get_body_state(body_name=name)
+        except Exception as e:  # noqa: BLE001 - defensive: predicates never raise
+            logger.debug("body_position(%r) failed: %s", name, e)
+            return None
+        if not isinstance(result, dict) or result.get("status") != "success":
+            return None
+        payload = _extract_json(result)
+        pos = payload.get("position")
+        if isinstance(pos, list) and len(pos) == 3 and all(isinstance(c, (int, float)) for c in pos):
+            return [float(c) for c in pos]
         return None
-    if not isinstance(result, dict) or result.get("status") != "success":
-        return None
-    payload = _extract_json(result)
-    pos = payload.get("position")
-    if isinstance(pos, list) and len(pos) == 3 and all(isinstance(c, (int, float)) for c in pos):
-        return [float(c) for c in pos]
+
+    # 1. Bare name (works for fixtures with explicit body names matching
+    # the BDDL name, e.g. ``living_room_table``).
+    pos = _try(body)
+    if pos is not None:
+        return pos
+    # 2. LIBERO ``<name>_main`` convention (the root body of
+    # procedurally-generated objects). Skip if the name already has
+    # the suffix to avoid double-suffixing on retries.
+    if not body.endswith("_main"):
+        pos = _try(f"{body}_main")
+        if pos is not None:
+            return pos
     return None
 
 
