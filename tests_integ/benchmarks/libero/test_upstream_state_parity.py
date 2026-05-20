@@ -711,9 +711,18 @@ def test_libero_10_scene5_mujoco_engine_success_rate() -> None:
     max_episode_steps = 720
     n_action_steps = 8
 
+    from strands_robots.simulation.policy_runner import set_eval_seed
+
     successes = []
     try:
         for ep in range(n_episodes):
+            # #179 — seed Python/NumPy/torch/cuDNN per episode so the
+            # GR00T diffusion sampler is reproducible. Without this,
+            # ``success_rate`` varies wildly across runs of the same
+            # eval (5-ep variance ranged 0.40-1.00 pre-fix). The
+            # per-episode seed is deterministic in (master_seed,
+            # episode_index).
+            set_eval_seed(seed + ep)
             adapter.on_episode_start(sim, _random.Random(seed + ep))
             steps = 0
             is_success = False

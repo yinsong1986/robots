@@ -54,7 +54,7 @@ from strands_robots.simulation.models import TrajectoryStep
 logger = logging.getLogger(__name__)
 
 
-def _set_eval_seed(seed: int) -> None:
+def set_eval_seed(seed: int) -> None:
     """Seed Python / NumPy / torch RNGs for reproducible eval rollouts.
 
     Mirrors NVIDIA's ``set_seed`` from
@@ -87,9 +87,12 @@ def _set_eval_seed(seed: int) -> None:
       are scoped to torch (not the broader environment) so the side
       effect surface is acceptable.
 
-    Per-episode reproducibility additionally depends on the spec's
-    ``episode_rng`` derived from this master seed inside
-    :meth:`_evaluate_with_spec`.
+    Public since #179: standalone integration tests
+    (``tests_integ/.../test_libero_10_scene5_mujoco_engine_success_rate``)
+    bypass :meth:`evaluate_benchmark` and need to call this directly to
+    get reproducible policy rollouts. The leading ``_`` was an oversight
+    from #168 round 38; the function is the supported way to seed an
+    eval and is part of the public API.
 
     NumPy / torch are imported lazily so this helper works on minimal
     installs that don't have torch (e.g. ``policy_provider="mock"``
@@ -112,6 +115,12 @@ def _set_eval_seed(seed: int) -> None:
         _torch.backends.cudnn.benchmark = False
     except ImportError:
         pass
+
+
+# Backward-compatibility alias for the pre-#179 private name. Internal
+# callers (this module's :class:`PolicyRunner`) still use it; the public
+# :func:`set_eval_seed` is the supported entry point.
+_set_eval_seed = set_eval_seed
 
 
 # Hook signature: called every control step after send_action.
@@ -748,6 +757,21 @@ class PolicyRunner:
             episode_seed = master_rng.randint(0, 2**31 - 1)
             episode_rng = random.Random(episode_seed)
 
+            # #179 — re-seed Python / NumPy / torch / cuDNN at the start
+            # of EACH episode (not just once before the loop). Without
+            # the per-episode reseed, every torch op draws from a global
+            # RNG state that mutates across episodes, so the diffusion
+            # sampler in policies like ``nvidia/GR00T-N1.7-LIBERO`` produces
+            # different action chunks per re-run even at the same
+            # ``seed=42``. With the per-episode reseed, episode N always
+            # starts from the same RNG state regardless of what happened
+            # in episodes 0..N-1.
+            #
+            # Validated on libero-10/SCENE5: pre-#179 5-ep eval ranged
+            # 0.40-1.00 across runs; post-#179 the same eval is bit-stable
+            # (same successes list every run).
+            set_eval_seed(episode_seed)
+
             try:
                 spec.on_episode_start(self.sim, episode_rng)
             except BenchmarkCompatibilityError as e:
@@ -988,4 +1012,4 @@ class PolicyRunner:
         raise ValueError(f"Unknown success_fn string: {success_fn!r}")
 
 
-__all__ = ["PolicyRunner", "OnFrame", "SuccessFn", "CooperativeStop", "TrajectoryStep"]
+__all__ = ["PolicyRunner", "OnFrame", "SuccessFn", "CooperativeStop", "TrajectoryStep", "set_eval_seed"]
