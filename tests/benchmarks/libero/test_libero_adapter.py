@@ -2385,15 +2385,17 @@ class TestCacheTransformVersion:
 
         assert key1 != key2
 
-    def test_current_transform_version_is_v3(self):
+    def test_current_transform_version_is_v4(self):
         """Pin the current version. Round 8 = ``v2`` (collision rgba +
         custom headlight, was wrong direction). Round 9 = ``v3``
-        (cache verbatim, render-time options). Bumping the version is
-        the contract that invalidates stale caches; the value MUST be
-        reviewed every time the transform pipeline changes."""
+        (cache verbatim, render-time options). #181 = ``v4`` (switch
+        ``_extract_compiled_mjcf`` to prefer pre-compile MJCF so
+        ``inertiagrouprange="0 0"`` is preserved). Bumping the version
+        is the contract that invalidates stale caches; the value MUST
+        be reviewed every time the transform pipeline changes."""
         from strands_robots.benchmarks.libero.adapter import _LIBERO_MJCF_TRANSFORM_VERSION
 
-        assert _LIBERO_MJCF_TRANSFORM_VERSION == "v3"
+        assert _LIBERO_MJCF_TRANSFORM_VERSION == "v4"
 
 
 class TestInstallRenderOptions:

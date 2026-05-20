@@ -3407,23 +3407,43 @@ def _default_scene_cache_dir() -> Path:
 
 
 def _extract_compiled_mjcf(env: Any) -> str:
-    """Pull the compiled MJCF XML out of a ``libero`` ControlEnv.
+    """Pull the MJCF XML out of a ``libero`` ControlEnv.
 
-    ``ControlEnv.env`` is the underlying robosuite manipulation env;
-    its ``.sim.model.get_xml()`` returns the merged / compiled MJCF as
-    a string (with all ``<include>``s resolved and assets inlined).
-    Robosuite renamed this accessor over the years, so we try a small
-    set of fallbacks before giving up - and we never look at any
-    non-public attributes.
+    Prefers ``env.env.model.get_xml()`` (the **pre-compile** MJCF emitted by
+    robosuite's ``ManipulationTask`` — what gets handed to
+    ``MjModel.from_xml_string`` at construction time). Falls back to
+    ``env.env.sim.model.get_xml()`` (a **post-compile** re-serialization via
+    ``mj_saveLastXML``) if the pre-compile accessor isn't available.
+
+    **Why pre-compile is preferred (#181).** ``mj_saveLastXML`` is a lossy
+    round-trip — it doesn't preserve every ``<compiler>`` attribute. In
+    particular ``inertiagrouprange="0 0"`` is dropped, so re-loading the
+    saved XML re-computes body inertias from ALL geom groups (including
+    visual meshes) rather than just collision geoms (group 0). Effect on
+    ``libero-10/SCENE5``: re-loaded model has table_col mass 77.5 kg vs
+    upstream's 34.5 kg, mug masses 4× heavier, etc.
+
+    The pre-compile path preserves ``<compiler inertiagrouprange="0 0"/>``
+    verbatim, so re-loading byte-identically reproduces upstream's runtime
+    masses (table_col=34.54 kg, mug=0.0165 kg). Verified empirically by
+    diffing ``env.env.sim.model._model`` (upstream runtime) vs
+    ``mujoco.MjModel.from_xml_path(cached.xml)`` for both paths.
+
+    Robosuite renamed accessors over the years; we try a small set of
+    fallbacks before giving up. Never looks at any non-public attributes.
     """
     accessors = (
-        # Newer robosuite (>=1.4) - canonical path through the env's MjSim.
-        lambda: env.env.sim.model.get_xml(),
-        # Older robosuite (<1.4) - sometimes exposes the model directly.
+        # #181 — preferred: pre-compile MJCF from robosuite's
+        # ``ManipulationTask``. Preserves ``<compiler>`` attributes that
+        # ``mj_saveLastXML`` drops (notably ``inertiagrouprange``).
         lambda: env.env.model.get_xml(),
-        # Fallback: ManipulationEnv subclasses sometimes expose the
-        # compiled XML via an explicit ``model.get_model_xml`` helper.
+        # Older robosuite path: ``ManipulationEnv`` subclasses sometimes
+        # expose the compiled XML via an explicit helper.
         lambda: env.env.model.get_model_xml(),  # type: ignore[attr-defined]
+        # Last resort: post-compile re-serialization. Lossy on
+        # ``<compiler>`` attributes (see #181); used only if the
+        # pre-compile accessors aren't available (very old robosuite).
+        lambda: env.env.sim.model.get_xml(),
     )
     last_err: Exception | None = None
     for accessor in accessors:
@@ -3434,7 +3454,7 @@ def _extract_compiled_mjcf(env: Any) -> str:
             continue
         if isinstance(xml, str) and xml.strip():
             return xml
-    raise RuntimeError(f"could not extract compiled MJCF from libero env (last error: {last_err!r})")
+    raise RuntimeError(f"could not extract MJCF from libero env (last error: {last_err!r})")
 
 
 # Match a complete ``<camera ... name="OLD" ...>`` declaration so the
@@ -3476,12 +3496,24 @@ def _rename_mjcf_cameras(xml: str, aliases: dict[str, str]) -> str:
 # * ``v2``: round 8 - applied ``_apply_libero_visual_fixes`` (rgba alpha=0 on
 #   collision geoms + custom ``<visual>`` block with stacked ``<headlight>``).
 #   Empirically wrong direction (washed out contrast); reverted in v3.
-# * ``v3``: round 9 - cached MJCF matches upstream ``OffScreenRenderEnv.sim.model.get_xml()``
-#   verbatim except for the camera-name aliases. Visual fidelity is
-#   handled at render time via ``world._backend_state["viz_option"]``
-#   (set by :meth:`LiberoAdapter._install_render_options`), not via
-#   MJCF rewrites.
-_LIBERO_MJCF_TRANSFORM_VERSION = "v3"
+# * ``v3``: round 9 - cached MJCF matches upstream
+#   ``OffScreenRenderEnv.sim.model.get_xml()`` verbatim except for the
+#   camera-name aliases. Visual fidelity is handled at render time via
+#   ``world._backend_state["viz_option"]`` (set by
+#   :meth:`LiberoAdapter._install_render_options`), not via MJCF rewrites.
+# * ``v4``: #181 — switch ``_extract_compiled_mjcf`` to prefer
+#   ``env.env.model.get_xml()`` (pre-compile) over
+#   ``env.env.sim.model.get_xml()`` (post-compile via ``mj_saveLastXML``).
+#   The post-compile path is lossy on ``<compiler>`` attributes, dropping
+#   ``inertiagrouprange="0 0"`` which restricts inertia computation to
+#   collision geoms (group 0). Without it, MuJoCo computes body masses
+#   from ALL geom groups including visual meshes — table mass jumps from
+#   34.5 kg to 77.5 kg, mug masses go up 4×, and ``mj_step`` produces
+#   different ``qfrc_bias`` (Coriolis + gravity) than upstream's runtime
+#   model. Effect on libero-10/SCENE5: end-to-end ``success_rate`` mean
+#   over 5 master seeds × 5 episodes drops from ~0.72 (offscreen) to
+#   ~0.52 (mujoco) entirely from this single ``<compiler>`` attr drop.
+_LIBERO_MJCF_TRANSFORM_VERSION = "v4"
 
 
 def _build_scene_robot_wrapper(
