@@ -706,7 +706,7 @@ def test_libero_10_scene5_mujoco_engine_success_rate() -> None:
     sim.create_world()
     sim.add_robot("robot", data_config="panda")
 
-    n_episodes = 3
+    n_episodes = 5
     seed = 42
     max_episode_steps = 720
     n_action_steps = 8
@@ -766,10 +766,13 @@ def test_libero_10_scene5_mujoco_engine_success_rate() -> None:
         sim.destroy()
 
     success_rate = sum(successes) / max(n_episodes, 1)
-    assert success_rate > 0, (
+    assert success_rate >= 1.0, (
         f"MuJoCoSimEngine + in-process Gr00tPolicy got success_rate={success_rate:.2f} "
-        f"on libero-10/SCENE5 ({successes}). Round-46 fixes (home-pose write, "
-        f"settle step, _quat_wxyz_to_rpy_xyz, _body_position _main fallback) may have "
-        f"regressed — pre-46 baseline got 0/5 on this task. Confirm the round-46 fixes "
-        f"are still in place."
+        f"on libero-10/SCENE5 ({successes}). Pre-#181 this was reproducibly 0.60 (3/5) "
+        f'because the cached MJCF dropped ``inertiagrouprange="0 0"`` (lossy '
+        f"``mj_saveLastXML``); post-#181 the cache uses the pre-compile MJCF which "
+        f"preserves ``<compiler>`` attributes, restoring upstream's body inertias and "
+        f"closing the parity gap. If this drops below 1.00, the fix may have "
+        f"regressed — re-check ``_extract_compiled_mjcf`` accessor order and "
+        f"``_LIBERO_MJCF_TRANSFORM_VERSION``."
     )
