@@ -338,6 +338,19 @@ class Gr00tPolicy(Policy):
             self.data_config_name,
         )
 
+        # #187 wire-payload diagnostic: per-instance call counter so
+        # ``_maybe_dump_wire_payload`` can cap dumps at
+        # ``STRANDS_GROOT_WIRE_LOG_MAX_CALLS`` (default 10) without
+        # filling the disk on long rollouts. Counter is shared across
+        # LOCAL and SERVICE modes; the dump filename includes the mode
+        # prefix so a single dir holds both paths' payloads side-by-side
+        # for offline diff.
+        self._wire_log_call_count: int = 0
+        # Track whether we've already logged a "diagnostic disabled"
+        # warning so we don't spam the eval log with one-warning-per-step
+        # if the dump dir is unwritable.
+        self._wire_log_disabled: bool = False
+
     # Mapping initialization
 
     def _init_mappings(self) -> None:
@@ -551,6 +564,11 @@ class Gr00tPolicy(Policy):
         else:
             raise RuntimeError(f"Unknown GR00T version: {self._groot_version}")
 
+        # #187 wire-payload diagnostic: capture (nested_obs, actions_raw)
+        # for offline diff against the SERVICE path. Zero overhead when
+        # STRANDS_GROOT_WIRE_LOG is unset.
+        self._maybe_dump_wire_payload("local", nested_obs, actions_raw)
+
         return self._unpack_actions(actions_raw)
 
     def _prepare_observation(self, robot_obs: dict[str, Any], instruction: str) -> dict:
@@ -662,11 +680,18 @@ class Gr00tPolicy(Policy):
         """Service mode: build observation, call server, unpack."""
         assert self._client is not None, "Service client not initialized"
         if self._obs_mapping is not None:
-            nested_obs = self._prepare_observation(robot_obs, instruction)
-            action_chunk = self._client.get_action(nested_obs)
+            wire_obs = self._prepare_observation(robot_obs, instruction)
+            action_chunk = self._client.get_action(wire_obs)
         else:
-            obs = self._build_service_observation(robot_obs, instruction)
-            action_chunk = self._client.get_action(obs)
+            wire_obs = self._build_service_observation(robot_obs, instruction)
+            action_chunk = self._client.get_action(wire_obs)
+
+        # #187 wire-payload diagnostic: capture (wire_obs, action_chunk)
+        # for offline diff against the LOCAL path. Zero overhead when
+        # STRANDS_GROOT_WIRE_LOG is unset. Run an eval once with each
+        # mode into the same dump dir, then ``np.allclose`` matching
+        # ``call0`` files to bisect the divergence.
+        self._maybe_dump_wire_payload("service", wire_obs, action_chunk)
 
         return self._unpack_service_actions(action_chunk)
 
@@ -787,6 +812,150 @@ class Gr00tPolicy(Policy):
                 step[k] = row.tolist() if hasattr(row, "tolist") else list(row)
             actions.append(step)
         return actions
+
+    # Wire-payload diagnostic
+
+    def _maybe_dump_wire_payload(
+        self,
+        mode: str,
+        observation: dict[str, Any],
+        action_chunk: dict[str, Any],
+    ) -> None:
+        """Dump the pre-inference observation and post-inference action
+        chunk to disk for offline diff between LOCAL and SERVICE paths.
+
+        Gated on ``STRANDS_GROOT_WIRE_LOG=<dir>``. When unset, this is a
+        zero-overhead no-op (one ``os.environ.get`` per call). When set,
+        dumps a pickle file per call to ``<dir>/{mode}_call{N:04d}.pkl``
+        until ``STRANDS_GROOT_WIRE_LOG_MAX_CALLS`` (default 10) is hit.
+
+        Pickle file structure::
+
+            {
+                "mode": "local" | "service",
+                "call_index": int,
+                "observation": dict,    # nested for local, flat for service
+                "action_chunk": dict,   # raw model / server output (pre _unpack_*)
+                "groot_version": str | None,
+                "data_config_name": str,
+            }
+
+        Used by the #187 bisection plan to verify whether LOCAL and
+        SERVICE paths send byte-identical observations to the model.
+        Run an eval twice (once with each mode) into the same dump dir,
+        then ``pickle.load`` the matching ``call0`` files and ``np.allclose``
+        the per-key tensors. Any divergence at step 0 is the bug
+        (assuming wire format is identical, which the regression test
+        in this PR pins).
+
+        Best-effort: if the dump dir doesn't exist or isn't writable,
+        log ONE warning and disable further dumps for the rest of the
+        process. Diagnostic instrumentation must never crash production
+        eval. The user gets a one-line warning early; subsequent calls
+        are silent no-ops.
+
+        :param mode: ``"local"`` or ``"service"``. Becomes the filename prefix.
+        :param observation: The pre-inference observation dict. For LOCAL
+            this is the nested-dict format; for SERVICE this is the flat
+            wire format AFTER newaxis fanout (i.e. what would have been
+            msgpack-packed onto the wire).
+        :param action_chunk: The raw post-inference action chunk dict
+            (before ``_unpack_actions`` / ``_unpack_service_actions``
+            squashes axes for the per-step dispatch loop).
+        """
+        # Tolerate construction paths that bypass ``__init__`` (test
+        # fixtures that ``Gr00tPolicy.__new__(Gr00tPolicy)`` then stuff
+        # attributes manually). Diagnostic instrumentation must never
+        # crash production OR test paths.
+        if getattr(self, "_wire_log_disabled", False):
+            return
+        log_dir = _wire_log_dir()
+        if log_dir is None:
+            return
+        call_count = getattr(self, "_wire_log_call_count", 0)
+        if call_count >= _wire_log_max_calls():
+            return
+
+        import pickle
+
+        path = os.path.join(log_dir, f"{mode}_call{call_count:04d}.pkl")
+        payload = {
+            "mode": mode,
+            "call_index": call_count,
+            "observation": observation,
+            "action_chunk": action_chunk,
+            "groot_version": getattr(self, "_groot_version", None),
+            "data_config_name": getattr(self, "data_config_name", "unknown"),
+        }
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            with open(path, "wb") as f:
+                pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except (OSError, pickle.PicklingError) as e:
+            # Disk full / dir not writable / permission denied / un-picklable
+            # object in the payload (e.g. a thread-local). Log once and
+            # disable further dumps so the eval doesn't spam the log
+            # with one warning per step.
+            logger.warning(
+                "STRANDS_GROOT_WIRE_LOG=%r: failed to dump wire payload to %r (%s); "
+                "disabling diagnostic for this process",
+                log_dir,
+                path,
+                e,
+            )
+            self._wire_log_disabled = True
+            return
+
+        self._wire_log_call_count = call_count + 1
+        if self._wire_log_call_count == 1:
+            # First successful dump: log INFO so the user sees confirmation
+            # the diagnostic is active. Subsequent dumps are silent.
+            logger.info(
+                "STRANDS_GROOT_WIRE_LOG=%r: dumping wire payloads (mode=%s, max=%d). First file: %s",
+                log_dir,
+                mode,
+                _wire_log_max_calls(),
+                path,
+            )
+
+
+# Wire-payload diagnostic (#187) - dump pre-inference observation +
+# post-inference action chunk to disk for offline diff between LOCAL
+# and SERVICE paths.
+
+
+def _wire_log_dir() -> str | None:
+    """Return the directory where wire payloads should be dumped, or None.
+
+    Reads ``STRANDS_GROOT_WIRE_LOG``. Returns ``None`` when unset or empty,
+    in which case the dumper is a no-op (zero overhead in production eval).
+
+    Used by :meth:`Gr00tPolicy._maybe_dump_wire_payload` to gate the dump
+    so production paths pay no cost when the diagnostic is off.
+    """
+    path = os.environ.get("STRANDS_GROOT_WIRE_LOG", "").strip()
+    return path or None
+
+
+def _wire_log_max_calls() -> int:
+    """Return the cap on number of wire-payload dumps per process.
+
+    Reads ``STRANDS_GROOT_WIRE_LOG_MAX_CALLS``. Defaults to ``10`` so a
+    full LIBERO eval (5 episodes × 720 steps / 8 chunk = ~450 calls)
+    doesn't fill the disk with multi-GB pickle archives.
+
+    The user's bisection plan from #187 only needs the first few calls
+    to detect a divergence between LOCAL and SERVICE wire payloads.
+    """
+    raw = os.environ.get("STRANDS_GROOT_WIRE_LOG_MAX_CALLS", "10").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "STRANDS_GROOT_WIRE_LOG_MAX_CALLS=%r is not an integer; defaulting to 10",
+            raw,
+        )
+        return 10
 
 
 # Shape helpers - match Isaac-GR00T's expected formats exactly

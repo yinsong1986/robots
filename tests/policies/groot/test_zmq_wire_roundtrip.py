@@ -305,3 +305,160 @@ class TestZmqWireRoundTripLiberoPanda:
 
         request = sent[0]
         assert set(request["data"].keys()) == {"observation", "options"}
+
+
+class TestWirePayloadDiagnostic:
+    """``STRANDS_GROOT_WIRE_LOG=<dir>`` dumps each get_action call's
+    pre-inference observation and post-inference action chunk to a
+    pickle file. Used by the #187 bisection plan to verify whether
+    LOCAL and SERVICE paths send byte-identical observations to the
+    model.
+
+    Pin the diagnostic surface so future refactors can't silently drop
+    the dump (or, worse, dump the wrong thing).
+    """
+
+    def _make_libero_policy(self):
+        """Same fixture as TestZmqWireRoundTripLiberoPanda above."""
+        p = Gr00tPolicy(data_config="libero_panda", host="localhost", port=19999)
+        p._groot_version = "n1.7"
+        return p
+
+    def _capture_send_decode_recv(self, policy: Gr00tPolicy, response: dict | tuple) -> list[dict]:
+        """Same socket-mock pattern as the wire round-trip tests above."""
+        sent: list[dict] = []
+
+        def _capture_send(data: bytes) -> None:
+            sent.append(MsgSerializer.from_bytes(data))
+
+        packed = MsgSerializer.to_bytes(response)  # type: ignore[arg-type]
+        assert policy._client is not None
+        policy._client.socket.send = _capture_send  # type: ignore[assignment]
+        policy._client.socket.recv = lambda: packed  # type: ignore[assignment]
+        return sent
+
+    def test_disabled_by_default_is_zero_overhead_noop(self, monkeypatch, tmp_path):
+        """No ``STRANDS_GROOT_WIRE_LOG`` env var ⇒ no files written.
+
+        Production eval must pay zero cost when the diagnostic is off.
+        """
+        monkeypatch.delenv("STRANDS_GROOT_WIRE_LOG", raising=False)
+        policy = self._make_libero_policy()
+        self._capture_send_decode_recv(policy, (_server_action_chunk(), {}))
+
+        asyncio.run(policy.get_actions(_libero_observation(), "t"))
+
+        # tmp_path is empty (we never told the diagnostic to write anywhere).
+        assert list(tmp_path.iterdir()) == []
+        # Counter stays at 0 - no work done.
+        assert policy._wire_log_call_count == 0
+
+    def test_enabled_writes_pickle_per_call(self, monkeypatch, tmp_path):
+        """``STRANDS_GROOT_WIRE_LOG=<dir>`` writes one pickle per
+        ``get_actions`` call with the ``service_callN.pkl`` naming
+        convention. The file is loadable and contains the canonical
+        keys the bisection plan expects.
+        """
+        import pickle
+
+        monkeypatch.setenv("STRANDS_GROOT_WIRE_LOG", str(tmp_path))
+        monkeypatch.setenv("STRANDS_GROOT_WIRE_LOG_MAX_CALLS", "5")
+
+        policy = self._make_libero_policy()
+        self._capture_send_decode_recv(policy, (_server_action_chunk(), {}))
+
+        asyncio.run(policy.get_actions(_libero_observation(), "pick the cube"))
+
+        dump_path = tmp_path / "service_call0000.pkl"
+        assert dump_path.exists(), f"expected diagnostic dump at {dump_path}"
+
+        with open(dump_path, "rb") as f:
+            payload = pickle.load(f)
+
+        # Schema the bisection plan relies on. If any key here changes,
+        # the offline diff script breaks silently — pin it.
+        assert payload["mode"] == "service"
+        assert payload["call_index"] == 0
+        assert payload["groot_version"] == "n1.7"
+        assert payload["data_config_name"] == "libero_panda"
+        # Observation must be the wire-format dict (flat keys, post
+        # newaxis fanout) — what the user wants to diff against the
+        # local-mode nested dict.
+        assert "video.image" in payload["observation"]
+        assert payload["observation"]["video.image"].shape == (1, 1, 64, 64, 3)
+        assert "state.gripper" in payload["observation"]
+        # Action chunk must be the raw server response shape, not the
+        # post-_unpack_service_actions per-step list. The whole point
+        # of the diagnostic is to capture what the inference layer saw,
+        # not what the OSC controller saw.
+        assert "action.x" in payload["action_chunk"]
+        assert payload["action_chunk"]["action.x"].shape == (1, 16, 1)
+
+    def test_max_calls_caps_dumps(self, monkeypatch, tmp_path):
+        """``STRANDS_GROOT_WIRE_LOG_MAX_CALLS=2`` caps the number of
+        files written, preventing multi-GB dumps on long evals.
+
+        Calls beyond the cap are silent no-ops (no log spam).
+        """
+        monkeypatch.setenv("STRANDS_GROOT_WIRE_LOG", str(tmp_path))
+        monkeypatch.setenv("STRANDS_GROOT_WIRE_LOG_MAX_CALLS", "2")
+
+        policy = self._make_libero_policy()
+        self._capture_send_decode_recv(policy, (_server_action_chunk(), {}))
+
+        for _ in range(5):
+            asyncio.run(policy.get_actions(_libero_observation(), "t"))
+
+        files = sorted(p.name for p in tmp_path.iterdir())
+        # Only call0 and call1 should land; call2..call4 hit the cap.
+        assert files == ["service_call0000.pkl", "service_call0001.pkl"]
+        # Counter sits exactly at the cap — pinned so a future "off-by-one"
+        # refactor that drops one dump or writes one extra is caught.
+        assert policy._wire_log_call_count == 2
+
+    def test_unwritable_dir_disables_diagnostic_with_warning(self, monkeypatch, tmp_path, caplog):
+        """If the dump dir can't be written (disk full, permissions),
+        log ONE warning and disable for the rest of the process.
+
+        Diagnostic instrumentation must never crash production eval.
+        Subsequent calls become silent no-ops (no per-step warning spam).
+        """
+        import logging as _logging
+
+        # Point the diagnostic at a path that can't be created (we make
+        # ``tmp_path`` itself a regular file so ``os.makedirs`` fails).
+        bad_path = tmp_path / "not_a_dir"
+        bad_path.write_text("blocking file at this path")
+        monkeypatch.setenv("STRANDS_GROOT_WIRE_LOG", str(bad_path / "dumps"))
+
+        policy = self._make_libero_policy()
+        self._capture_send_decode_recv(policy, (_server_action_chunk(), {}))
+
+        with caplog.at_level(_logging.WARNING, logger="strands_robots.policies.groot.policy"):
+            # First call: should log warning and disable.
+            asyncio.run(policy.get_actions(_libero_observation(), "t"))
+            # Second + third calls: silent no-ops (no extra warnings).
+            asyncio.run(policy.get_actions(_libero_observation(), "t"))
+            asyncio.run(policy.get_actions(_libero_observation(), "t"))
+
+        warnings = [r for r in caplog.records if "STRANDS_GROOT_WIRE_LOG" in r.getMessage()]
+        # Exactly ONE warning across the three calls.
+        assert len(warnings) == 1, f"expected 1 warning, got {len(warnings)}: {[r.getMessage() for r in warnings]}"
+        assert "disabling diagnostic for this process" in warnings[0].getMessage()
+        # The disabled flag is set, so subsequent calls short-circuit.
+        assert policy._wire_log_disabled is True
+
+    def test_max_calls_invalid_value_defaults_to_10(self, monkeypatch, tmp_path, caplog):
+        """``STRANDS_GROOT_WIRE_LOG_MAX_CALLS=garbage`` warns once and
+        defaults to 10. Mirrors the same env-var-validation pattern
+        used elsewhere (e.g. ``STRANDS_LIBERO_ACTION_LOG_MAX``)."""
+        import logging as _logging
+
+        from strands_robots.policies.groot.policy import _wire_log_max_calls
+
+        monkeypatch.setenv("STRANDS_GROOT_WIRE_LOG_MAX_CALLS", "not-an-int")
+
+        with caplog.at_level(_logging.WARNING, logger="strands_robots.policies.groot.policy"):
+            assert _wire_log_max_calls() == 10
+
+        assert any("STRANDS_GROOT_WIRE_LOG_MAX_CALLS" in r.getMessage() for r in caplog.records)
