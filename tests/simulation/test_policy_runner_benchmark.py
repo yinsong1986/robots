@@ -1014,3 +1014,87 @@ class TestPolicyResetIntegration:
         # We logged the failure (one per episode = two warnings).
         warnings = [r for r in caplog.records if "policy.reset" in r.getMessage() and "raised" in r.getMessage()]
         assert len(warnings) == 2, f"expected 2 reset warnings, got {len(warnings)}"
+
+
+class TestSpecInstructionFallback:
+    """#187: ``policy_runner._evaluate_with_spec`` falls back to
+    ``spec.instruction`` (default ``""``) when the user-supplied
+    ``instruction`` argument to ``evaluate_benchmark`` is empty.
+
+    Without this, language-conditioned policies (GR00T, OpenVLA) receive
+    an empty string as the task description and produce off-task actions.
+    GPU bisection on libero-10/SCENE5 confirmed this was the dominant
+    cause of the success_rate gap (0.40 ZMQ vs 1.00 in-process — same
+    model, same wire format, same engine, but `policy_obs[\"annotation.\"]`
+    was `[\"\"]` on the failing path because robots-sim passes
+    `instruction=\"\"` to evaluate_benchmark).
+    """
+
+    def test_user_instruction_wins_over_spec(self):
+        """When the caller passes ``instruction="explicit task"`` and the
+        spec also has a non-empty ``instruction`` property, the user value
+        wins. Pin so we don't silently override caller intent."""
+        captured: list[str] = []
+
+        class _LangPolicy(MockPolicy):
+            async def get_actions(self, observation_dict, instruction, **kwargs):
+                captured.append(instruction)
+                return [{}]
+
+        class _SpecWithInstruction(_CountingBenchmark):
+            @property
+            def instruction(self) -> str:
+                return "spec said do X"
+
+        sim = FakeSim()
+        policy = _LangPolicy()
+        policy.set_robot_state_keys(sim.robot_joint_names("fake_robot"))
+        PolicyRunner(sim).evaluate(
+            "fake_robot",
+            policy,
+            spec=_SpecWithInstruction(),
+            n_episodes=1,
+            seed=42,
+            instruction="user said do Y",
+        )
+        # Every call sees the user-supplied instruction.
+        assert captured, "expected at least one get_actions call"
+        assert all(c == "user said do Y" for c in captured), f"got {captured!r}"
+
+    def test_falls_back_to_spec_when_user_instruction_empty(self):
+        """Caller passes nothing (or ""), spec has non-empty instruction →
+        spec wins. This is the #187 fix."""
+        captured: list[str] = []
+
+        class _LangPolicy(MockPolicy):
+            async def get_actions(self, observation_dict, instruction, **kwargs):
+                captured.append(instruction)
+                return [{}]
+
+        class _SpecWithInstruction(_CountingBenchmark):
+            @property
+            def instruction(self) -> str:
+                return "put the white mug on the left plate"
+
+        sim = FakeSim()
+        policy = _LangPolicy()
+        policy.set_robot_state_keys(sim.robot_joint_names("fake_robot"))
+        # No instruction= argument — falls back to spec.instruction.
+        PolicyRunner(sim).evaluate("fake_robot", policy, spec=_SpecWithInstruction(), n_episodes=1, seed=42)
+        assert captured
+        assert all(c == "put the white mug on the left plate" for c in captured), f"got {captured!r}"
+
+    def test_warns_when_both_empty(self, caplog):
+        """If neither caller nor spec provides an instruction, log a
+        WARNING so the user knows the policy is running blind. Pin so a
+        future refactor doesn't silently drop the warning."""
+        import logging as _logging
+
+        sim = FakeSim()
+        policy = MockPolicy()
+        policy.set_robot_state_keys(sim.robot_joint_names("fake_robot"))
+        with caplog.at_level(_logging.WARNING, logger="strands_robots.simulation.policy_runner"):
+            PolicyRunner(sim).evaluate("fake_robot", policy, spec=_CountingBenchmark(), n_episodes=1, seed=42)
+
+        warnings = [r for r in caplog.records if "instruction is empty" in r.getMessage()]
+        assert warnings, "expected a warning about empty instruction"

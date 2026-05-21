@@ -1090,8 +1090,22 @@ def _to_video_batch(value: np.ndarray) -> np.ndarray:
 
 
 def _to_state_batch(value) -> np.ndarray:
-    """Ensure state is (B=1, T=1, D) float32."""
+    """Ensure state is (B=1, T=1, D) float32.
+
+    Handles every shape pre-fanout:
+      * scalar / 0-D ndarray → (1, 1, 1)  (e.g. ``state.x = 0.123``)
+      * 1-D ndarray (D,)     → (1, 1, D)  (e.g. ``state.gripper = [0.02, -0.02]``)
+      * 2-D ndarray (T, D)   → (1, T, D)
+      * 3-D and beyond       → passthrough
+    """
     arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim == 0:
+        # 0-D scalar: promote to (D=1,) then to (1, 1, 1) so the model
+        # sees a proper (B, T, D) shape. Without this, NVIDIA's
+        # _unbatch_observation crashes with `IndexError: too many indices
+        # for array: array is 0-dimensional` on every scalar state key
+        # (#187 LOCAL-mode regression I caught while bisecting).
+        return arr[np.newaxis, np.newaxis, np.newaxis]
     if arr.ndim == 1:
         return arr[np.newaxis, np.newaxis, ...]
     elif arr.ndim == 2:

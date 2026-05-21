@@ -750,6 +750,29 @@ class PolicyRunner:
         max_steps = spec.max_steps
         results: list[dict[str, Any]] = []
 
+        # #187 — fall back to ``spec.instruction`` (default ``""``) when
+        # the user didn't pass an explicit instruction. Language-
+        # conditioned policies (GR00T, OpenVLA) need the task description
+        # or they produce off-task actions; LIBERO/Meta-World/etc. ship
+        # the per-task language with the benchmark, so the spec is the
+        # right source of truth. User-provided ``instruction`` still
+        # wins when non-empty, preserving back-compat.
+        spec_instruction = ""
+        try:
+            spec_instruction = spec.instruction or ""
+        except Exception as e:  # noqa: BLE001 - back-compat for specs without the property
+            logger.debug("spec.instruction lookup raised %s; defaulting to empty", e)
+        effective_instruction = instruction or spec_instruction
+        if not effective_instruction:
+            logger.warning(
+                "evaluate_benchmark: instruction is empty (user passed %r, spec.instruction=%r). "
+                "Language-conditioned policies (GR00T, OpenVLA, etc.) will receive an empty "
+                "string and may produce off-task actions. Pass instruction=... explicitly or "
+                "override BenchmarkProtocol.instruction on your spec.",
+                instruction,
+                spec_instruction,
+            )
+
         for ep in range(n_episodes):
             self.sim.reset()
             # Per-episode seeded RNG - deterministic given the master seed
@@ -836,7 +859,7 @@ class PolicyRunner:
                         "status": "error",
                         "content": [{"text": f"augment_observation failed in {spec_name}: {e}"}],
                     }
-                coro_or_result = policy.get_actions(observation, instruction)
+                coro_or_result = policy.get_actions(observation, effective_instruction)
                 actions = _resolve_coroutine(coro_or_result)
 
                 # #168: consume up to ``action_horizon`` actions
