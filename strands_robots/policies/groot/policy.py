@@ -615,6 +615,12 @@ class Gr00tPolicy(Policy):
                 _torch.backends.cudnn.deterministic = True
                 _torch.backends.cudnn.benchmark = False
             except ImportError:
+                # Torch is an optional dependency for `Gr00tPolicy`; minimal
+                # installs (e.g. ``policy_provider="mock"`` smoke tests, or
+                # SERVICE-only deployments without local model loading) won't
+                # have it. Silently skipping the reseed in that case is the
+                # right behaviour — there's no torch RNG state to seed when
+                # torch isn't even imported.
                 pass
             logger.debug("Gr00tPolicy.reset: local-mode reseed applied (seed=%r)", seed)
         except Exception as e:  # noqa: BLE001 - reset is best-effort
