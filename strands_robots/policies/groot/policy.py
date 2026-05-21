@@ -545,6 +545,81 @@ class Gr00tPolicy(Policy):
     def set_robot_state_keys(self, robot_state_keys: list[str]) -> None:
         """No-op.  Mappings handle key translation."""
 
+    def reset(self, seed: int | None = None) -> None:
+        """Per-episode reset.
+
+        In SERVICE mode, forwards a ``reset`` call to the GR00T inference
+        server so its per-episode RNG state (diffusion sampler noise,
+        cuDNN benchmark state, etc.) can be re-initialised. Without this
+        the server's RNG drifts across calls and produces different
+        action chunks for byte-identical inputs across re-runs of the
+        same eval — the #187 success-rate gap.
+
+        The standard ``gr00t.eval.run_gr00t_server`` registers a ``reset``
+        endpoint that maps to ``policy.reset(options=...)`` (see
+        ``server_client.py:94``). The default ``Gr00tPolicy.reset`` upstream
+        is a no-op; deployments that need per-episode RNG control should
+        either patch the server (see
+        ``examples/gr00t_server_deterministic_wrapper.py`` in robots-sim)
+        or use the ``Robot()`` factory which auto-mounts the wrapper.
+
+        In LOCAL mode, applies the same client-side reseed
+        ``set_eval_seed`` would (Python / NumPy / torch / cuDNN), which
+        is sufficient for reproducibility because the diffusion sampler
+        runs in the same process as the client.
+
+        Best-effort: any failure (server doesn't expose ``reset``,
+        endpoint raises, network timeout) is logged and swallowed —
+        ``reset`` is a soft hint to the policy, not a hard requirement.
+        Eval correctness is preserved even if reset is a no-op.
+
+        Args:
+            seed: Master seed for the per-episode reset. When ``None``,
+                no seed is forwarded (server uses its compiled-in default).
+        """
+        if self._mode == "service":
+            assert self._client is not None, "service mode requires a client"
+            try:
+                # `options` is the standard kwarg the server's `reset`
+                # endpoint maps to `policy.reset(options=options)`. We
+                # pass the seed there so the server-side patch can
+                # apply it.
+                payload: dict[str, Any] = {}
+                if seed is not None:
+                    payload = {"options": {"seed": int(seed)}}
+                self._client.call_endpoint("reset", payload if payload else None)
+                logger.debug("Gr00tPolicy.reset: forwarded to server (seed=%r)", seed)
+            except Exception as e:  # noqa: BLE001 - reset is best-effort
+                logger.info(
+                    "Gr00tPolicy.reset: server did not accept reset (seed=%r): %s; "
+                    "continuing without per-episode server-side reseed",
+                    seed,
+                    e,
+                )
+            return
+
+        # LOCAL mode: same reseed set_eval_seed would do.
+        if seed is None:
+            return
+        try:
+            import random as _random
+
+            _random.seed(seed)
+            np.random.seed(seed)
+            try:
+                import torch as _torch
+
+                _torch.manual_seed(seed)
+                if _torch.cuda.is_available():
+                    _torch.cuda.manual_seed_all(seed)
+                _torch.backends.cudnn.deterministic = True
+                _torch.backends.cudnn.benchmark = False
+            except ImportError:
+                pass
+            logger.debug("Gr00tPolicy.reset: local-mode reseed applied (seed=%r)", seed)
+        except Exception as e:  # noqa: BLE001 - reset is best-effort
+            logger.info("Gr00tPolicy.reset: local-mode reseed failed: %s", e)
+
     async def get_actions(self, observation_dict: dict[str, Any], instruction: str, **kwargs) -> list[dict[str, Any]]:
         if self._mode == "local":
             return self._local_get_actions(observation_dict, instruction)

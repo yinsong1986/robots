@@ -772,6 +772,23 @@ class PolicyRunner:
             # (same successes list every run).
             set_eval_seed(episode_seed)
 
+            # #187 — for SERVICE-mode policies (e.g. Gr00tPolicy over
+            # ZMQ), set_eval_seed only seeds the client process. The
+            # remote inference server has its own torch/CUDA RNG that
+            # drifts across calls. Forward the per-episode seed via
+            # policy.reset(seed=...) so server-side state can be
+            # re-initialised. Default Policy.reset is a no-op; concrete
+            # policies override (Gr00tPolicy forwards to the server's
+            # `reset` endpoint).
+            try:
+                policy.reset(seed=episode_seed)
+            except Exception as e:  # noqa: BLE001 - reset is best-effort
+                logger.warning(
+                    "policy.reset(seed=%d) raised %s; continuing without per-episode reset",
+                    episode_seed,
+                    e,
+                )
+
             try:
                 spec.on_episode_start(self.sim, episode_rng)
             except BenchmarkCompatibilityError as e:
