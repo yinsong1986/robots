@@ -24,13 +24,18 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from strands_robots.policies import Policy
+    from strands_robots.simulation.policy_runner import OnFrame
 
 # PolicyRunner and VideoConfig are used by run_policy / replay / eval_policy.
 # We could defer these with inline lazy imports (and historically did), but
 # policy_runner.py only imports `SimEngine` from base under TYPE_CHECKING so
 # the runtime cycle doesn't actually exist. Keep the imports at module level
 # to break the AST-visible cycle that static analysers flag.
-from strands_robots.simulation.policy_runner import OnFrame, PolicyRunner, VideoConfig
+#
+# ``OnFrame`` (#191) lives under ``TYPE_CHECKING`` instead because it's a
+# pure type alias used only in annotations — no runtime touch — so there's
+# no benefit to paying the cycle-detection cost for it.
+from strands_robots.simulation.policy_runner import PolicyRunner, VideoConfig
 
 logger = logging.getLogger(__name__)
 

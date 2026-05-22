@@ -35,10 +35,11 @@ import pytest
 
 mujoco = pytest.importorskip("mujoco", reason="mujoco not installed - pip install strands-robots[sim-mujoco]")
 imageio = pytest.importorskip("imageio", reason="imageio not installed - pip install imageio imageio-ffmpeg")
-
-# Bring imageio.v2 in explicitly since RenderingMixin._flush_cameras_recording_state
-# uses ``imageio.v2``; importorskip on bare ``imageio`` doesn't validate v2.
-import imageio.v2 as _imageio_v2  # noqa: E402,F401
+# Validate ``imageio.v2`` is importable since
+# ``RenderingMixin._flush_cameras_recording_state`` uses it; ``importorskip``
+# on bare ``imageio`` doesn't catch a v2 split-package install. Skips
+# the whole module if v2 is missing.
+pytest.importorskip("imageio.v2", reason="imageio.v2 not available - upgrade imageio (>=2.5)")
 
 from strands_robots.simulation import Simulation  # noqa: E402
 
