@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 # policy_runner.py only imports `SimEngine` from base under TYPE_CHECKING so
 # the runtime cycle doesn't actually exist. Keep the imports at module level
 # to break the AST-visible cycle that static analysers flag.
-from strands_robots.simulation.policy_runner import PolicyRunner, VideoConfig
+from strands_robots.simulation.policy_runner import OnFrame, PolicyRunner, VideoConfig
 
 logger = logging.getLogger(__name__)
 
@@ -461,6 +461,7 @@ class SimEngine(ABC):
         n_episodes: int = 1,
         seed: int | None = None,
         action_horizon: int = 8,
+        on_frame: OnFrame | None = None,
     ) -> dict[str, Any]:
         """Run a registered :class:`BenchmarkProtocol` against the current sim.
 
@@ -494,6 +495,19 @@ class SimEngine(ABC):
                 success/failure checks run after EACH applied action,
                 so per-step rewards and early termination work
                 correctly regardless of horizon.
+            on_frame: Optional ``(step, observation, action) -> None``
+                hook fired per applied control step on the eval thread,
+                immediately after ``sim.send_action``. Use this for
+                synchronous recording or telemetry when the eval is
+                dispatched from a thread distinct from the script main
+                (e.g. Strands ``Agent`` tool dispatch under asyncio) —
+                the daemon-thread recorder
+                (:meth:`~strands_robots.simulation.mujoco.simulation.Simulation.start_cameras_recording`)
+                races ``mjData`` mutations on the eval thread under that
+                pattern and produces 2-3% frame-capture rates with
+                greenish GL clear-colour artifacts. Pair with
+                :meth:`~strands_robots.simulation.mujoco.simulation.Simulation.start_cameras_recording_synchronous`
+                for the recorder side. See #191.
 
         Returns:
             Standard status dict. On success, carries per-episode cumulative
@@ -568,6 +582,7 @@ class SimEngine(ABC):
             spec=spec,
             seed=seed,
             action_horizon=action_horizon,
+            on_frame=on_frame,
         )
 
     def list_benchmarks(self) -> dict[str, Any]:

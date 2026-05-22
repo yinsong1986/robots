@@ -1098,3 +1098,141 @@ class TestSpecInstructionFallback:
 
         warnings = [r for r in caplog.records if "instruction is empty" in r.getMessage()]
         assert warnings, "expected a warning about empty instruction"
+
+
+class TestOnFrameHookForSpec:
+    """#191: ``policy_runner._evaluate_with_spec`` invokes ``on_frame``
+    after each ``sim.send_action`` on the eval thread, before the spec's
+    ``on_step`` reward bookkeeping. Plumbed through from
+    ``Simulation.evaluate_benchmark`` and ``PolicyRunner.evaluate``.
+
+    Used by ``Simulation.start_cameras_recording_synchronous`` to capture
+    frames on the eval thread instead of a daemon thread, eliminating the
+    cross-thread ``mjData`` race that produced 2-3% frame-capture rates
+    under Strands ``Agent`` tool dispatch.
+    """
+
+    def test_on_frame_called_per_applied_step(self):
+        """``on_frame`` fires once per applied control step.
+
+        With ``max_steps=20`` and ``success_after=10**9`` (never succeeds),
+        the rollout runs to truncation: 20 steps per episode × 1 episode
+        = 20 invocations.
+        """
+        captured: list[tuple[int, dict, dict]] = []
+
+        def on_frame(step, obs, action):
+            captured.append(
+                (
+                    step,
+                    dict(obs) if isinstance(obs, dict) else obs,
+                    dict(action) if isinstance(action, dict) else action,
+                )
+            )
+
+        sim = FakeSim()
+        policy = MockPolicy()
+        policy.set_robot_state_keys(sim.robot_joint_names("fake_robot"))
+        spec = _CountingBenchmark()
+
+        result = PolicyRunner(sim).evaluate("fake_robot", policy, spec=spec, n_episodes=1, seed=42, on_frame=on_frame)
+
+        assert result["status"] == "success", result
+        assert len(captured) == 20, f"expected 20 on_frame calls (max_steps=20), got {len(captured)}"
+        # Step indices are monotonic global counter starting at 0.
+        steps = [c[0] for c in captured]
+        assert steps == list(range(20)), f"expected step counter 0..19, got {steps}"
+
+    def test_on_frame_global_counter_crosses_episode_boundaries(self):
+        """The counter is *global*, not per-episode. With 3 episodes ×
+        max_steps=20 = 60 calls, indices run 0..59.
+
+        Pinned so callers know they can't assume the counter resets per
+        episode — they must track ep boundaries via the per-episode
+        results dict if needed.
+        """
+        captured_steps: list[int] = []
+
+        def on_frame(step, obs, action):
+            captured_steps.append(step)
+
+        sim = FakeSim()
+        policy = MockPolicy()
+        policy.set_robot_state_keys(sim.robot_joint_names("fake_robot"))
+        spec = _CountingBenchmark()
+
+        result = PolicyRunner(sim).evaluate("fake_robot", policy, spec=spec, n_episodes=3, seed=42, on_frame=on_frame)
+
+        assert result["status"] == "success", result
+        assert len(captured_steps) == 60, f"expected 60 calls (3 ep × 20 steps), got {len(captured_steps)}"
+        assert captured_steps == list(range(60)), "global counter should be monotonic across episodes"
+
+    def test_on_frame_failures_logged_not_fatal(self, caplog):
+        """A raising ``on_frame`` is logged WARNING but the rollout
+        continues. The hook is opt-in telemetry — a broken recorder
+        shouldn't crash a 5-episode eval.
+
+        Pinned so a future refactor doesn't accidentally promote hook
+        failures to fatal errors.
+        """
+        import logging as _logging
+
+        def bad_on_frame(step, obs, action):
+            raise RuntimeError("camera offline")
+
+        sim = FakeSim()
+        policy = MockPolicy()
+        policy.set_robot_state_keys(sim.robot_joint_names("fake_robot"))
+        spec = _CountingBenchmark()
+
+        with caplog.at_level(_logging.WARNING, logger="strands_robots.simulation.policy_runner"):
+            result = PolicyRunner(sim).evaluate(
+                "fake_robot", policy, spec=spec, n_episodes=1, seed=42, on_frame=bad_on_frame
+            )
+
+        assert result["status"] == "success", f"hook failure must not fail the rollout: {result}"
+        warnings = [r for r in caplog.records if "on_frame hook failed" in r.getMessage()]
+        # 20 steps → 20 hook invocations → 20 warnings.
+        assert len(warnings) == 20, f"expected 20 warnings, got {len(warnings)}"
+
+    def test_on_frame_default_none_is_noop(self):
+        """The default ``on_frame=None`` doesn't change behaviour — the
+        eval loop runs identically without the hook. Pinned so the
+        plumbing addition is a strict superset.
+        """
+        sim = FakeSim()
+        policy = MockPolicy()
+        policy.set_robot_state_keys(sim.robot_joint_names("fake_robot"))
+        spec = _CountingBenchmark()
+
+        result = PolicyRunner(sim).evaluate("fake_robot", policy, spec=spec, n_episodes=1, seed=42)
+        assert result["status"] == "success"
+        assert spec.on_step_calls == 20, "spec hook count unchanged when on_frame is absent"
+
+    def test_evaluate_benchmark_forwards_on_frame(self):
+        """``Simulation.evaluate_benchmark`` plumbs ``on_frame`` to
+        ``PolicyRunner.evaluate``. End-to-end pin so the full chain
+        (Simulation → PolicyRunner.evaluate → _evaluate_with_spec → loop)
+        works without callers having to drop down to ``PolicyRunner``
+        directly.
+        """
+        from strands_robots.simulation.benchmark import register_benchmark
+
+        captured: list[int] = []
+
+        def on_frame(step, obs, action):
+            captured.append(step)
+
+        sim = FakeSim()
+        spec = _CountingBenchmark()
+        register_benchmark("on-frame-plumbing-eb", spec)
+        result = sim.evaluate_benchmark(
+            benchmark_name="on-frame-plumbing-eb",
+            robot_name="fake_robot",
+            policy_provider="mock",
+            n_episodes=1,
+            seed=42,
+            on_frame=on_frame,
+        )
+        assert result["status"] == "success", result
+        assert len(captured) == 20, f"expected 20 calls via evaluate_benchmark plumbing, got {len(captured)}"
