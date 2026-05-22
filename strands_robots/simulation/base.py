@@ -20,11 +20,11 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from strands_robots.policies import Policy
-    from strands_robots.simulation.policy_runner import OnFrame
 
 # PolicyRunner and VideoConfig are used by run_policy / replay / eval_policy.
 # We could defer these with inline lazy imports (and historically did), but
@@ -32,9 +32,14 @@ if TYPE_CHECKING:
 # the runtime cycle doesn't actually exist. Keep the imports at module level
 # to break the AST-visible cycle that static analysers flag.
 #
-# ``OnFrame`` (#191) lives under ``TYPE_CHECKING`` instead because it's a
-# pure type alias used only in annotations — no runtime touch — so there's
-# no benefit to paying the cycle-detection cost for it.
+# Note (#191): we deliberately do NOT import ``OnFrame`` here, even under
+# ``TYPE_CHECKING`` — CodeQL's ``py/unsafe-cyclic-import`` rule walks
+# ``TYPE_CHECKING`` blocks too and would flag the static cycle (
+# policy_runner.py imports SimEngine from base under TYPE_CHECKING,
+# so importing OnFrame from policy_runner here closes the loop in the
+# AST). Instead, we reference ``OnFrame`` in the ``evaluate_benchmark``
+# signature as a *string* annotation; ``from __future__ import
+# annotations`` (already in effect) makes that a no-op at runtime.
 from strands_robots.simulation.policy_runner import PolicyRunner, VideoConfig
 
 logger = logging.getLogger(__name__)
@@ -466,7 +471,7 @@ class SimEngine(ABC):
         n_episodes: int = 1,
         seed: int | None = None,
         action_horizon: int = 8,
-        on_frame: OnFrame | None = None,
+        on_frame: Callable[[int, dict[str, Any], dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Run a registered :class:`BenchmarkProtocol` against the current sim.
 
