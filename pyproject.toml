@@ -57,6 +57,14 @@ cosmos3-service = [
     "msgpack>=1.0.0,<2.0.0",
     "websockets>=12.0",
 ]
+# MoveIt2 sidecar client (ROS 2 / moveit_py runs out-of-process; the
+# client is a lightweight ZMQ + msgpack peer so users without ROS 2
+# sourced are unaffected). See policies/moveit2/server/ for the
+# sidecar reference implementation.
+moveit2 = [
+    "pyzmq>=27.0.0,<28.0.0",
+    "msgpack>=1.0.0,<2.0.0",
+]
 lerobot = [
     "lerobot[feetech]>=0.5.0,<0.6.0",
     # #378: lerobot 0.5.1's pyav video fallback calls torchvision.io.VideoReader,
@@ -110,6 +118,7 @@ device-connect = [
 ]
 all = [
     "strands-robots[groot-service]",
+    "strands-robots[moveit2]",
     "strands-robots[lerobot]",
     "strands-robots[sim-mujoco]",
     "strands-robots[mesh]",
@@ -254,7 +263,7 @@ ignore_missing_imports = false
 
 # Third-party libs without type stubs
 [[tool.mypy.overrides]]
-module = ["lerobot.*", "gr00t.*", "draccus.*", "msgpack.*", "websockets", "websockets.*", "zmq.*", "huggingface_hub.*", "serial.*", "psutil.*", "torch.*", "torchvision.*", "transformers.*", "einops.*", "robot_descriptions.*", "mujoco.*", "imageio.*", "libero.*", "zenoh.*", "boto3", "boto3.*", "awscrt", "awscrt.*", "awsiot", "awsiot.*", "botocore.*", "strands_robots.policies.cosmos3._msgpack_numpy", "openpi_client", "openpi_client.*", "openpi_server", "openpi_server.*", "openpi", "openpi.*", "device_connect_edge", "device_connect_edge.*", "device_connect_agent_tools", "device_connect_agent_tools.*"]
+module = ["lerobot.*", "gr00t.*", "draccus.*", "msgpack.*", "websockets", "websockets.*", "zmq.*", "huggingface_hub.*", "serial.*", "psutil.*", "torch.*", "torchvision.*", "transformers.*", "einops.*", "robot_descriptions.*", "mujoco.*", "imageio.*", "libero.*", "zenoh.*", "boto3", "boto3.*", "awscrt", "awscrt.*", "awsiot", "awsiot.*", "botocore.*", "strands_robots.policies.cosmos3._msgpack_numpy", "openpi_client", "openpi_client.*", "openpi_server", "openpi_server.*", "openpi", "openpi.*", "device_connect_edge", "device_connect_edge.*", "device_connect_agent_tools", "device_connect_agent_tools.*", "rclpy", "rclpy.*", "moveit", "moveit.*", "moveit_configs_utils", "moveit_configs_utils.*", "geometry_msgs", "geometry_msgs.*"]
 ignore_missing_imports = true
 
 # Device Connect drivers - thin wrappers over the untyped device_connect_edge
@@ -330,4 +339,5 @@ markers = [
     "gpu: requires CUDA GPU and real model weights (run with: pytest -m gpu)",
     "slow: long-running test (deselect with: pytest -m 'not slow')",
     "integration: requires live Device Connect infra (Zenoh router + etcd via Docker); skipped unless DEVICE_CONNECT_ALLOW_INSECURE is set (deselect with: pytest -m 'not integration')",
+    "moveit2: requires a running MoveIt2 sidecar (ROS 2 / moveit_py). Run with: pytest -m moveit2",
 ]

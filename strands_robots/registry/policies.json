@@ -100,6 +100,32 @@
                 "nvidia/cosmos3",
                 "nvidia/cosmos3-nano-policy"
             ]
+        },
+        "moveit2": {
+            "module": "strands_robots.policies.moveit2",
+            "class": "MoveIt2Policy",
+            "description": "MoveIt2 motion planning via ZMQ sidecar",
+            "requires": [
+                "port"
+            ],
+            "config_keys": [
+                "host",
+                "port",
+                "planning_group",
+                "timeout_ms",
+                "api_token"
+            ],
+            "defaults": {
+                "host": "127.0.0.1",
+                "port": 5556,
+                "planning_group": "arm"
+            },
+            "shorthands": [
+                "moveit2"
+            ],
+            "aliases": [
+                "moveit"
+            ]
         }
     }
 }

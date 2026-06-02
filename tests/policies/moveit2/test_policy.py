@@ -1,0 +1,535 @@
+"""Smoke tests for :class:`strands_robots.policies.moveit2.MoveIt2Policy`.
+
+Runs in-process against a stubbed ZMQ socket — no ROS 2, no live network.
+Mirrors the pattern used by ``tests/policies/groot/test_zmq_wire_roundtrip.py``:
+override ``client.socket.send`` / ``recv`` and msgpack-encode a fake
+sidecar response.
+
+Subtask 3 of issue #299. The acceptance criteria pin:
+
+* :class:`MoveIt2Policy` is creatable via ``create_policy("moveit2", ...)``
+  with the registered shorthand and the ``moveit`` alias.
+* The wire request format matches the protocol the issue specifies
+  (``joint_state``, ``target_pose`` / ``target_joints``, ``planning_group``,
+  ``world_update``).
+* Trajectory rows the sidecar returns unpack into per-step joint dicts.
+* Validation rejects malformed goals up-front.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from unittest.mock import MagicMock
+
+import pytest
+
+msgpack = pytest.importorskip(
+    "msgpack",
+    reason="msgpack not installed - pip install 'strands-robots[moveit2]'",
+)
+zmq = pytest.importorskip(
+    "zmq",
+    reason="zmq not installed - pip install 'strands-robots[moveit2]'",
+)
+
+# E402: importorskip must execute before these imports to skip cleanly.
+from strands_robots.policies import (  # noqa: E402
+    Policy,
+    create_policy,
+    list_providers,
+)
+from strands_robots.policies.moveit2 import (  # noqa: E402
+    MoveIt2InferenceClient,
+    MoveIt2Policy,
+    MsgSerializer,
+)
+
+
+def _capture_send_decode_recv(policy: MoveIt2Policy, response: dict) -> list[dict]:
+    """Replace the client's send/recv with capturing stubs.
+
+    Returns a list that gets populated with the *decoded* request dicts
+    (one per ``call_endpoint`` round-trip). The recv stub returns
+    ``response`` msgpack-packed.
+    """
+    sent: list[dict] = []
+
+    def _capture_send(data: bytes) -> None:
+        sent.append(MsgSerializer.from_bytes(data))
+
+    packed = MsgSerializer.to_bytes(response)
+    policy._client.socket.send = _capture_send  # type: ignore[assignment]
+    policy._client.socket.recv = lambda: packed  # type: ignore[assignment]
+    return sent
+
+
+def _ok_trajectory_response(horizon: int = 4, ndof: int = 6) -> dict:
+    """Construct a successful sidecar response with a synthetic trajectory."""
+    trajectory = []
+    for t in range(horizon):
+        # [time, q0, q1, ...] - matches the wire protocol from issue #302.
+        row = [float(t) * 0.1]
+        for i in range(ndof):
+            row.append(0.01 * (t + 1) * (i + 1))
+        trajectory.append(row)
+    return {"trajectory": trajectory, "success": True, "status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# MoveIt2InferenceClient
+# ---------------------------------------------------------------------------
+
+
+class TestMoveIt2InferenceClient:
+    def test_construction_defaults_to_loopback(self):
+        """Default host must be 127.0.0.1, not 0.0.0.0 (security baseline)."""
+        client = MoveIt2InferenceClient()
+        assert client.host == "127.0.0.1"
+        assert client.port == 5556
+        assert client.timeout_ms == 15000
+        assert client.api_token is None
+
+    def test_construction_with_api_token(self):
+        client = MoveIt2InferenceClient(host="localhost", port=5556, api_token="secret")
+        assert client.api_token == "secret"
+
+    def test_api_token_warning_on_remote_host(self, caplog):
+        import logging as _logging
+
+        with caplog.at_level(_logging.WARNING, logger="strands_robots.policies.moveit2.client"):
+            MoveIt2InferenceClient(host="10.0.0.1", port=5556, api_token="tok")
+        assert any("plaintext" in r.message for r in caplog.records)
+
+    def test_no_warning_for_localhost_token(self, caplog):
+        import logging as _logging
+
+        with caplog.at_level(_logging.WARNING, logger="strands_robots.policies.moveit2.client"):
+            MoveIt2InferenceClient(host="127.0.0.1", port=5556, api_token="tok")
+        assert not any("plaintext" in r.message for r in caplog.records)
+
+    def test_call_endpoint_includes_api_token(self):
+        client = MoveIt2InferenceClient(host="127.0.0.1", port=9999, api_token="mytoken")
+        sent: list[dict] = []
+        client.socket.send = lambda data: sent.append(MsgSerializer.from_bytes(data))
+        client.socket.recv = MagicMock(return_value=MsgSerializer.to_bytes({"status": "ok"}))
+        client.call_endpoint("ping")
+        assert sent[0]["api_token"] == "mytoken"
+
+    def test_call_endpoint_without_api_token_omits_field(self):
+        client = MoveIt2InferenceClient(host="127.0.0.1", port=9999)
+        sent: list[dict] = []
+        client.socket.send = lambda data: sent.append(MsgSerializer.from_bytes(data))
+        client.socket.recv = MagicMock(return_value=MsgSerializer.to_bytes({"status": "ok"}))
+        client.call_endpoint("ping")
+        assert "api_token" not in sent[0]
+
+    def test_call_endpoint_raises_on_server_error(self):
+        client = MoveIt2InferenceClient(host="127.0.0.1", port=9999)
+        client.socket.send = MagicMock()
+        client.socket.recv = MagicMock(return_value=MsgSerializer.to_bytes({"error": "no plan found"}))
+        with pytest.raises(RuntimeError, match="Server error: no plan found"):
+            client.call_endpoint("plan", {})
+
+    def test_ping_returns_false_on_failure(self):
+        client = MoveIt2InferenceClient(host="127.0.0.1", port=9999)
+        client.socket.send = MagicMock(side_effect=Exception("timeout"))
+        assert client.ping() is False
+
+    def test_plan_helper_omits_optional_fields_when_unset(self):
+        """plan() should not send ``target_pose`` / ``world_update`` keys when
+        those are None — keeps the wire payload minimal and lets the
+        sidecar use its own defaults."""
+        client = MoveIt2InferenceClient(host="127.0.0.1", port=9999)
+        sent: list[dict] = []
+        client.socket.send = lambda data: sent.append(MsgSerializer.from_bytes(data))
+        client.socket.recv = MagicMock(
+            return_value=MsgSerializer.to_bytes({"trajectory": [], "success": True, "status": "ok"})
+        )
+        client.plan(joint_state=[0.0] * 6, planning_group="arm", target_joints={"j0": 0.5})
+        payload = sent[0]["data"]
+        assert "target_pose" not in payload
+        assert "world_update" not in payload
+        assert payload["target_joints"] == {"j0": 0.5}
+        assert payload["planning_group"] == "arm"
+
+
+# ---------------------------------------------------------------------------
+# MoveIt2Policy - construction & registry
+# ---------------------------------------------------------------------------
+
+
+class TestMoveIt2PolicyConstruction:
+    def test_provider_name(self):
+        p = MoveIt2Policy(host="127.0.0.1", port=19999)
+        assert p.provider_name == "moveit2"
+
+    def test_does_not_require_images(self):
+        """Planner-style policies must skip camera rendering (#300 contract)."""
+        p = MoveIt2Policy(host="127.0.0.1", port=19999)
+        assert p.requires_images is False
+
+    def test_subclass_of_policy_abc(self):
+        """Pin the inheritance contract from issue #300."""
+        p = MoveIt2Policy(host="127.0.0.1", port=19999)
+        assert isinstance(p, Policy)
+
+    def test_silent_unknown_kwargs(self, caplog):
+        """Per #300: providers MUST ignore unknown kwargs rather than raising."""
+        # No exception raised on unknown kwarg.
+        p = MoveIt2Policy(
+            host="127.0.0.1",
+            port=19999,
+            future_kwarg_we_dont_know_about="ignore me",
+        )
+        assert p.host == "127.0.0.1"
+
+    def test_create_policy_by_canonical_name(self):
+        p = create_policy("moveit2", host="127.0.0.1", port=19999)
+        assert isinstance(p, MoveIt2Policy)
+        assert p.host == "127.0.0.1"
+        assert p.port == 19999
+
+    def test_create_policy_by_moveit_alias(self):
+        p = create_policy("moveit", host="127.0.0.1", port=19999)
+        assert isinstance(p, MoveIt2Policy)
+
+    def test_listed_in_providers(self):
+        providers = list_providers()
+        assert "moveit2" in providers
+        # ``moveit`` is an alias resolved at create_policy() time, not a
+        # canonical name listed by ``list_providers()``. The alias path
+        # is covered separately in ``test_create_policy_by_moveit_alias``.
+
+    def test_api_token_env_fallback(self, monkeypatch):
+        """Falls back to ``MOVEIT2_API_TOKEN`` env var when not provided."""
+        monkeypatch.setenv("MOVEIT2_API_TOKEN", "env-token")
+        p = MoveIt2Policy(host="127.0.0.1", port=19999)
+        assert p._client.api_token == "env-token"
+
+    def test_explicit_api_token_overrides_env(self, monkeypatch):
+        monkeypatch.setenv("MOVEIT2_API_TOKEN", "env-token")
+        p = MoveIt2Policy(host="127.0.0.1", port=19999, api_token="explicit")
+        assert p._client.api_token == "explicit"
+
+
+# ---------------------------------------------------------------------------
+# Validation - reject malformed goals up-front
+# ---------------------------------------------------------------------------
+
+
+class TestMoveIt2PolicyValidation:
+    def _make_policy(self) -> MoveIt2Policy:
+        return MoveIt2Policy(host="127.0.0.1", port=19999)
+
+    def test_missing_target_raises(self):
+        """Neither target_pose nor target_joints -> ValueError."""
+        p = self._make_policy()
+        with pytest.raises(ValueError, match="target_pose|target_joints"):
+            asyncio.run(p.get_actions({"observation.state": [0.0] * 6}, "instruction"))
+
+    def test_target_pose_wrong_length_rejected(self):
+        p = self._make_policy()
+        with pytest.raises(ValueError, match="7 elements"):
+            asyncio.run(
+                p.get_actions(
+                    {"observation.state": [0.0] * 6},
+                    "",
+                    target_pose=[0.0, 0.0, 0.0],  # only 3 elements
+                )
+            )
+
+    def test_target_pose_nan_rejected(self):
+        p = self._make_policy()
+        with pytest.raises(ValueError, match="finite"):
+            asyncio.run(
+                p.get_actions(
+                    {"observation.state": [0.0] * 6},
+                    "",
+                    target_pose=[0.3, 0.0, 0.4, 1.0, 0.0, 0.0, float("nan")],
+                )
+            )
+
+    def test_target_joints_non_dict_rejected(self):
+        p = self._make_policy()
+        with pytest.raises(ValueError, match="must be a dict"):
+            asyncio.run(
+                p.get_actions(
+                    {"observation.state": [0.0] * 6},
+                    "",
+                    target_joints=[0.5, 1.0],  # list instead of dict
+                )
+            )
+
+    def test_target_joints_bad_key_rejected(self):
+        """Joint names with shell metacharacters rejected up-front."""
+        p = self._make_policy()
+        with pytest.raises(ValueError, match="must match"):
+            asyncio.run(
+                p.get_actions(
+                    {"observation.state": [0.0] * 6},
+                    "",
+                    target_joints={"j0; rm -rf": 0.5},
+                )
+            )
+
+    def test_target_joints_inf_rejected(self):
+        p = self._make_policy()
+        with pytest.raises(ValueError, match="finite"):
+            asyncio.run(
+                p.get_actions(
+                    {"observation.state": [0.0] * 6},
+                    "",
+                    target_joints={"j0": float("inf")},
+                )
+            )
+
+    def test_planning_group_bad_chars_rejected(self):
+        p = self._make_policy()
+        with pytest.raises(ValueError, match="planning_group"):
+            asyncio.run(
+                p.get_actions(
+                    {"observation.state": [0.0] * 6},
+                    "",
+                    target_joints={"j0": 0.5},
+                    planning_group="arm; rm -rf /",
+                )
+            )
+
+
+# ---------------------------------------------------------------------------
+# Wire round-trip - end-to-end against stubbed ZMQ
+# ---------------------------------------------------------------------------
+
+
+class TestMoveIt2PolicyWireRoundTrip:
+    def _make_policy(self) -> MoveIt2Policy:
+        return MoveIt2Policy(
+            host="127.0.0.1",
+            port=19999,
+            planning_group="arm",
+        )
+
+    def test_request_payload_has_canonical_schema(self):
+        """The msgpack payload sent to the sidecar contains the keys the
+        issue #302 wire protocol specifies: joint_state, target_pose,
+        planning_group. ``options`` / ``api_token`` envelopes match the
+        groot client behaviour."""
+        p = self._make_policy()
+        sent = _capture_send_decode_recv(p, _ok_trajectory_response())
+        asyncio.run(
+            p.get_actions(
+                {"observation.state": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]},
+                "ignore me",
+                target_pose=[0.3, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
+            )
+        )
+        assert len(sent) == 1
+        assert sent[0]["endpoint"] == "plan"
+        payload = sent[0]["data"]
+        assert payload["joint_state"] == [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+        assert payload["target_pose"] == [0.3, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0]
+        assert payload["planning_group"] == "arm"
+        assert "target_joints" not in payload  # not provided -> omitted
+
+    def test_target_joints_path(self):
+        """target_joints flows through cleanly."""
+        p = self._make_policy()
+        sent = _capture_send_decode_recv(p, _ok_trajectory_response())
+        asyncio.run(
+            p.get_actions(
+                {"observation.state": [0.0] * 6},
+                "",
+                target_joints={"shoulder_pan": 0.5, "elbow": -0.3},
+            )
+        )
+        payload = sent[0]["data"]
+        assert payload["target_joints"] == {"shoulder_pan": 0.5, "elbow": -0.3}
+
+    def test_world_update_passthrough(self):
+        """world_update is forwarded as-is (sidecar defines schema)."""
+        p = self._make_policy()
+        sent = _capture_send_decode_recv(p, _ok_trajectory_response())
+        update = {"depth_topic": "/camera/depth", "stamp": 1234567890}
+        asyncio.run(
+            p.get_actions(
+                {"observation.state": [0.0] * 6},
+                "",
+                target_joints={"j0": 0.5},
+                world_update=update,
+            )
+        )
+        assert sent[0]["data"]["world_update"] == update
+
+    def test_planning_group_per_call_override(self):
+        """``planning_group`` kwarg overrides the constructor default."""
+        p = MoveIt2Policy(host="127.0.0.1", port=19999, planning_group="arm")
+        sent = _capture_send_decode_recv(p, _ok_trajectory_response())
+        asyncio.run(
+            p.get_actions(
+                {"observation.state": [0.0] * 6},
+                "",
+                target_joints={"j0": 0.5},
+                planning_group="left_arm",
+            )
+        )
+        assert sent[0]["data"]["planning_group"] == "left_arm"
+
+    def test_trajectory_unpacks_to_per_step_dicts(self):
+        """The sidecar's ``[[t, q0, q1, ...], ...]`` rows unpack into a
+        list of per-step joint dicts. Time column is dropped — the
+        runner schedules the timing."""
+        p = self._make_policy()
+        p.set_robot_state_keys(["j0", "j1", "j2", "j3", "j4", "j5"])
+        _capture_send_decode_recv(p, _ok_trajectory_response(horizon=4, ndof=6))
+
+        actions = asyncio.run(
+            p.get_actions(
+                {"observation.state": [0.0] * 6},
+                "",
+                target_pose=[0.3, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
+            )
+        )
+        assert len(actions) == 4
+        # Per-step dict: 6 joints, no time column.
+        for step in actions:
+            assert set(step.keys()) == {"j0", "j1", "j2", "j3", "j4", "j5"}
+            assert all(isinstance(v, float) for v in step.values())
+
+    def test_trajectory_falls_back_to_positional_keys(self):
+        """When ``set_robot_state_keys`` is unset, fall back to ``joint_<i>``."""
+        p = self._make_policy()
+        # Don't call set_robot_state_keys.
+        _capture_send_decode_recv(p, _ok_trajectory_response(horizon=2, ndof=3))
+
+        actions = asyncio.run(
+            p.get_actions(
+                {"observation.state": [0.0, 0.0, 0.0]},
+                "",
+                target_joints={"j0": 0.5},
+            )
+        )
+        assert len(actions) == 2
+        for step in actions:
+            assert set(step.keys()) == {"joint_0", "joint_1", "joint_2"}
+
+    def test_empty_trajectory_returns_empty_list(self):
+        p = self._make_policy()
+        _capture_send_decode_recv(p, {"trajectory": [], "success": True, "status": "ok"})
+        actions = asyncio.run(
+            p.get_actions(
+                {"observation.state": [0.0] * 6},
+                "",
+                target_joints={"j0": 0.5},
+            )
+        )
+        assert actions == []
+
+    def test_failed_plan_raises_runtime_error(self):
+        """``success=False`` from the sidecar surfaces as a RuntimeError
+        with status / goal context for debugging."""
+        p = self._make_policy()
+        _capture_send_decode_recv(
+            p,
+            {"trajectory": [], "success": False, "status": "no_collision_free_path"},
+        )
+        with pytest.raises(RuntimeError, match="no_collision_free_path"):
+            asyncio.run(
+                p.get_actions(
+                    {"observation.state": [0.0] * 6},
+                    "",
+                    target_pose=[0.3, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
+                )
+            )
+
+    def test_reset_forwards_to_server(self):
+        """Pin the reset() round-trip behaviour: server sees the seed."""
+        p = self._make_policy()
+        sent = _capture_send_decode_recv(p, {"status": "ok"})
+        p.reset(seed=42)
+        assert sent[0]["endpoint"] == "reset"
+        assert sent[0]["data"] == {"options": {"seed": 42}}
+
+    def test_reset_swallows_server_errors(self):
+        """reset() is best-effort; server errors must not propagate."""
+        p = self._make_policy()
+        # Mock send to raise so call_endpoint propagates an exception.
+        p._client.socket.send = MagicMock(side_effect=Exception("connection refused"))
+        # Should not raise.
+        p.reset(seed=42)
+
+
+# ---------------------------------------------------------------------------
+# Policy ABC contract — same shape as MockPolicy
+# ---------------------------------------------------------------------------
+
+
+class TestPolicyContractParity:
+    """Mock + MoveIt2 must pass the same Policy-shape contract.
+
+    Pins the issue #300 ABC contract for non-VLA providers so a future
+    refactor that breaks one cannot pass while breaking the other. cuRobo
+    (subtask 2 of #299) will join this list when it lands.
+    """
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            lambda: create_policy("mock"),
+            lambda: create_policy("moveit2", host="127.0.0.1", port=19999),
+        ],
+    )
+    def test_provider_is_policy_subclass(self, factory):
+        assert isinstance(factory(), Policy)
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            lambda: create_policy("mock"),
+            lambda: create_policy("moveit2", host="127.0.0.1", port=19999),
+        ],
+    )
+    def test_provider_has_provider_name(self, factory):
+        p = factory()
+        assert isinstance(p.provider_name, str)
+        assert p.provider_name  # non-empty
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            lambda: create_policy("mock"),
+            lambda: create_policy("moveit2", host="127.0.0.1", port=19999),
+        ],
+    )
+    def test_provider_set_robot_state_keys_is_no_raise(self, factory):
+        p = factory()
+        # Both implementations accept the call shape from #300; mock
+        # stores the list, moveit2 stores the list for trajectory
+        # unpacking. Neither raises.
+        p.set_robot_state_keys(["j0", "j1", "j2"])
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            lambda: create_policy("mock"),
+            lambda: create_policy("moveit2", host="127.0.0.1", port=19999),
+        ],
+    )
+    def test_provider_requires_images_is_false_for_planners(self, factory):
+        """Both providers consume joint state only - skip camera rendering."""
+        assert factory().requires_images is False
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            lambda: create_policy("mock"),
+            lambda: create_policy("moveit2", host="127.0.0.1", port=19999),
+        ],
+    )
+    def test_provider_reset_is_no_raise(self, factory):
+        """reset() is best-effort and must not raise on the default path."""
+        p = factory()
+        # MoveIt2 forwards to a (stubbed-absent) server; the client send
+        # would fail, but reset() catches and logs.
+        if isinstance(p, MoveIt2Policy):
+            p._client.socket.send = MagicMock(side_effect=Exception("offline"))
+        p.reset(seed=0)
