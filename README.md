@@ -419,6 +419,83 @@ policy = create_policy(
 policy = create_policy(provider="mock")
 ```
 
+### Non-VLA Policies (motion planners, MPC, scripted)
+
+The `Policy` ABC is intentionally agnostic about *how* actions are produced.
+The same interface fits VLA-style providers **and** classical motion
+planners (cuRobo, MoveIt2, OMPL), model-predictive controllers, and pure-IK
+or scripted trajectories — anything that maps `(observation, goal)` to a
+list of joint targets.
+
+`MockPolicy` (`strands_robots/policies/mock.py`) is the reference: it sets
+`requires_images = False` so the simulation skips camera rendering (~10x
+throughput at 500Hz), ignores the `instruction` string, and returns a list
+of joint-target dicts.
+
+Non-VLA providers should consume **well-known `**kwargs` keys** instead of
+JSON-encoding goals into the natural-language instruction:
+
+| Key             | Type                       | Meaning                                                                |
+| --------------- | -------------------------- | ---------------------------------------------------------------------- |
+| `target_pose`   | `list[float]`              | Cartesian goal `[x, y, z, qw, qx, qy, qz]` in the robot base frame     |
+| `target_joints` | `dict[str, float]`         | Joint-space goal keyed by joint name (radians / metres)                |
+| `world_update`  | `dict \| None`             | Per-call world refresh for collision-aware planners (depth, mesh, ...) |
+
+Providers MUST ignore unknown `**kwargs` rather than raising, so callers can
+pass shared keys across providers without coupling to a specific backend.
+
+Minimal example — register a planner-style provider at runtime:
+
+```python
+from typing import Any
+from strands_robots.policies import Policy, register_policy, create_policy
+
+
+class ReachPolicy(Policy):
+    """Linear interpolation from current joint state to target_joints."""
+
+    def __init__(self, steps: int = 32, **_: Any) -> None:
+        self._keys: list[str] = []
+        self._steps = steps
+
+    @property
+    def provider_name(self) -> str:
+        return "reach"
+
+    @property
+    def requires_images(self) -> bool:
+        return False  # joint-state only -- skip camera rendering
+
+    def set_robot_state_keys(self, robot_state_keys: list[str]) -> None:
+        self._keys = list(robot_state_keys)
+
+    async def get_actions(
+        self, observation_dict: dict[str, Any], instruction: str, **kwargs: Any
+    ) -> list[dict[str, Any]]:
+        target = kwargs.get("target_joints")
+        if target is None:
+            raise ValueError("ReachPolicy requires target_joints kwarg")
+
+        state = observation_dict.get("observation.state", [0.0] * len(self._keys))
+        out: list[dict[str, float]] = []
+        for s in range(1, self._steps + 1):
+            alpha = s / self._steps
+            out.append(
+                {k: (1 - alpha) * state[i] + alpha * target[k] for i, k in enumerate(self._keys)}
+            )
+        return out
+
+
+register_policy("reach", lambda: ReachPolicy, aliases=["lerp"])
+policy = create_policy("reach")
+```
+
+The same shape extends to cuRobo (call `MotionGen.plan_single` with the
+`target_pose` kwarg, cache the trajectory, yield `action_horizon` chunks)
+and MoveIt2 (forward `target_pose` + `joint_state` to a sidecar ROS 2
+service via ZMQ / gRPC).  Reference implementations are tracked separately
+on the [Strands Labs - Robots project board](https://github.com/orgs/strands-labs/projects/2).
+
 ## Project Structure
 
 ```
