@@ -100,6 +100,28 @@
                 "nvidia/cosmos3",
                 "nvidia/cosmos3-nano-policy"
             ]
+        },
+        "curobo": {
+            "module": "strands_robots.policies.curobo",
+            "class": "CuroboPolicy",
+            "description": "NVIDIA cuRobo collision-aware motion planning (in-process, CUDA)",
+            "requires": [],
+            "config_keys": [
+                "robot_config",
+                "world_config",
+                "action_horizon",
+                "tensor_args",
+                "motion_gen_kwargs"
+            ],
+            "defaults": {
+                "action_horizon": 16
+            },
+            "shorthands": [
+                "curobo"
+            ],
+            "aliases": [
+                "cumotion"
+            ]
         }
     }
 }

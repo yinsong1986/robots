@@ -493,6 +493,49 @@ register_policy("reach", lambda: ReachPolicy, aliases=["lerp"])
 policy = create_policy("reach")
 ```
 
+The same shape extends to MoveIt2 (forward `target_pose` + `joint_state` to
+a sidecar ROS 2 service via ZMQ / gRPC).  Reference implementations are
+tracked on the [Strands Labs - Robots project board](https://github.com/orgs/strands-labs/projects/2).
+
+#### `CuroboPolicy` (in-process collision-aware planning, GPU)
+
+[`CuroboPolicy`](./strands_robots/policies/curobo/policy.py) wraps NVIDIA's
+[cuRobo](https://curobo.org/) `MotionGen` planner. Unlike sidecar-style
+providers, cuRobo runs **in the same process** as a CUDA library — there is
+no network round-trip, but a CUDA-capable GPU and the `[curobo]` extra are
+required:
+
+```bash
+pip install 'strands-robots[curobo]'
+```
+
+```python
+from strands_robots.policies import create_policy
+
+policy = create_policy(
+    "curobo",                    # alias: "cumotion"
+    robot_config="ur5e.yml",     # any cuRobo built-in YAML, or a dict
+    action_horizon=16,
+)
+
+actions = policy.get_actions_sync(
+    observation_dict={"observation.state": [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]},
+    instruction="reach for the red block",   # ignored by planners
+    target_pose=[0.5, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
+)
+```
+
+The full collision-free trajectory is cached on the first call; each
+subsequent call yields up to `action_horizon` waypoints from the cache so
+the 50Hz execution loop in `Robot` can stream per-step joint targets without
+re-planning. Pass `replan=True` (or call `policy.reset()`) to force a fresh
+plan when the world has updated mid-rollout. `world_update` is forwarded to
+`MotionGen.update_world` for per-call collision-world refresh.
+
+The LLM-agent demo path (`Robot.start_task(..., policy_provider="curobo",
+target_pose=[...])`) flows the same `target_pose` / `target_joints` kwargs
+through `start_task`'s `**policy_kwargs` so agents share one goal vocabulary
+across VLA and planner providers.
 
 ## Simulation (MuJoCo)
 

@@ -57,6 +57,13 @@ cosmos3-service = [
     "msgpack>=1.0.0,<2.0.0",
     "websockets>=12.0",
 ]
+# cuRobo collision-aware motion planning. Runs in-process as a CUDA
+# library (no sidecar, unlike MoveIt2). The package itself pulls torch /
+# warp / yourdfpy etc.; users without a CUDA-capable GPU should not
+# install this extra. See policies/curobo/ for the policy wrapper.
+curobo = [
+    "nvidia-curobo>=0.7.4,<0.8.0",
+]
 lerobot = [
     "lerobot[feetech]>=0.5.0,<0.6.0",
     # #378: lerobot 0.5.1's pyav video fallback calls torchvision.io.VideoReader,
@@ -330,4 +337,5 @@ markers = [
     "gpu: requires CUDA GPU and real model weights (run with: pytest -m gpu)",
     "slow: long-running test (deselect with: pytest -m 'not slow')",
     "integration: requires live Device Connect infra (Zenoh router + etcd via Docker); skipped unless DEVICE_CONNECT_ALLOW_INSECURE is set (deselect with: pytest -m 'not integration')",
+    "curobo: requires NVIDIA cuRobo + a CUDA-capable GPU. Run with: pytest -m curobo (set CUROBO_LIVE=1)",
 ]
