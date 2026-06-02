@@ -9,7 +9,10 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 from strands_robots.policies.base import Policy
+from strands_robots.policies.mock import MockPolicy
 
 
 class _IdentityPolicy(Policy):
@@ -75,8 +78,6 @@ def test_well_known_kwargs_are_accepted_by_contract():
     target_joints, world_update). The Policy contract requires get_actions
     to ignore unknown kwargs rather than raising, so callers can pass
     shared keys across providers without coupling to a backend."""
-    from strands_robots.policies.mock import MockPolicy
-
     p = MockPolicy()
     p.set_robot_state_keys(["j0", "j1"])
     obs = {"observation.state": [0.0, 0.0]}
@@ -98,6 +99,46 @@ def test_well_known_kwargs_are_accepted_by_contract():
 def test_non_vla_providers_can_skip_camera_rendering():
     """``requires_images=False`` is the opt-out for joint-state-only
     providers (MockPolicy, planners, MPC, scripted)."""
-    from strands_robots.policies.mock import MockPolicy
-
     assert MockPolicy().requires_images is False
+
+
+# Providers that opt into the non-VLA path and inherit the documented
+# "ignore unknown ``**kwargs`` rather than raising" contract from the
+# Policy ABC. As CuroboPolicy / MoveIt2Policy land via #305 / #306 they
+# extend this list rather than re-asserting the same contract locally.
+_NON_VLA_PROVIDER_FACTORIES: list[Any] = [
+    pytest.param(lambda: MockPolicy(), id="mock"),
+    # pytest.param(lambda: CuroboPolicy(...), id="curobo"),     # PR #306
+    # pytest.param(lambda: MoveIt2Policy(...), id="moveit2"),   # PR #305
+]
+
+
+@pytest.mark.parametrize("provider_factory", _NON_VLA_PROVIDER_FACTORIES)
+def test_unknown_kwargs_are_silently_ignored(provider_factory):
+    """Regression pin for the cross-provider contract documented in the
+    Policy ABC module docstring: ``get_actions(**kwargs)`` MUST silently
+    ignore kwargs it does not recognise rather than raising ``TypeError``.
+
+    A made-up kwarg no provider knows about (``some_future_kwarg``) must
+    round-trip cleanly through ``get_actions_sync`` -- this fails on any
+    future provider whose ``get_actions`` signature drops ``**kwargs``
+    entirely (e.g. ``def get_actions(self, obs, instruction, target_pose=None)``),
+    which would otherwise be silently masked by the sync wrapper's own
+    ``**kwargs`` passthrough.
+
+    Centralising here means #305 / #306 inherit the contract automatically
+    instead of each PR re-asserting it locally."""
+    p = provider_factory()
+    p.set_robot_state_keys(["j0", "j1"])
+    obs = {"observation.state": [0.0, 0.0]}
+
+    actions = p.get_actions_sync(
+        obs,
+        instruction="",
+        target_pose=[0.5, 0.0, 0.3, 1.0, 0.0, 0.0, 0.0],
+        some_future_kwarg="opaque",
+    )
+    assert isinstance(actions, list) and actions, (
+        "Policy must return a non-empty action list even when passed an "
+        "unknown kwarg; the contract is to ignore, not raise."
+    )
