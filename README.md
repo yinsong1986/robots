@@ -529,9 +529,38 @@ sim_a.mesh.tell(sim_b.mesh.peer_id, "pick up the cube")
 sim_a.mesh.emergency_stop()     # broadcast E-STOP, audited to disk
 ```
 
+`tell()` works against both `HardwareRobot` and `Simulation` peers. The
+dispatcher detects the peer type and routes to
+`HardwareRobot._execute_task_sync` / `start_task` for hardware peers and to
+`Simulation.run_policy` / `start_policy` for sim peers. Issue [#300]'s
+well-known per-call policy kwargs (`target_pose`, `target_joints`,
+`world_update`) and the existing constructor extras (`model_path`,
+`server_address`, `policy_type`, `pretrained_name_or_path`) are forwarded
+end-to-end via `policy_config` so a planner-style policy on a sim peer
+sees the goal payload it needs:
+
+```python
+# Agent on peer A drives a cuRobo planner running on a sim peer B.
+sim_a.mesh.tell(
+    sim_b.mesh.peer_id,
+    "reach for the red block",
+    policy_provider="curobo",
+    target_pose=[0.3, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
+    robot_name="arm_left",       # disambiguate in multi-robot sims
+    duration=10.0,
+    fast_mode=True,
+)
+```
+
+Per-robot mesh peers attach automatically inside a sim, so an LLM agent
+may also `tell()` a specific `SimRobot` peer (`<sim_peer_id>__<robot_name>`)
+when the simulation hosts more than one robot.
+
 Disable globally with `STRANDS_MESH=false` or per-robot with
 `Robot("so100", mesh=False)`.  Install the optional dependency with
 `pip install strands-robots[mesh]`.
+
+[#300]: https://github.com/strands-labs/robots/issues/300
 
 ### Cache Directory
 
