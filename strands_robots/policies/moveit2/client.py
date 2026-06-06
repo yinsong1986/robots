@@ -194,8 +194,14 @@ class MoveIt2InferenceClient:
             payload["world_update"] = world_update
         return self.call_endpoint("plan", payload)
 
-    def __del__(self) -> None:
-        # Best-effort socket teardown - never raise from __del__.
+    def _teardown(self) -> None:
+        """Best-effort ZMQ socket + context teardown.
+
+        Extracted from ``__del__`` so the destructor stays one line — CodeQL
+        flags non-trivial logic in ``__del__`` because exceptions raised
+        during interpreter shutdown are swallowed silently and can mask
+        resource leaks.
+        """
         try:
             if hasattr(self, "socket"):
                 self.socket.close()
@@ -203,6 +209,9 @@ class MoveIt2InferenceClient:
                 self.context.term()
         except Exception:  # noqa: BLE001
             pass
+
+    def __del__(self) -> None:
+        self._teardown()
 
 
 __all__ = [

@@ -36,6 +36,7 @@ for the recommended deployment.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Any
 
@@ -360,7 +361,7 @@ class MoveIt2Policy(Policy):
                 raise ValueError(f"target_pose[{i}] must be a number, got {type(v).__name__}") from e
             # NaN / +inf / -inf would crash the sidecar planner with an
             # opaque ROS error. Reject up front.
-            if f != f or f in (float("inf"), float("-inf")):
+            if math.isnan(f) or math.isinf(f):
                 raise ValueError(f"target_pose[{i}]={f!r} must be finite")
 
     @staticmethod
@@ -380,7 +381,7 @@ class MoveIt2Policy(Policy):
                 f = float(v)
             except (TypeError, ValueError) as e:
                 raise ValueError(f"target_joints[{k!r}]={v!r} must be a number") from e
-            if f != f or f in (float("inf"), float("-inf")):
+            if math.isnan(f) or math.isinf(f):
                 raise ValueError(f"target_joints[{k!r}]={f!r} must be finite")
 
     @staticmethod
