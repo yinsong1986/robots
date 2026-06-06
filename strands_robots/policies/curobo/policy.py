@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from typing import Any
 
@@ -719,7 +720,7 @@ class CuroboPolicy(Policy):
                 f = float(v)
             except (TypeError, ValueError) as e:
                 raise ValueError(f"target_pose[{i}] must be a number, got {type(v).__name__}") from e
-            if f != f or f in (float("inf"), float("-inf")):
+            if math.isnan(f) or math.isinf(f):
                 raise ValueError(f"target_pose[{i}]={f!r} must be finite")
 
     @staticmethod
@@ -737,7 +738,7 @@ class CuroboPolicy(Policy):
                 f = float(v)
             except (TypeError, ValueError) as e:
                 raise ValueError(f"target_joints[{k!r}]={v!r} must be a number") from e
-            if f != f or f in (float("inf"), float("-inf")):
+            if math.isnan(f) or math.isinf(f):
                 raise ValueError(f"target_joints[{k!r}]={f!r} must be finite")
 
 
