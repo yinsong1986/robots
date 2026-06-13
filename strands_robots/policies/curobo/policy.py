@@ -28,10 +28,17 @@ cuRobo is a CUDA library rather than a sidecar:
         target_pose=[0.4, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
     )
 
-The ``nvidia-curobo`` package and a CUDA-capable GPU stay out of the base
-install; users opt in via the ``[curobo]`` extra. The policy module raises
-a clear :class:`ImportError` (via :func:`require_optional`) on construction
-when the extra is missing.
+The ``nvidia-curobo`` package on PyPI is an unrelated v0.1 squatter — the
+real cuRobo is published only as source on GitHub. Users opt in by
+installing it from source before constructing this policy::
+
+    git clone https://github.com/NVlabs/curobo.git
+    pip install -e ./curobo
+
+The ``[curobo]`` extra in ``pyproject.toml`` is intentionally empty until
+cuRobo publishes a real PyPI wheel. The policy module raises a clear
+:class:`ImportError` (via :func:`require_optional`) on construction when
+the ``curobo`` Python package is missing.
 """
 
 from __future__ import annotations
@@ -389,7 +396,11 @@ class CuroboPolicy(Policy):
         """
         require_optional(
             "curobo",
-            pip_install="nvidia-curobo>=0.7.4,<0.8.0",
+            # cuRobo is NOT on PyPI (the ``nvidia-curobo`` v0.1 package
+            # is an unrelated squatter). Real install is from source:
+            #   git clone https://github.com/NVlabs/curobo.git
+            #   pip install -e ./curobo
+            pip_install="-e git+https://github.com/NVlabs/curobo.git#egg=curobo",
             extra="curobo",
             purpose="CuroboPolicy motion planning",
         )

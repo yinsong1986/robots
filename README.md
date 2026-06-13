@@ -502,12 +502,24 @@ tracked on the [Strands Labs - Robots project board](https://github.com/orgs/str
 [`CuroboPolicy`](./strands_robots/policies/curobo/policy.py) wraps NVIDIA's
 [cuRobo](https://curobo.org/) `MotionGen` planner. Unlike sidecar-style
 providers, cuRobo runs **in the same process** as a CUDA library — there is
-no network round-trip, but a CUDA-capable GPU and the `[curobo]` extra are
-required:
+no network round-trip, but a CUDA-capable GPU is required.
 
-```bash
-pip install 'strands-robots[curobo]'
-```
+> **Install note**: cuRobo is **not** published on PyPI (the
+> `nvidia-curobo` package on PyPI is an unrelated v0.1 squatter). Install
+> from source from the upstream repository, then install this package:
+>
+> ```bash
+> git clone https://github.com/NVlabs/curobo.git
+> pip install -e ./curobo
+> pip install 'strands-robots[curobo]'   # extra is currently empty;
+>                                        # reserved for when cuRobo
+>                                        # publishes a real PyPI wheel
+> ```
+>
+> The on-device cuRobo APIs are still evolving; this policy currently
+> targets the `0.7.x` API surface. See the follow-up tracking issue
+> linked from PR #306 for the migration to cuRobo's restructured
+> `MotionPlanner` API on `main`.
 
 ```python
 from strands_robots.policies import create_policy

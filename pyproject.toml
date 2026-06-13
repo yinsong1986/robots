@@ -58,12 +58,25 @@ cosmos3-service = [
     "websockets>=12.0",
 ]
 # cuRobo collision-aware motion planning. Runs in-process as a CUDA
-# library (no sidecar, unlike MoveIt2). The package itself pulls torch /
-# warp / yourdfpy etc.; users without a CUDA-capable GPU should not
-# install this extra. See policies/curobo/ for the policy wrapper.
-curobo = [
-    "nvidia-curobo>=0.7.4,<0.8.0",
-]
+# library (no sidecar, unlike MoveIt2). Users without a CUDA-capable GPU
+# should not install this extra. See policies/curobo/ for the policy
+# wrapper.
+#
+# IMPORTANT: cuRobo is NOT distributed on PyPI. The package named
+# ``nvidia-curobo`` on PyPI is an unrelated v0.1 squatter — installing
+# it does not get you a working cuRobo. The real cuRobo is published
+# only as source on GitHub at https://github.com/NVlabs/curobo. Users
+# must install it from source before using this policy:
+#
+#   git clone https://github.com/NVlabs/curobo.git
+#   pip install -e ./curobo
+#
+# Once cuRobo's API surface stabilises and a real PyPI release exists,
+# this extra will pin to it. Until then, keep the extra empty so
+# ``pip install strands-robots[curobo]`` is a no-op rather than a
+# silently-broken install of the squatter package. Tracked in the
+# follow-up issue linked from PR #306.
+curobo = []
 lerobot = [
     "lerobot[feetech]>=0.5.0,<0.6.0",
     # #378: lerobot 0.5.1's pyav video fallback calls torchvision.io.VideoReader,
