@@ -37,13 +37,31 @@ from strands_robots.policies.curobo import CuroboPolicy
 # ---------------------------------------------------------------------------
 
 
+class _StubKinematics:
+    """Minimal stand-in for cuRobo's ``MotionPlanner.kinematics``.
+
+    ``_build_goal_pose`` resolves the ``GoalToolPose`` tool frame from
+    ``planner.kinematics.tool_frames[0]``. Exposing a single dummy frame here
+    keeps the stub tests hermetic: they exercise the same Cartesian-goal code
+    path whether or not cuRobo is installed (when it is, ``_build_goal_pose``
+    builds a real ``GoalToolPose`` from this frame; when it is not, the raw
+    list is forwarded). Without this, ``_resolve_tool_frames`` raises on any
+    box that actually has cuRobo installed - i.e. every GPU box the policy
+    really runs on.
+    """
+
+    def __init__(self) -> None:
+        self.tool_frames = ["tool0"]
+
+
 class _StubMotionGen:
     """Minimal stand-in for cuRobo's ``MotionGen`` for unit tests.
 
     Records the calls it receives, returns a synthetic trajectory shaped
     like the one cuRobo produces (list-of-lists of floats per waypoint),
     and exposes the optional ``warmup`` / ``reset`` / ``update_world``
-    hooks the policy probes for.
+    hooks the policy probes for, plus a ``kinematics`` surface so the
+    Cartesian-goal path stays hermetic with cuRobo installed.
     """
 
     def __init__(
@@ -63,6 +81,9 @@ class _StubMotionGen:
         self.warmup_called: int = 0
         self.reset_called: int = 0
         self.world_updates: list = []
+        # cuRobo's MotionPlanner exposes .kinematics.tool_frames; mirror it so
+        # _build_goal_pose can resolve a tool frame when cuRobo is installed.
+        self.kinematics = _StubKinematics()
 
     def warmup(self) -> None:
         self.warmup_called += 1
@@ -760,4 +781,100 @@ class TestCuroboPolicyConstructorAliases:
                 motion_gen=_StubMotionGen(),
                 motion_planner_kwargs={"a": 1},
                 motion_gen_kwargs={"a": 1},
+            )
+
+
+# ---------------------------------------------------------------------------
+# cuRobo ``main`` result-shape handling (regression for the live Thor run)
+# ---------------------------------------------------------------------------
+
+
+class _FakeInterpolatedPlan:
+    """Stand-in for cuRobo's ``JointState`` returned by ``get_interpolated_plan``.
+
+    Holds a ``position`` tensor. On the cuRobo ``main`` API this tensor is
+    ``[batch, horizon, T, ndof]`` (e.g. ``[1, 1, 61, 9]`` for Franka), unlike
+    the legacy 2D ``[T, ndof]`` shape the original migration assumed.
+    """
+
+    def __init__(self, position: object) -> None:
+        self.position = position
+
+
+class _NewApiPlanResult:
+    """Result whose only trajectory accessor is ``get_interpolated_plan`` (no
+    ``trajectory`` list attr), forcing the real-cuRobo extraction path."""
+
+    def __init__(self, position: object, success: bool = True) -> None:
+        self.success = success
+        self.status = "SUCCESS"
+        self._plan = _FakeInterpolatedPlan(position)
+
+    def get_interpolated_plan(self) -> _FakeInterpolatedPlan:
+        return self._plan
+
+
+class TestCuroboExtractTrajectoryShape:
+    """Pin ``_extract_trajectory`` against cuRobo ``main``'s 4D position tensor.
+
+    The live Thor run against ``NVlabs/curobo`` ``main`` surfaced that
+    ``get_interpolated_plan().position`` is ``[batch, horizon, T, ndof]`` (4D),
+    not the 2D ``[T, ndof]`` the original migration assumed - the flat
+    ``[T, ndof]`` view must be recovered by collapsing the leading dims.
+    """
+
+    def test_collapses_4d_main_api_position_to_t_by_ndof(self) -> None:
+        torch = pytest.importorskip("torch")
+        ndof, t = 9, 5
+        # [B=1, H=1, T=5, ndof=9] - the canonical Franka ``main`` shape.
+        flat = torch.arange(t * ndof, dtype=torch.float32).reshape(t, ndof)
+        position = flat.reshape(1, 1, t, ndof)
+        result = _NewApiPlanResult(position)
+
+        traj = CuroboPolicy._extract_trajectory(result)
+
+        assert len(traj) == t
+        assert all(len(row) == ndof for row in traj)
+        # Values must match the flat [T, ndof] view exactly.
+        assert traj == flat.tolist()
+
+    def test_passes_through_legacy_2d_position(self) -> None:
+        torch = pytest.importorskip("torch")
+        ndof, t = 6, 4
+        position = torch.arange(t * ndof, dtype=torch.float32).reshape(t, ndof)
+        result = _NewApiPlanResult(position)
+
+        traj = CuroboPolicy._extract_trajectory(result)
+
+        assert len(traj) == t
+        assert all(len(row) == ndof for row in traj)
+        assert traj == position.tolist()
+
+
+class TestCuroboNoneResultRaises:
+    """Pin the ``main``-API None-result failure path.
+
+    cuRobo ``main``'s ``plan_pose`` / ``plan_js`` return ``None`` when no
+    solution is found (e.g. an unreachable goal), rather than a result object
+    with ``success=False`` (the legacy 0.7.x shape). The policy must surface
+    this as a clear ``RuntimeError`` rather than an opaque downstream
+    "missing get_interpolated_plan" error.
+    """
+
+    def test_none_plan_result_raises_runtime_error(self) -> None:
+        # Use a joint-space goal so the test exercises the same None-guard
+        # whether or not cuRobo is installed: ``_build_goal_joint_state`` needs
+        # no ``.kinematics`` (unlike the Cartesian ``_build_goal_pose`` ->
+        # ``GoalToolPose`` path), so this runs on a GPU-less CI box too.
+        class _NonePlanner(_NewApiStubMotionPlanner):
+            def plan_js(self, start_state: object, goal: object) -> None:  # type: ignore[override]
+                self.plan_calls.append(("plan_js", start_state, goal))
+                return None
+
+        policy = CuroboPolicy(motion_gen=_NonePlanner())
+        with pytest.raises(RuntimeError, match="no solution|result is None"):
+            policy.get_actions_sync(
+                observation_dict={"observation.state": [0.0] * 7},
+                instruction="",
+                target_joints={"j0": 0.1, "j1": -0.2, "j2": 99.0},
             )
