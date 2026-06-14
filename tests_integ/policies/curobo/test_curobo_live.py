@@ -75,9 +75,10 @@ pytestmark = [
 from strands_robots.policies import create_policy  # noqa: E402
 from strands_robots.policies.curobo import CuroboPolicy  # noqa: E402
 
-# Default UR5e robot config that ships with cuRobo. Override via
-# ``CUROBO_ROBOT_CONFIG`` for sites that prefer a custom YAML.
-ROBOT_CONFIG = os.environ.get("CUROBO_ROBOT_CONFIG", "ur5e.yml")
+# Default UR10e robot config that ships with cuRobo's ``main`` content tree
+# (``ur5e.yml`` is not packaged there). Both are 6-DOF, so the 6-element home
+# state below stays valid. Override via ``CUROBO_ROBOT_CONFIG`` for a custom YAML.
+ROBOT_CONFIG = os.environ.get("CUROBO_ROBOT_CONFIG", "ur10e.yml")
 ACTION_HORIZON = int(os.environ.get("CUROBO_ACTION_HORIZON", "16"))
 
 
@@ -236,7 +237,9 @@ def test_franka_7dof_reach_to_pose_thor_sanity_check(
     Pinned to the canonical example from the Thor validation report:
 
     * Home: ``[0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]``
-      (Franka neutral configuration, 7 joints).
+      (Franka neutral 7-DOF arm configuration; cuRobo's ``franka.yml``
+      plans the 2 finger joints too, so the planned trajectory rows are
+      9-DOF).
     * Goal: ``[0.5, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0]`` (50 cm in front of
       the base, identity quaternion).
 
@@ -257,8 +260,13 @@ def test_franka_7dof_reach_to_pose_thor_sanity_check(
     assert isinstance(actions, list)
     assert len(actions) > 0, "Franka reach plan must return a non-empty chunk"
     assert len(actions) <= ACTION_HORIZON
-    # Franka has 7 joints - per-step action dicts must reflect that.
+    # cuRobo's ``franka.yml`` plans the full 9-DOF chain (7 arm joints + 2
+    # finger joints), so per-step action dicts reflect 9 joints, not just the
+    # 7 arm DOF. Pin the exact count so a future cuRobo robot-config change
+    # (e.g. dropping the fingers from the planning model) surfaces here.
     for step in actions:
         assert isinstance(step, dict)
-        assert len(step) == 7, f"Franka step should have 7 joints, got {len(step)}: {sorted(step.keys())}"
+        assert len(step) == 9, (
+            f"Franka step should have 9 joints (7 arm + 2 finger), got {len(step)}: {sorted(step.keys())}"
+        )
         assert all(isinstance(v, float) for v in step.values())

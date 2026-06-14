@@ -628,6 +628,18 @@ class CuroboPolicy(Policy):
                 f"CuroboPolicy planning failed: target_pose={target_pose!r}, target_joints={target_joints!r}: {e}"
             ) from e
 
+        # cuRobo's ``main`` API returns ``None`` from ``plan_pose`` / ``plan_js``
+        # when the planner finds no solution (e.g. an unreachable goal), rather
+        # than a result object with ``success=False`` (the legacy 0.7.x shape).
+        # Guard both so an unsolved plan surfaces as a clear RuntimeError instead
+        # of an opaque "missing get_interpolated_plan" error downstream.
+        if result is None:
+            raise RuntimeError(
+                "CuroboPolicy planning failed: planner returned no solution "
+                f"(result is None) for target_pose={target_pose!r}, "
+                f"target_joints={target_joints!r}"
+            )
+
         if not getattr(result, "success", True):
             status = getattr(result, "status", "unknown")
             raise RuntimeError(
@@ -809,8 +821,11 @@ class CuroboPolicy(Policy):
 
         On the cuRobo ``main`` API the result of ``plan_pose`` /
         ``plan_js`` exposes ``get_interpolated_plan()`` returning a
-        :class:`JointState` whose ``position`` is a ``[T, ndof]`` tensor -
-        unchanged in shape from the legacy ``MotionGenResult``.
+        :class:`JointState` whose ``position`` is a
+        ``[batch, horizon, T, ndof]`` tensor. The legacy ``MotionGenResult``
+        exposed a 2D ``[T, ndof]`` tensor; this helper collapses any leading
+        batch / horizon dimensions (taking the first plan) so callers always
+        receive a flat ``[T, ndof]`` list-of-lists regardless of API era.
 
         Stub planners may emit a plain ``list[list[float]]`` directly via
         ``result.trajectory`` to keep the test seam lightweight.
@@ -821,8 +836,10 @@ class CuroboPolicy(Policy):
         if isinstance(traj, list):
             return [[float(v) for v in row] for row in traj]
 
-        # Real cuRobo path: ``get_interpolated_plan().position`` is a
-        # ``[T, ndof]`` torch tensor.
+        # Real cuRobo path: ``get_interpolated_plan().position`` is a torch
+        # tensor. On the ``main`` API its shape is ``[batch, horizon, T, ndof]``
+        # (e.g. ``[1, 1, 61, 9]`` for Franka); the legacy API returned a 2D
+        # ``[T, ndof]`` tensor. Either way we want the final ``[T, ndof]`` view.
         get_plan = getattr(result, "get_interpolated_plan", None)
         if get_plan is None:
             raise RuntimeError(
@@ -832,6 +849,13 @@ class CuroboPolicy(Policy):
             )
         plan = get_plan()
         position = getattr(plan, "position", plan)
+        # Collapse leading batch / horizon dims (take the first plan) down to a
+        # 2D ``[T, ndof]`` tensor. ``ndim`` exists on torch tensors and numpy
+        # arrays; stub objects fall through to the list path below.
+        ndim = getattr(position, "ndim", None)
+        if ndim is not None:
+            while position.ndim > 2:
+                position = position[0]
         # ``position`` is typically ``torch.Tensor``; ``.cpu().tolist()``
         # produces a list-of-lists. Fall back to ``list(...)`` for stub
         # objects.
