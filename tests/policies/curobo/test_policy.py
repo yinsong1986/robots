@@ -591,3 +591,173 @@ class TestPolicyContractParity:
         """reset() is best-effort and must not raise on the default path."""
         p = factory()
         p.reset(seed=0)
+
+
+# ---------------------------------------------------------------------------
+# cuRobo ``main`` API migration regression tests (issue #421)
+# ---------------------------------------------------------------------------
+
+
+class _NewApiStubMotionPlanner(_StubMotionGen):
+    """Stub planner that exposes the **new** cuRobo API surface.
+
+    Mirrors ``MotionPlanner`` on cuRobo ``main``:
+
+    * ``plan_pose(goal, start_state)`` for Cartesian goals
+    * ``plan_js(start_state, goal_js)`` for joint-space goals
+    * ``update_scene(dict)`` for the per-call collision-scene refresh
+
+    The legacy ``plan_single`` / ``plan_single_js`` / ``update_world`` are
+    intentionally **absent** so the policy must route through the new
+    methods. Pin the dispatch order from issue #421's acceptance
+    criteria - any future regression that drops the new-API code path
+    will fail this test.
+    """
+
+    def __init__(self, ndof: int = 7, horizon: int = 60) -> None:
+        super().__init__(ndof=ndof, horizon=horizon)
+
+    # Override to remove the legacy methods. Python does not let you
+    # ``del`` an inherited method cleanly, so we rebind to a sentinel
+    # the policy probes with ``getattr(..., None)``.
+    plan_single = None  # type: ignore[assignment]
+    plan_single_js = None  # type: ignore[assignment]
+    update_world = None  # type: ignore[assignment]
+
+    def plan_pose(self, goal: object, start_state: object) -> _StubMotionGenResult:
+        self.plan_calls.append(("plan_pose", start_state, goal))
+        return _StubMotionGenResult(
+            ndof=self.ndof,
+            horizon=self.horizon,
+            success=self.success,
+            status=self.status,
+        )
+
+    def plan_js(self, start_state: object, goal: object) -> _StubMotionGenResult:
+        self.plan_calls.append(("plan_js", start_state, goal))
+        return _StubMotionGenResult(
+            ndof=self.ndof,
+            horizon=self.horizon,
+            success=self.success,
+            status=self.status,
+        )
+
+    def update_scene(self, scene_model: object) -> None:
+        self.world_updates.append(scene_model)
+
+
+class TestCuroboMainApiDispatch:
+    """Pin the new-API dispatch path so a future refactor cannot silently
+    fall back to the legacy ``plan_single`` shim.
+
+    Acceptance criteria from issue #421:
+
+      * ``MotionGen.plan_single(start, goal_pose)`` ->
+        ``MotionPlanner.plan_pose(GoalToolPose, JointState)``
+      * Joint-space goals route through ``plan_js`` (was
+        ``plan_single_js``).
+      * ``world_update`` flows through ``update_scene`` (was
+        ``update_world``).
+    """
+
+    def test_target_pose_routes_to_plan_pose(self) -> None:
+        stub = _NewApiStubMotionPlanner(ndof=7, horizon=8)
+        p = CuroboPolicy(motion_gen=stub, action_horizon=4)
+        asyncio.run(
+            p.get_actions(
+                {"observation.state": [0.0] * 7},
+                "",
+                target_pose=[0.5, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
+            )
+        )
+        assert len(stub.plan_calls) == 1
+        # New API: plan_pose is preferred over plan_single. The stub
+        # has plan_single = None so a regression would raise
+        # AttributeError - the assertion below pins the routing intent.
+        assert stub.plan_calls[0][0] == "plan_pose"
+
+    def test_target_joints_routes_to_plan_js(self) -> None:
+        stub = _NewApiStubMotionPlanner(ndof=7, horizon=8)
+        p = CuroboPolicy(motion_gen=stub, action_horizon=4)
+        asyncio.run(
+            p.get_actions(
+                {"observation.state": [0.0] * 7},
+                "",
+                target_joints={"j0": 0.1, "j1": -0.2, "j2": 0.3},
+            )
+        )
+        assert len(stub.plan_calls) == 1
+        # plan_js (new API) preferred over plan_single_js (legacy stub).
+        assert stub.plan_calls[0][0] == "plan_js"
+
+    def test_world_update_routes_to_update_scene(self) -> None:
+        stub = _NewApiStubMotionPlanner(ndof=7, horizon=4)
+        p = CuroboPolicy(motion_gen=stub, action_horizon=4)
+        scene = {"cuboid": {"obstacle1": {"dims": [0.1, 0.1, 0.1]}}}
+        asyncio.run(
+            p.get_actions(
+                {"observation.state": [0.0] * 7},
+                "",
+                target_pose=[0.5, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
+                world_update=scene,
+            )
+        )
+        # update_scene (new API) preferred over update_world (legacy).
+        # Stub forwards the raw dict for record-and-assert simplicity.
+        assert stub.world_updates == [scene]
+
+
+class TestCuroboPolicyConstructorAliases:
+    """Pin the constructor's backwards-compatible aliases.
+
+    The cuRobo ``main`` API renamed ``TensorDeviceType`` ->
+    ``DeviceCfg`` and ``MotionGenConfig`` -> ``MotionPlannerCfg``. Code
+    written against the 0.7.x kwargs (``tensor_args=``,
+    ``motion_gen_kwargs=``) must keep working without modification, but
+    the new canonical names (``device_cfg=``, ``motion_planner_kwargs=``)
+    should be the documented form.
+    """
+
+    def test_legacy_tensor_args_kwarg_accepted(self) -> None:
+        """``tensor_args=`` is still accepted as a legacy alias for
+        ``device_cfg=`` so 0.7.x call sites keep working through the
+        migration."""
+        # We can't actually exercise the cuRobo build path without
+        # importing curobo; the easy regression test is that the kwarg
+        # doesn't crash in the constructor when a stub is injected
+        # (the alias is parsed before the build path runs).
+        p = CuroboPolicy(motion_gen=_StubMotionGen(), tensor_args="cuda:0")
+        assert p.action_horizon == 16
+
+    def test_legacy_motion_gen_kwargs_alias_accepted(self) -> None:
+        p = CuroboPolicy(
+            motion_gen=_StubMotionGen(),
+            motion_gen_kwargs={"interpolation_dt": 0.02},
+        )
+        # The legacy alias must reach the same internal slot the
+        # canonical kwarg does.
+        assert p._motion_planner_kwargs == {"interpolation_dt": 0.02}
+
+    def test_canonical_motion_planner_kwargs_accepted(self) -> None:
+        p = CuroboPolicy(
+            motion_gen=_StubMotionGen(),
+            motion_planner_kwargs={"use_cuda_graph": False},
+        )
+        assert p._motion_planner_kwargs == {"use_cuda_graph": False}
+
+    def test_supplying_both_aliases_raises(self) -> None:
+        """Passing the legacy alias and the canonical kwarg together is
+        almost always a stale-callsite bug. Reject loudly rather than
+        applying a silent precedence rule."""
+        with pytest.raises(ValueError, match="device_cfg|tensor_args"):
+            CuroboPolicy(
+                motion_gen=_StubMotionGen(),
+                device_cfg="cuda:0",
+                tensor_args="cuda:0",
+            )
+        with pytest.raises(ValueError, match="motion_planner_kwargs|motion_gen_kwargs"):
+            CuroboPolicy(
+                motion_gen=_StubMotionGen(),
+                motion_planner_kwargs={"a": 1},
+                motion_gen_kwargs={"a": 1},
+            )

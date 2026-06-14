@@ -2,13 +2,28 @@
 
 The policy reads a goal from the well-known ``**kwargs`` keys defined in
 issue #300 (``target_pose``, ``target_joints``, ``world_update``), forwards
-the request to a :class:`MotionGen` instance running in the same process,
-caches the resulting collision-free trajectory, and yields
+the request to a :class:`MotionPlanner` instance running in the same
+process, caches the resulting collision-free trajectory, and yields
 ``action_horizon``-sized chunks per ``get_actions`` call so the 50Hz
 execution loop in :class:`~strands_robots.robot.Robot` can stream per-step
 joint targets without re-planning.
 
-Construction mirrors the other non-VLA providers — no service mode, since
+The on-device cuRobo APIs were restructured between the ``0.7.x`` series
+and the current ``main`` branch (issue #421). This module targets the
+restructured ``main`` API:
+
+* ``curobo.motion_planner.MotionPlanner`` (was ``curobo.wrap.reacher.motion_gen.MotionGen``)
+* ``curobo.motion_planner.MotionPlannerCfg`` (was ``MotionGenConfig``)
+* ``curobo.types.DeviceCfg`` (was ``curobo.types.base.TensorDeviceType``)
+* ``curobo.types.JointState`` (was ``curobo.types.state.JointState``)
+* ``curobo.types.Pose`` + ``curobo.types.GoalToolPose`` (planning now needs the latter)
+
+The legacy ``WorldConfig`` is gone; the collision scene flows through
+``MotionPlannerCfg.create(scene_model=...)`` at config-build time, and
+per-call refreshes go through ``MotionPlanner.update_scene`` (or the
+legacy ``update_world`` shim for stub planners in unit tests).
+
+Construction mirrors the other non-VLA providers - no service mode, since
 cuRobo is a CUDA library rather than a sidecar:
 
 .. code-block:: python
@@ -17,18 +32,18 @@ cuRobo is a CUDA library rather than a sidecar:
 
     policy = create_policy(
         "curobo",                                  # alias: "cumotion"
-        robot_config="ur5e.yml",
-        world_config={"cuboid": {...}},
+        robot_config="franka.yml",
+        world_config={"cuboid": {...}},            # fed to scene_model
         action_horizon=16,
     )
 
     actions = policy.get_actions_sync(
-        observation_dict={"observation.state": [0.0] * 6},
+        observation_dict={"observation.state": [0.0] * 7},
         instruction="reach for the red block",     # ignored by planners
-        target_pose=[0.4, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
+        target_pose=[0.5, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
     )
 
-The ``nvidia-curobo`` package on PyPI is an unrelated v0.1 squatter — the
+The ``nvidia-curobo`` package on PyPI is an unrelated v0.1 squatter - the
 real cuRobo is published only as source on GitHub. Users opt in by
 installing it from source before constructing this policy::
 
@@ -39,6 +54,12 @@ The ``[curobo]`` extra in ``pyproject.toml`` is intentionally empty until
 cuRobo publishes a real PyPI wheel. The policy module raises a clear
 :class:`ImportError` (via :func:`require_optional`) on construction when
 the ``curobo`` Python package is missing.
+
+Stub seam: unit tests inject a fake planner via the ``motion_gen=`` kwarg
+to avoid touching CUDA. The dispatch in :meth:`_plan_and_cache` prefers the
+new ``plan_pose`` / ``plan_js`` entry points when the planner exposes
+them, but falls back to the legacy ``plan_single`` / ``plan_single_js``
+names so the stub-based test path keeps working without GPU.
 """
 
 from __future__ import annotations
@@ -69,49 +90,57 @@ _MAX_TRAJECTORY_WAYPOINTS = 100_000
 
 
 class CuroboPolicy(Policy):
-    """In-process cuRobo ``MotionGen`` wrapper.
+    """In-process cuRobo ``MotionPlanner`` wrapper.
 
-    The policy is intentionally thin — all motion-planning state lives in
-    the :class:`MotionGen` instance owned by this object. Because cuRobo
-    runs on a CUDA device, this policy is **not** thread-safe across
+    The policy is intentionally thin - all motion-planning state lives in
+    the :class:`MotionPlanner` instance owned by this object. Because
+    cuRobo runs on a CUDA device, this policy is **not** thread-safe across
     processes; callers that want fan-out should construct one
     ``CuroboPolicy`` per worker.
 
     Args:
         robot_config: Path to (or in-memory dict of) the cuRobo robot
             description YAML. cuRobo ships configs for many arms under
-            ``curobo/content/configs/robot/``; for example ``"ur5e.yml"``
-            or ``"franka.yml"``. May also be a pre-loaded dict (skips
-            disk I/O — useful for tests and embedded deployments).
-        world_config: Initial collision world. cuRobo accepts a dict with
-            ``"cuboid"`` / ``"mesh"`` / ``"sphere"`` / ``"capsule"`` keys
-            whose values are mappings from name to geometry params; or a
-            pre-built ``WorldConfig`` instance, or ``None`` for free-space
-            planning. Per-call overrides flow through the ``world_update``
-            kwarg on :meth:`get_actions`.
+            ``curobo/content/configs/robot/``; for example ``"franka.yml"``
+            or ``"ur5e.yml"``. May also be a pre-loaded dict (skips
+            disk I/O - useful for tests and embedded deployments).
+        world_config: Initial collision scene. Forwarded as the
+            ``scene_model=`` kwarg to ``MotionPlannerCfg.create``. cuRobo
+            accepts a dict with ``"cuboid"`` / ``"mesh"`` / ``"sphere"`` /
+            ``"capsule"`` keys whose values are mappings from name to
+            geometry params, or ``None`` for free-space planning.
+            Per-call overrides flow through the ``world_update`` kwarg on
+            :meth:`get_actions` and are forwarded to
+            ``MotionPlanner.update_scene``.
         action_horizon: Number of waypoints to yield per call to
             :meth:`get_actions`. Matches the chunked-action contract used
             by the 50Hz execution loop in :class:`~strands_robots.robot.Robot`.
-            Default 16 — same as :class:`~strands_robots.policies.groot.policy.Gr00tPolicy`'s
+            Default 16 - same as :class:`~strands_robots.policies.groot.policy.Gr00tPolicy`'s
             inner-loop horizon.
-        tensor_args: Optional cuRobo ``TensorDeviceType`` controlling the
-            device (e.g. ``"cuda:0"``) and dtype. When omitted, cuRobo's
-            default (``cuda:0``, ``fp32``) is used. Passing a string
-            (``"cuda:0"`` / ``"cpu"``) is also accepted; it is converted
-            internally.
-        motion_gen_kwargs: Optional extra kwargs forwarded to
-            :meth:`MotionGenConfig.load_from_robot_config` — e.g.
-            ``{"interpolation_dt": 0.02, "num_trajopt_seeds": 12}``.
+        device_cfg: Optional cuRobo ``DeviceCfg`` controlling the device
+            (e.g. ``torch.device('cuda:0')``) and dtype. When omitted, a
+            ``DeviceCfg`` is constructed for ``cuda:0`` if CUDA is
+            available, else ``cpu``. Passing a string (``"cuda:0"`` /
+            ``"cpu"``) is also accepted; it is converted internally.
+            Accepted under the legacy alias ``tensor_args=`` for
+            backwards compatibility with code written against the
+            ``0.7.x`` API; both kwargs map to the same parameter.
+        motion_planner_kwargs: Optional extra kwargs forwarded to
+            ``MotionPlannerCfg.create`` - e.g.
+            ``{"interpolation_dt": 0.02, "use_cuda_graph": False}``.
             Reserved for advanced tuning; defaults are sensible.
-        motion_gen: Pre-built :class:`MotionGen` instance. When supplied,
-            the policy skips its own ``MotionGenConfig.load_from_robot_config``
-            + ``MotionGen(...)`` construction. This is the seam unit tests
-            use to inject a stub planner without a CUDA device. Production
-            callers should leave this ``None`` and pass ``robot_config``.
-        warmup: When ``True`` (default), call ``MotionGen.warmup()`` after
-            construction so the first ``get_actions`` call is not paying
-            JIT-compile cost. Set ``False`` only for tests where warmup
-            is expensive or undesirable.
+            Accepted under the legacy alias ``motion_gen_kwargs=``.
+        motion_gen: Pre-built ``MotionPlanner`` instance (kwarg name kept
+            for backwards-compatibility with the ``0.7.x`` test-seam
+            contract). When supplied, the policy skips its own
+            ``MotionPlannerCfg.create`` + ``MotionPlanner(...)``
+            construction. This is the seam unit tests use to inject a
+            stub planner without a CUDA device. Production callers should
+            leave this ``None`` and pass ``robot_config``.
+        warmup: When ``True`` (default), call ``MotionPlanner.warmup()``
+            after construction so the first ``get_actions`` call is not
+            paying JIT-compile cost. Set ``False`` only for tests where
+            warmup is expensive or undesirable.
         **kwargs: Forward-compatibility absorber for the smart-string
             resolution path. Per the #300 contract, providers MUST ignore
             unknown kwargs rather than raising.
@@ -128,7 +157,7 @@ class CuroboPolicy(Policy):
             from strands_robots.policies.curobo import CuroboPolicy
 
             policy = CuroboPolicy(
-                robot_config="ur5e.yml",
+                robot_config="franka.yml",
                 action_horizon=16,
             )
 
@@ -136,15 +165,15 @@ class CuroboPolicy(Policy):
 
             from strands_robots.policies import create_policy
 
-            policy = create_policy("curobo", robot_config="ur5e.yml")
-            policy = create_policy("cumotion", robot_config="ur5e.yml")  # alias
+            policy = create_policy("curobo", robot_config="franka.yml")
+            policy = create_policy("cumotion", robot_config="franka.yml")  # alias
 
         Per-call goal::
 
             actions = policy.get_actions_sync(
-                observation_dict={"observation.state": [0.0] * 6},
+                observation_dict={"observation.state": [0.0] * 7},
                 instruction="",                               # unused
-                target_pose=[0.4, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
+                target_pose=[0.5, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
             )
     """
 
@@ -153,19 +182,39 @@ class CuroboPolicy(Policy):
         robot_config: str | dict[str, Any] | None = None,
         world_config: dict[str, Any] | None = None,
         action_horizon: int = 16,
-        tensor_args: Any = None,
-        motion_gen_kwargs: dict[str, Any] | None = None,
+        device_cfg: Any = None,
+        motion_planner_kwargs: dict[str, Any] | None = None,
         motion_gen: Any = None,
         warmup: bool = True,
+        # Legacy aliases preserved from the 0.7.x API surface so callers
+        # that pass ``tensor_args=`` / ``motion_gen_kwargs=`` keep working
+        # through the migration. Only one of each pair may be supplied.
+        tensor_args: Any = None,
+        motion_gen_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         if action_horizon < 1:
             raise ValueError(f"action_horizon must be >= 1, got {action_horizon}")
 
+        # Reconcile the legacy aliases. Supplying both forms is an error
+        # rather than a silent precedence rule - the user almost certainly
+        # has a typo or a stale call site.
+        if device_cfg is not None and tensor_args is not None:
+            raise ValueError(
+                "CuroboPolicy: pass exactly one of device_cfg= (preferred) or the legacy alias tensor_args=, not both."
+            )
+        if motion_planner_kwargs is not None and motion_gen_kwargs is not None:
+            raise ValueError(
+                "CuroboPolicy: pass exactly one of motion_planner_kwargs= "
+                "(preferred) or the legacy alias motion_gen_kwargs=, not both."
+            )
+        resolved_device_cfg = device_cfg if device_cfg is not None else tensor_args
+        resolved_planner_kwargs = motion_planner_kwargs if motion_planner_kwargs is not None else motion_gen_kwargs
+
         self.robot_config = robot_config
         self.world_config = world_config
         self.action_horizon = int(action_horizon)
-        self._motion_gen_kwargs = dict(motion_gen_kwargs or {})
+        self._motion_planner_kwargs = dict(resolved_planner_kwargs or {})
 
         # State for trajectory chunking: cache the full plan, yield
         # ``action_horizon`` rows per call until exhausted, then re-plan
@@ -177,20 +226,23 @@ class CuroboPolicy(Policy):
         # When the caller supplies a pre-built ``motion_gen`` (e.g. from
         # tests), use it directly. Otherwise build one from the cuRobo
         # APIs. The lazy import lives behind ``require_optional`` so the
-        # error message points at the ``[curobo]`` extra cleanly.
+        # error message points at the ``[curobo]`` extra cleanly. The
+        # constructor kwarg keeps the ``motion_gen=`` name for
+        # backwards-compatibility; internally we store it as
+        # ``self._motion_planner`` to match the new cuRobo type name.
         if motion_gen is not None:
-            self._motion_gen = motion_gen
+            self._motion_planner = motion_gen
         else:
             if robot_config is None:
                 raise ValueError(
                     "CuroboPolicy requires either ``robot_config`` (path or dict) "
                     "or a pre-built ``motion_gen`` instance. Pass robot_config="
-                    "'ur5e.yml' to load one of the cuRobo built-in configs."
+                    "'franka.yml' to load one of the cuRobo built-in configs."
                 )
-            self._motion_gen = self._build_motion_gen(
+            self._motion_planner = self._build_motion_gen(
                 robot_config=robot_config,
                 world_config=world_config,
-                tensor_args=tensor_args,
+                device_cfg=resolved_device_cfg,
             )
             if warmup:
                 self._safe_warmup()
@@ -243,12 +295,12 @@ class CuroboPolicy(Policy):
     def reset(self, seed: int | None = None) -> None:
         """Drop the cached trajectory and reset cuRobo's per-episode state.
 
-        cuRobo's ``MotionGen.reset()`` clears any seed / partial-plan
+        cuRobo's ``MotionPlanner.reset()`` clears any seed / partial-plan
         state held by the planner. The ``seed`` argument is not forwarded
         to cuRobo (its trajopt RNG is configured at construction time);
         it is accepted for API parity with the rest of the non-VLA family.
 
-        Best-effort — any failure (planner doesn't expose ``reset``,
+        Best-effort - any failure (planner doesn't expose ``reset``,
         endpoint raises) is logged and swallowed. Eval correctness is
         preserved even when reset is a no-op (the next ``get_actions``
         call re-plans from the current observation).
@@ -258,18 +310,18 @@ class CuroboPolicy(Policy):
         self._cached_trajectory = []
         self._cached_cursor = 0
 
-        # Forward to ``MotionGen.reset`` if available. Older / stub
+        # Forward to ``MotionPlanner.reset`` if available. Older / stub
         # planners may not expose it; that's fine.
-        reset_fn = getattr(self._motion_gen, "reset", None)
+        reset_fn = getattr(self._motion_planner, "reset", None)
         if reset_fn is None:
-            logger.debug("CuroboPolicy.reset: motion_gen has no reset(); cleared cache only")
+            logger.debug("CuroboPolicy.reset: motion_planner has no reset(); cleared cache only")
             return
         try:
             reset_fn()
-            logger.debug("CuroboPolicy.reset: forwarded to motion_gen (seed=%r)", seed)
+            logger.debug("CuroboPolicy.reset: forwarded to motion_planner (seed=%r)", seed)
         except Exception as e:  # noqa: BLE001 - reset is best-effort
             logger.info(
-                "CuroboPolicy.reset: motion_gen.reset() raised (seed=%r): %s; "
+                "CuroboPolicy.reset: motion_planner.reset() raised (seed=%r): %s; "
                 "continuing without per-episode planner-side reset",
                 seed,
                 e,
@@ -288,11 +340,13 @@ class CuroboPolicy(Policy):
 
         1. Reads the goal from ``**kwargs`` (or, as a fallback for
            LLM-driven workflows, parses it out of ``instruction``).
-        2. Optionally refreshes the cuRobo collision world via
-           ``world_update``.
+        2. Optionally refreshes the cuRobo collision scene via
+           ``world_update`` (forwarded to ``MotionPlanner.update_scene``,
+           or the legacy ``update_world`` shim for stub planners).
         3. Builds a :class:`JointState` start configuration from
            ``observation_dict["observation.state"]``.
-        4. Calls ``MotionGen.plan_single`` and unpacks the interpolated
+        4. Calls ``MotionPlanner.plan_pose`` (Cartesian goals) or
+           ``plan_js`` (joint-space goals) and unpacks the interpolated
            plan into a list of joint-target rows.
         5. Caches the full trajectory.
 
@@ -385,14 +439,26 @@ class CuroboPolicy(Policy):
         self,
         robot_config: str | dict[str, Any],
         world_config: dict[str, Any] | None,
-        tensor_args: Any,
+        device_cfg: Any,
     ) -> Any:
-        """Construct a :class:`MotionGen` instance from the cuRobo APIs.
+        """Construct a ``MotionPlanner`` instance from the cuRobo APIs.
+
+        Targets cuRobo's restructured ``main`` API (issue #421):
+
+        * ``curobo.types.DeviceCfg`` (was ``TensorDeviceType``)
+        * ``curobo.motion_planner.MotionPlannerCfg`` (was ``MotionGenConfig``)
+        * ``curobo.motion_planner.MotionPlanner`` (was ``MotionGen``)
+        * The collision scene flows through ``MotionPlannerCfg.create(scene_model=...)``;
+          there is no longer a standalone ``WorldConfig``.
 
         Lives in its own method so the constructor seam stays clean and
         unit tests can override ``__init__`` paths without touching this
         path. Importing cuRobo is gated by :func:`require_optional` so
         the ``[curobo]`` extra is the actionable error.
+
+        The method name ``_build_motion_gen`` is preserved for parity
+        with the legacy 0.7.x test fixtures and external monkeypatches;
+        the returned object is now a ``MotionPlanner``.
         """
         require_optional(
             "curobo",
@@ -405,50 +471,74 @@ class CuroboPolicy(Policy):
             purpose="CuroboPolicy motion planning",
         )
         # Import lazily so module load doesn't pay the CUDA-init cost
-        # for users who never construct a CuroboPolicy.
-        from curobo.geom.types import WorldConfig  # type: ignore[import-not-found]
-        from curobo.types.base import TensorDeviceType  # type: ignore[import-not-found]
-        from curobo.wrap.reacher.motion_gen import (  # type: ignore[import-not-found]
-            MotionGen,
-            MotionGenConfig,
+        # for users who never construct a CuroboPolicy. The ``main``
+        # cuRobo API exposes the high-level types directly under
+        # ``curobo.types`` and ``curobo.motion_planner``.
+        import torch  # type: ignore[import-not-found]
+        from curobo.motion_planner import (  # type: ignore[import-not-found]
+            MotionPlanner,
+            MotionPlannerCfg,
         )
+        from curobo.types import DeviceCfg  # type: ignore[import-not-found]
 
-        # Resolve tensor_args. Accept None / str / TensorDeviceType.
-        resolved_tensor_args: Any
-        if tensor_args is None:
-            resolved_tensor_args = TensorDeviceType()
-        elif isinstance(tensor_args, str):
-            resolved_tensor_args = TensorDeviceType(device=tensor_args)
-        else:
-            resolved_tensor_args = tensor_args
+        resolved_device_cfg = self._resolve_device_cfg(device_cfg, DeviceCfg, torch)
 
-        # Resolve world_config. Accept None / dict / WorldConfig.
-        resolved_world: Any
-        if world_config is None:
-            resolved_world = WorldConfig()
-        elif isinstance(world_config, dict):
-            resolved_world = WorldConfig.from_dict(world_config)
-        else:
-            resolved_world = world_config
+        # ``world_config`` is forwarded as-is to ``scene_model=`` so a
+        # ``MotionPlannerCfg`` can resolve the collision geometry. cuRobo
+        # accepts the same dict shape it used to accept on
+        # ``WorldConfig.from_dict`` (cuboid / mesh / sphere / capsule
+        # mappings), so existing callers that built a dict for the
+        # 0.7.x API continue to work without modification.
+        scene_model = world_config
 
-        cfg = MotionGenConfig.load_from_robot_config(
-            robot_config,
-            resolved_world,
-            tensor_args=resolved_tensor_args,
-            **self._motion_gen_kwargs,
-        )
-        return MotionGen(cfg)
+        # Build kwargs for ``MotionPlannerCfg.create``. ``robot=`` is the
+        # canonical kwarg name on the ``main`` API; ``scene_model=`` is
+        # only forwarded when the caller supplied one to keep the call
+        # signature minimal for the free-space case.
+        cfg_kwargs: dict[str, Any] = {
+            "robot": robot_config,
+            "device_cfg": resolved_device_cfg,
+        }
+        if scene_model is not None:
+            cfg_kwargs["scene_model"] = scene_model
+        cfg_kwargs.update(self._motion_planner_kwargs)
+
+        cfg = MotionPlannerCfg.create(**cfg_kwargs)
+        return MotionPlanner(cfg)
+
+    @staticmethod
+    def _resolve_device_cfg(device_cfg: Any, DeviceCfg: Any, torch: Any) -> Any:
+        """Coerce a user-supplied device-config kwarg into a cuRobo ``DeviceCfg``.
+
+        Accepts ``None`` (defaults to cuda:0 if available else cpu), a
+        string ``"cuda:0"`` / ``"cpu"`` / ``"cuda"``, a
+        ``torch.device`` instance, or a pre-built ``DeviceCfg``. The last
+        case is detected duck-typed so we don't import ``DeviceCfg`` at
+        the policy module top.
+        """
+        if device_cfg is None:
+            default_device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+            return DeviceCfg(device=default_device)
+        if isinstance(device_cfg, str):
+            return DeviceCfg(device=torch.device(device_cfg))
+        if isinstance(device_cfg, torch.device):
+            return DeviceCfg(device=device_cfg)
+        # Either a pre-built DeviceCfg or a legacy TensorDeviceType
+        # the user is forwarding from older code. Pass through unchanged
+        # and let the planner raise if the type is genuinely wrong - the
+        # error message from cuRobo is clearer than anything we'd add.
+        return device_cfg
 
     def _safe_warmup(self) -> None:
-        """Call :meth:`MotionGen.warmup` if available; log on failure."""
-        warmup_fn = getattr(self._motion_gen, "warmup", None)
+        """Call :meth:`MotionPlanner.warmup` if available; log on failure."""
+        warmup_fn = getattr(self._motion_planner, "warmup", None)
         if warmup_fn is None:
             return
         try:
             warmup_fn()
         except Exception as e:  # noqa: BLE001 - warmup is best-effort
             logger.warning(
-                "CuroboPolicy: motion_gen.warmup() raised (%s); first get_actions call will pay JIT-compile cost",
+                "CuroboPolicy: motion_planner.warmup() raised (%s); first get_actions call will pay JIT-compile cost",
                 e,
             )
 
@@ -475,12 +565,25 @@ class CuroboPolicy(Policy):
         target_joints: dict[str, float] | None,
         world_update: dict[str, Any] | None,
     ) -> None:
-        """Build the cuRobo request, call ``plan_single``, cache the result.
+        """Build the cuRobo request, dispatch the plan call, cache the result.
 
         Imports cuRobo types lazily so the smoke tests that inject a stub
-        ``motion_gen`` never touch the cuRobo package at all.
+        planner via ``motion_gen=`` never touch the cuRobo package at all.
+
+        Dispatch order for Cartesian goals:
+
+        1. New API: ``MotionPlanner.plan_pose(GoalToolPose, JointState)``
+        2. Legacy / stub API: ``plan_single(JointState, Pose)``
+
+        Dispatch order for joint-space goals:
+
+        1. New API: ``MotionPlanner.plan_js(JointState, JointState)``
+           (or any other goal-aware joint-space entry point cuRobo
+           lands; we probe ``plan_js`` first, then ``plan_single_js``,
+           then ``plan_single`` as a last resort).
+        2. Legacy / stub API: ``plan_single_js(JointState, JointState)``.
         """
-        # Refresh the collision world if requested.
+        # Refresh the collision scene if requested.
         if world_update is not None:
             self._apply_world_update(world_update)
 
@@ -489,24 +592,35 @@ class CuroboPolicy(Policy):
         # path stays small.
         start_state = self._build_start_state(joint_state)
 
-        # Build the goal. cuRobo's ``plan_single`` takes a Pose for
-        # Cartesian goals and a JointState for joint-space goals via
-        # ``plan_single_js``. We dispatch on which one was supplied.
         try:
             if target_pose is not None:
                 goal = self._build_goal_pose(target_pose)
-                result = self._motion_gen.plan_single(start_state, goal)
+                # New API: ``plan_pose(goal, start)`` with the goal
+                # built as a ``GoalToolPose`` (5D tensor shape). The
+                # legacy ``plan_single(start, goal)`` accepts a flat
+                # ``Pose`` and is kept as a fallback so the stub seam
+                # in unit tests (``_StubMotionGen.plan_single``) keeps
+                # working without any GPU.
+                plan_pose_fn = getattr(self._motion_planner, "plan_pose", None)
+                if plan_pose_fn is not None:
+                    result = plan_pose_fn(goal, start_state)
+                else:
+                    result = self._motion_planner.plan_single(start_state, goal)
             else:
                 # target_joints is non-None here (validated upstream).
                 goal_js = self._build_goal_joint_state(target_joints or {})
-                # ``plan_single_js`` is the cuRobo joint-space planner;
-                # fall back to ``plan_single`` if a stub planner only
-                # exposes the latter (covers test paths cleanly).
-                plan_js = getattr(self._motion_gen, "plan_single_js", None)
-                if plan_js is None:
-                    result = self._motion_gen.plan_single(start_state, goal_js)
+                # New API: ``plan_js`` is the joint-space planner;
+                # legacy / stub API is ``plan_single_js``. Both take
+                # ``(start_state, goal_js)``. Fall back to
+                # ``plan_single`` only if neither joint-space entry
+                # point is exposed.
+                plan_js_fn = getattr(self._motion_planner, "plan_js", None) or getattr(
+                    self._motion_planner, "plan_single_js", None
+                )
+                if plan_js_fn is not None:
+                    result = plan_js_fn(start_state, goal_js)
                 else:
-                    result = plan_js(start_state, goal_js)
+                    result = self._motion_planner.plan_single(start_state, goal_js)
         except Exception as e:
             # Re-raise as RuntimeError with goal context so the runner
             # gets a clear message instead of an opaque cuRobo trace.
@@ -532,32 +646,38 @@ class CuroboPolicy(Policy):
         self._cached_cursor = 0
 
     def _apply_world_update(self, world_update: dict[str, Any]) -> None:
-        """Forward a per-call collision-world refresh to cuRobo.
+        """Forward a per-call collision-scene refresh to cuRobo.
 
-        cuRobo exposes ``MotionGen.update_world(WorldConfig)``; we accept
-        a plain dict so callers don't have to import cuRobo types.
+        On the cuRobo ``main`` API the scene is owned by the
+        ``MotionPlannerCfg`` and refreshed via
+        ``MotionPlanner.update_scene(dict)``. We probe ``update_scene``
+        first (new API), then ``update_world`` (legacy + stub seam) so a
+        stub planner that only exposes ``update_world`` keeps working in
+        unit tests.
+
+        The callee gets the raw dict so test stubs can record it
+        directly. Real cuRobo accepts the same dict shape it used to
+        accept on ``WorldConfig.from_dict``.
         """
-        update_world = getattr(self._motion_gen, "update_world", None)
-        if update_world is None:
+        update_fn = getattr(self._motion_planner, "update_scene", None) or getattr(
+            self._motion_planner, "update_world", None
+        )
+        if update_fn is None:
             logger.warning(
-                "CuroboPolicy: motion_gen has no update_world(); world_update=%r ignored",
+                "CuroboPolicy: motion_planner exposes neither update_scene() "
+                "nor update_world(); world_update=%r ignored",
                 sorted(world_update.keys()) if isinstance(world_update, dict) else world_update,
             )
             return
-        # Lazy import - same pattern as ``_build_motion_gen``. Guarded so
-        # the stub-injection test path doesn't import cuRobo at all.
-        try:
-            from curobo.geom.types import WorldConfig  # type: ignore[import-not-found]
-
-            new_world = WorldConfig.from_dict(world_update)
-        except ImportError:
-            # Stub injection path: pass the raw dict through and let the
-            # stub interpret it.
-            new_world = world_update  # type: ignore[assignment]
-        update_world(new_world)
+        update_fn(world_update)
 
     def _build_start_state(self, joint_state: list[float] | None) -> Any:
-        """Build a cuRobo :class:`JointState` from a Python list."""
+        """Build a cuRobo :class:`JointState` from a Python list.
+
+        Targets the ``main`` API: ``curobo.types.JointState`` (was
+        ``curobo.types.state.JointState``) and ``curobo.types.DeviceCfg``
+        (was ``curobo.types.base.TensorDeviceType``).
+        """
         if joint_state is None:
             # Without a start state, defer to whatever the planner has
             # configured (its retract config, typically). Stub planners
@@ -565,58 +685,132 @@ class CuroboPolicy(Policy):
             return None
         try:
             import torch  # type: ignore[import-not-found]
-            from curobo.types.base import TensorDeviceType  # type: ignore[import-not-found]
-            from curobo.types.state import JointState  # type: ignore[import-not-found]
+            from curobo.types import DeviceCfg, JointState  # type: ignore[import-not-found]
         except ImportError:
             # Stub-injection path: pass the raw list through. The stub
             # planner is responsible for interpreting it.
             return joint_state
 
-        tensor_args = TensorDeviceType()
-        position = torch.tensor(joint_state, **vars(tensor_args)).unsqueeze(0)
+        device, dtype = self._planner_tensor_kwargs(DeviceCfg, torch)
+        position = torch.tensor(joint_state, device=device, dtype=dtype).unsqueeze(0)
         return JointState.from_position(position)
 
     def _build_goal_pose(self, target_pose: list[float]) -> Any:
-        """Build a cuRobo :class:`Pose` from ``[x, y, z, qw, qx, qy, qz]``."""
+        """Build a cuRobo ``GoalToolPose`` from ``[x, y, z, qw, qx, qy, qz]``.
+
+        The ``main`` API requires a 5D tensor shape ``[B, H, L, G, 3]``
+        (Batch / Horizon / Links / Goalset / 3) for the position and
+        ``[B, H, L, G, 4]`` for the quaternion, plus an explicit
+        ``tool_frames`` list. We resolve the tool frame from
+        ``self._motion_planner.kinematics.tool_frames[0]`` (the canonical
+        Thor-validated path); callers that need a non-default tool frame
+        can override by setting ``self._motion_planner.kinematics.tool_frames``
+        before constructing the policy.
+
+        The stub seam (no cuRobo installed) returns the raw list so unit
+        tests can introspect what was forwarded without importing cuRobo.
+        """
         try:
             import torch  # type: ignore[import-not-found]
-            from curobo.types.base import TensorDeviceType  # type: ignore[import-not-found]
-            from curobo.types.math import Pose  # type: ignore[import-not-found]
+            from curobo.types import DeviceCfg, GoalToolPose  # type: ignore[import-not-found]
         except ImportError:
             # Stub path - pass the raw list through.
             return target_pose
 
-        tensor_args = TensorDeviceType()
-        pos = torch.tensor(target_pose[0:3], **vars(tensor_args)).unsqueeze(0)
-        quat = torch.tensor(target_pose[3:7], **vars(tensor_args)).unsqueeze(0)
-        return Pose(position=pos, quaternion=quat)
+        device, dtype = self._planner_tensor_kwargs(DeviceCfg, torch)
+
+        # 5D shape: [B=1, H=1, L=1, G=1, 3] for position and 4 for quaternion.
+        # The single batch / horizon / link / goalset entry corresponds to
+        # the canonical "single-arm reach to one Cartesian goal" use case
+        # this policy targets. Goal-set / batched planning is a separate
+        # follow-up (out-of-scope per issue #421).
+        pos = torch.tensor(target_pose[0:3], device=device, dtype=dtype).reshape(1, 1, 1, 1, 3)
+        quat = torch.tensor(target_pose[3:7], device=device, dtype=dtype).reshape(1, 1, 1, 1, 4)
+
+        tool_frames = self._resolve_tool_frames()
+        return GoalToolPose(
+            tool_frames=tool_frames,
+            position=pos,
+            quaternion=quat,
+        )
+
+    def _resolve_tool_frames(self) -> list[Any]:
+        """Resolve the ``tool_frames`` argument for ``GoalToolPose``.
+
+        cuRobo's ``MotionPlanner`` exposes ``planner.kinematics.tool_frames``
+        on the ``main`` API. We pick the first entry by default - this
+        matches the Thor-validated example for single-arm reach. Sites
+        that need a non-default tool frame can mutate
+        ``self._motion_planner.kinematics.tool_frames`` before
+        constructing the policy.
+        """
+        kin = getattr(self._motion_planner, "kinematics", None)
+        if kin is None:
+            raise RuntimeError(
+                "CuroboPolicy: motion_planner has no .kinematics attribute; "
+                "cannot resolve tool_frames for GoalToolPose. This is expected "
+                "only for stub planners that bypass _build_goal_pose entirely."
+            )
+        tool_frames = getattr(kin, "tool_frames", None)
+        if not tool_frames:
+            raise RuntimeError(
+                "CuroboPolicy: motion_planner.kinematics.tool_frames is empty; "
+                "cannot construct GoalToolPose. Ensure the robot YAML defines "
+                "at least one tool frame."
+            )
+        return [tool_frames[0]]
 
     def _build_goal_joint_state(self, target_joints: dict[str, float]) -> Any:
-        """Build a cuRobo :class:`JointState` from a name->value dict."""
+        """Build a cuRobo :class:`JointState` from a name->value dict.
+
+        Targets the ``main`` API: ``curobo.types.JointState`` and
+        ``curobo.types.DeviceCfg`` import paths.
+        """
         try:
             import torch  # type: ignore[import-not-found]
-            from curobo.types.base import TensorDeviceType  # type: ignore[import-not-found]
-            from curobo.types.state import JointState  # type: ignore[import-not-found]
+            from curobo.types import DeviceCfg, JointState  # type: ignore[import-not-found]
         except ImportError:
             return target_joints
 
-        tensor_args = TensorDeviceType()
+        device, dtype = self._planner_tensor_kwargs(DeviceCfg, torch)
         # Order keys deterministically. If ``set_robot_state_keys`` was
         # called we honour that order; otherwise sorted for stability.
         if self._robot_state_keys and set(target_joints).issubset(set(self._robot_state_keys)):
             keys = [k for k in self._robot_state_keys if k in target_joints]
         else:
             keys = sorted(target_joints.keys())
-        position = torch.tensor([target_joints[k] for k in keys], **vars(tensor_args)).unsqueeze(0)
+        position = torch.tensor([target_joints[k] for k in keys], device=device, dtype=dtype).unsqueeze(0)
         return JointState.from_position(position, joint_names=keys)
+
+    def _planner_tensor_kwargs(self, DeviceCfg: Any, torch: Any) -> tuple[Any, Any]:
+        """Resolve ``(device, dtype)`` for tensor construction.
+
+        Reads them off the planner's stored ``DeviceCfg`` (the canonical
+        location on the ``main`` API). Falls back to a fresh
+        ``DeviceCfg()`` default when the planner doesn't expose one
+        (e.g. a future API rename or an unusual stub).
+        """
+        # Prefer the planner's resolved device_cfg so tensors land on
+        # the same device the planner is bound to.
+        dc = (
+            getattr(self._motion_planner, "device_cfg", None)
+            or getattr(self._motion_planner, "tensor_args", None)
+            or DeviceCfg(device=torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu"))
+        )
+        device = getattr(dc, "device", None)
+        dtype = getattr(dc, "dtype", None) or torch.float32
+        if device is None:
+            device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        return device, dtype
 
     @staticmethod
     def _extract_trajectory(result: Any) -> list[list[float]]:
-        """Pull the joint-position trajectory out of a cuRobo ``MotionGenResult``.
+        """Pull the joint-position trajectory out of a cuRobo plan result.
 
-        The canonical way to read the trajectory off a ``MotionGenResult``
-        is ``result.get_interpolated_plan()`` which returns a
-        :class:`JointState` whose ``position`` is a ``[T, ndof]`` tensor.
+        On the cuRobo ``main`` API the result of ``plan_pose`` /
+        ``plan_js`` exposes ``get_interpolated_plan()`` returning a
+        :class:`JointState` whose ``position`` is a ``[T, ndof]`` tensor -
+        unchanged in shape from the legacy ``MotionGenResult``.
 
         Stub planners may emit a plain ``list[list[float]]`` directly via
         ``result.trajectory`` to keep the test seam lightweight.
@@ -632,7 +826,7 @@ class CuroboPolicy(Policy):
         get_plan = getattr(result, "get_interpolated_plan", None)
         if get_plan is None:
             raise RuntimeError(
-                "CuroboPolicy: motion_gen result is missing both "
+                "CuroboPolicy: planner result is missing both "
                 "``trajectory`` (stub path) and ``get_interpolated_plan`` "
                 "(real path); cannot extract waypoints"
             )

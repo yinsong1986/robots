@@ -1,22 +1,43 @@
 """Integration test for :class:`CuroboPolicy` against the live cuRobo planner.
 
+Targets cuRobo's restructured ``main`` API (issue #421):
+
+* ``curobo.motion_planner.MotionPlanner`` / ``MotionPlannerCfg``
+* ``curobo.types.DeviceCfg`` / ``JointState`` / ``GoalToolPose``
+
 Gated behind both the ``curobo`` pytest marker AND a CUDA-capable GPU
 detection. Enable with:
 
 .. code-block:: bash
 
+    # cuRobo from source - PyPI doesn't host the real package
+    git clone https://github.com/NVlabs/curobo.git
+    pip install -e ./curobo
     pip install 'strands-robots[curobo]'
-    hatch run test-integ tests_integ/policies/curobo/ -m curobo -v
 
-A pre-installed cuRobo + a CUDA-capable GPU are required. The test
-plans a UR5e reach to a target pose, asserts the trajectory is non-empty
-and collision-free (``result.success``), and checks the chunked-action
-yield matches the ``action_horizon``.
+    CUROBO_LIVE=1 hatch run test-integ tests_integ/policies/curobo/ -m curobo -v
 
-Acceptance criteria from issue #301:
+A pre-installed cuRobo + a CUDA-capable GPU are required. The test suite
+covers:
 
-  > Integration test in ``tests_integ/policies/curobo/`` that plans a
-  > UR5e reach to a target pose, asserts collision-free, executes in sim.
+1. UR5e Cartesian reach to a target pose - asserts the trajectory is
+   non-empty and the chunked-action yield matches ``action_horizon``.
+2. Drain-the-cache contract - repeated calls yield the cached
+   trajectory ``action_horizon`` rows at a time without re-planning.
+3. Unreachable-pose error path - ``success=False`` surfaces as a
+   ``RuntimeError`` rather than silent zero actions.
+4. Franka-7DOF reach-to-pose sanity check (the canonical Thor
+   validation example, transcribed from the report linked off issue
+   #421). Pinned to the validated working example so a future cuRobo
+   ``main`` shift surfaces here first.
+
+The cuRobo ``main`` API surface is still moving. Sites running these
+tests against a fresh ``NVlabs/curobo`` checkout should pin to a known
+commit (set ``CUROBO_COMMIT_SHA`` in the test docstring as the
+canonical pin) until upstream cuts a stable release. As of this issue
+filing the canonical pin is ``main`` HEAD; update this comment with
+the SHA once the integration suite is wired up to a CI runner with a
+sm_110 / Blackwell board.
 """
 
 from __future__ import annotations
@@ -67,7 +88,7 @@ def policy() -> CuroboPolicy:
         "curobo",
         robot_config=ROBOT_CONFIG,
         action_horizon=ACTION_HORIZON,
-        # Keep warmup ON in the live test — the first ``plan_single``
+        # Keep warmup ON in the live test - the first ``plan_pose``
         # would otherwise pay a multi-second JIT cost that the chunked
         # action assertions below would mistake for a timeout.
         warmup=True,
@@ -132,7 +153,7 @@ def test_chunked_yield_drains_full_trajectory(policy: CuroboPolicy) -> None:
 
     yielded = 0
     chunks = 0
-    for _ in range(50):  # generous upper bound — typical traj is ~100 waypoints.
+    for _ in range(50):  # generous upper bound - typical traj is ~100 waypoints.
         actions = policy.get_actions_sync(
             observation_dict={"observation.state": home_state},
             instruction="",
@@ -162,3 +183,82 @@ def test_failed_plan_raises_runtime_error(policy: CuroboPolicy) -> None:
             instruction="",
             target_pose=[0.0, 0.0, 99.0, 1.0, 0.0, 0.0, 0.0],
         )
+
+
+# ---------------------------------------------------------------------------
+# Franka-7DOF Thor sanity check (issue #421 acceptance criterion 4)
+# ---------------------------------------------------------------------------
+
+
+# Override-only Franka config; fixture is module-scoped to share warmup
+# cost with the other tests.
+FRANKA_ROBOT_CONFIG = os.environ.get("CUROBO_FRANKA_ROBOT_CONFIG", "franka.yml")
+
+
+@pytest.fixture(scope="module")
+def franka_policy() -> CuroboPolicy:
+    """Build a Franka-7DOF :class:`CuroboPolicy` and warm it up once.
+
+    Mirrors the canonical Thor validation example transcribed from
+    issue #421's linked report:
+
+    .. code-block:: python
+
+        from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
+        from curobo.types import DeviceCfg, JointState, GoalToolPose
+
+        cfg = MotionPlannerCfg.create(
+            robot='franka.yml',
+            device_cfg=DeviceCfg(device=torch.device('cuda:0')),
+            use_cuda_graph=False,
+        )
+        planner = MotionPlanner(cfg)
+    """
+    p = create_policy(
+        "curobo",
+        robot_config=FRANKA_ROBOT_CONFIG,
+        action_horizon=ACTION_HORIZON,
+        # The Thor validation example pins ``use_cuda_graph=False`` for
+        # the first-bring-up case to avoid graph-capture surprises on
+        # sm_110 / CUDA 13. Forwarded via ``motion_planner_kwargs``.
+        motion_planner_kwargs={"use_cuda_graph": False},
+        warmup=True,
+    )
+    assert isinstance(p, CuroboPolicy)
+    return p
+
+
+def test_franka_7dof_reach_to_pose_thor_sanity_check(
+    franka_policy: CuroboPolicy,
+) -> None:
+    """Franka-7DOF reach-to-pose sanity check (Thor validation acceptance).
+
+    Pinned to the canonical example from the Thor validation report:
+
+    * Home: ``[0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]``
+      (Franka neutral configuration, 7 joints).
+    * Goal: ``[0.5, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0]`` (50 cm in front of
+      the base, identity quaternion).
+
+    The Thor report observed a 60-waypoint collision-free trajectory in
+    under 2 s after warmup. We assert success + non-empty trajectory
+    here; the exact waypoint count is not pinned because cuRobo's
+    interpolation density is configurable.
+    """
+    home_state = [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]
+    target_pose = [0.5, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0]
+
+    actions = franka_policy.get_actions_sync(
+        observation_dict={"observation.state": home_state},
+        instruction="franka thor sanity reach",
+        target_pose=target_pose,
+    )
+
+    assert isinstance(actions, list)
+    assert len(actions) > 0, "Franka reach plan must return a non-empty chunk"
+    assert len(actions) <= ACTION_HORIZON
+    # Franka has 7 joints - per-step action dicts must reflect that.
+    for step in actions:
+        assert isinstance(step, dict)
+        assert len(step) == 7, f"Franka step should have 7 joints, got {len(step)}: {sorted(step.keys())}"
+        assert all(isinstance(v, float) for v in step.values())

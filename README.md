@@ -500,8 +500,8 @@ tracked on the [Strands Labs - Robots project board](https://github.com/orgs/str
 #### `CuroboPolicy` (in-process collision-aware planning, GPU)
 
 [`CuroboPolicy`](./strands_robots/policies/curobo/policy.py) wraps NVIDIA's
-[cuRobo](https://curobo.org/) `MotionGen` planner. Unlike sidecar-style
-providers, cuRobo runs **in the same process** as a CUDA library — there is
+[cuRobo](https://curobo.org/) `MotionPlanner`. Unlike sidecar-style
+providers, cuRobo runs **in the same process** as a CUDA library - there is
 no network round-trip, but a CUDA-capable GPU is required.
 
 > **Install note**: cuRobo is **not** published on PyPI (the
@@ -516,22 +516,24 @@ no network round-trip, but a CUDA-capable GPU is required.
 >                                        # publishes a real PyPI wheel
 > ```
 >
-> The on-device cuRobo APIs are still evolving; this policy currently
-> targets the `0.7.x` API surface. See the follow-up tracking issue
-> linked from PR #306 for the migration to cuRobo's restructured
-> `MotionPlanner` API on `main`.
+> This policy targets cuRobo's restructured `main` API (issue #421):
+> `MotionPlanner` / `MotionPlannerCfg` / `DeviceCfg` / `JointState` /
+> `GoalToolPose`. The on-device cuRobo APIs are still moving on `main`
+> until upstream cuts a stable release; if you hit a fresh API shift
+> pin to a known-good commit (or open an issue against this repo with
+> the cuRobo SHA you tested).
 
 ```python
 from strands_robots.policies import create_policy
 
 policy = create_policy(
-    "curobo",                    # alias: "cumotion"
-    robot_config="ur5e.yml",     # any cuRobo built-in YAML, or a dict
+    "curobo",                      # alias: "cumotion"
+    robot_config="franka.yml",     # any cuRobo built-in YAML, or a dict
     action_horizon=16,
 )
 
 actions = policy.get_actions_sync(
-    observation_dict={"observation.state": [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]},
+    observation_dict={"observation.state": [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]},
     instruction="reach for the red block",   # ignored by planners
     target_pose=[0.5, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
 )
@@ -542,7 +544,8 @@ subsequent call yields up to `action_horizon` waypoints from the cache so
 the 50Hz execution loop in `Robot` can stream per-step joint targets without
 re-planning. Pass `replan=True` (or call `policy.reset()`) to force a fresh
 plan when the world has updated mid-rollout. `world_update` is forwarded to
-`MotionGen.update_world` for per-call collision-world refresh.
+`MotionPlanner.update_scene` (or the legacy `update_world` shim) for
+per-call collision-scene refresh.
 
 The LLM-agent demo path (`Robot.start_task(..., policy_provider="curobo",
 target_pose=[...])`) flows the same `target_pose` / `target_joints` kwargs
