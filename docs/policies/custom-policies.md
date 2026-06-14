@@ -69,6 +69,6 @@ The factory imports lazily on first use.
 ## See also
 
 - [Policy overview](overview.md) - factory, providers.
-- [Architecture](../architecture.md)
+- [cuRobo](curobo.md) - reference non-VLA goal-kwargs planner.
 - [Architecture](../architecture.md)
 - `strands_robots/policies/mock.py` - minimal reference implementation.

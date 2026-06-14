@@ -82,4 +82,5 @@ gr00t_inference(action="lifecycle", lifecycle="teardown",
 - [Real hardware](../hardware/robot-control.md)
 - [LeRobot Local](lerobot-local.md)
 - [Cosmos 3](cosmos3.md)
+- [cuRobo](curobo.md)
 - [Isaac-GR00T project](https://github.com/NVIDIA/Isaac-GR00T)
