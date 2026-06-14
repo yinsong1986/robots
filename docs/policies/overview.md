@@ -1,5 +1,5 @@
 ---
-description: The Policy ABC and the providers that ship - MockPolicy, Gr00tPolicy, LerobotLocalPolicy, Cosmos3Policy, CuroboPolicy.
+description: The Policy ABC and the providers that ship - MockPolicy, Gr00tPolicy, LerobotLocalPolicy, Cosmos3Policy, CuroboPolicy, MoveIt2Policy.
 ---
 
 # Policy providers
@@ -24,6 +24,7 @@ policy = create_policy("cosmos3", embodiment="droid", port=8000)
 | `lerobot_local` | `LerobotLocalPolicy` | `lerobot` | HF LeRobot in-process (ACT, Pi0, SmolVLA, …) |
 | `cosmos3` | `Cosmos3Policy` | `cosmos3-service` | NVIDIA Cosmos 3 VLA over WebSocket |
 | `curobo` | `CuroboPolicy` | `curobo` | NVIDIA cuRobo collision-aware planning, in-process CUDA |
+| `moveit2` | `MoveIt2Policy` | `moveit2` | MoveIt2 motion planning over a ROS 2 sidecar (ZMQ), no in-venv ROS 2 deps |
 
 ## Policy ABC
 
@@ -78,4 +79,5 @@ sim.run_policy(robot_name="so100", instruction="pick up the cube",
 - [LeRobot Local](lerobot-local.md) - in-process HF models, RTC.
 - [Cosmos 3](cosmos3.md) - NVIDIA Cosmos 3 omnimodal VLA.
 - [cuRobo](curobo.md) - in-process collision-aware motion planning (non-VLA, GPU).
+- [MoveIt2](moveit2.md) - ROS 2 sidecar collision-aware planning (non-VLA, no in-venv ROS 2).
 - [Custom policies](custom-policies.md) - implement the ABC.

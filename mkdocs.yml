@@ -33,6 +33,7 @@ nav:
   - GR00T: policies/groot.md
   - Cosmos 3: policies/cosmos3.md
   - cuRobo: policies/curobo.md
+  - MoveIt2: policies/moveit2.md
   - LeRobot Local: policies/lerobot-local.md
   - Custom Policies: policies/custom-policies.md
 - Real Hardware:

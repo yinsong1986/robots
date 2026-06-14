@@ -126,6 +126,7 @@ providers.
 ## See also
 
 - [Policy overview](overview.md)
+- [MoveIt2](moveit2.md) - ROS 2 sidecar collision-aware planning (non-VLA).
 - [GR00T](groot.md) - ZMQ service VLA.
 - [Cosmos 3](cosmos3.md) - WebSocket VLA.
 - [LeRobot Local](lerobot-local.md) - in-process HF models.
