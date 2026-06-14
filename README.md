@@ -105,6 +105,7 @@ extras you need:
 | `sim-mujoco` | MuJoCo, robot_descriptions, imageio | Simulation (recommended starting point) |
 | `lerobot` | LeRobot | Real hardware, local VLA inference, dataset recording |
 | `groot-service` | pyzmq, msgpack | NVIDIA GR00T inference client |
+| `curobo` | _(empty; install cuRobo from source)_ | In-process collision-aware motion planning (CUDA GPU) |
 | `mesh` | eclipse-zenoh, json5 | Peer-to-peer robot mesh |
 | `mesh-iot` | awsiotsdk, awscrt, boto3 | AWS IoT Core mesh transport for fleets |
 | `device-connect` | device-connect-edge, device-connect-agent-tools | Device-aware networking - discovery, RPC, events, safety (falls back to the built-in mesh if absent) |
