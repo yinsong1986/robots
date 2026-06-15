@@ -97,6 +97,46 @@ def main() -> int:
         observation_mapping=obs_mapping,
     )
 
+    # --- backend="diffusers" variant (in-process, no policy server) ---------
+    # Instead of the WebSocket service above, Cosmos 3 can run in-process via
+    # native Hugging Face diffusers (the Cosmos3OmniPipeline; one forward pass
+    # returns the world video + sound + action chunk). The predicted world video
+    # is surfaced on policy.last_rollout after each get_actions call. NOTE: the
+    # diffusers backend emits the model's RAW unified action (DROID = 9D
+    # end-effector pose + 1D gripper), not joint positions - use the service
+    # backend above when you need joint commands for the MuJoCo arm. Install:
+    #   uv pip install "strands-robots[cosmos3-diffusers]" \
+    #       'diffusers @ git+https://github.com/huggingface/diffusers'
+    #
+    # policy = Cosmos3Policy(
+    #     embodiment="droid",
+    #     backend="diffusers",
+    #     model="nvidia/Cosmos3-Nano",   # HF repo id or local path
+    #     observation_mapping=obs_mapping,
+    # )
+    # ... after policy.get_actions_sync(...):  world = policy.last_rollout["video"]
+    #
+    # To actually drive the MuJoCo arm from the diffusers backend, the raw
+    # [-1, 1] unified action must be de-normalized + IK'd to joint targets
+    # (the cosmos3-sim extra: mink + mujoco). See docs/policies/cosmos3.md
+    # "Closing the sim loop":
+    #
+    #   import mujoco, numpy as np
+    #   from robot_descriptions import panda_mj_description
+    #   from strands_robots.policies.cosmos3 import (
+    #       MinkIKBridge, decode_cosmos_chunk_to_targets,
+    #   )
+    #   from strands_robots.policies.cosmos3.embodiments import get_embodiment
+    #
+    #   raw_chunk = policy.last_rollout["action"]            # [T, 10] raw [-1,1]
+    #   model = mujoco.MjModel.from_xml_path(panda_mj_description.MJCF_PATH)
+    #   bridge = MinkIKBridge(model, ee_frame_name="hand", ee_frame_type="body")
+    #   q0 = np.zeros(model.nq); q0[:7] = [0, -0.3, 0, -2.2, 0, 2.0, 0.79]
+    #   out = decode_cosmos_chunk_to_targets(raw_chunk, get_embodiment("droid"), bridge, q0)
+    #   out["qpos"]            # [T, nq] joint targets for MuJoCo
+    #   out["tracking_error"]  # {"mean_mm", "max_mm"}  (~11.5 / 42.8 mm on Thor)
+    # ------------------------------------------------------------------------
+
     video = None
     if args.record:
         video = {"path": args.record, "camera": "front", "fps": int(args.control_frequency)}

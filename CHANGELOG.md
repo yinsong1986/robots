@@ -3,6 +3,84 @@
 All notable behavioural changes to `strands-robots` are logged here. Follows
 [Keep a Changelog](https://keepachangelog.com/) conventions.
 
+## Unreleased - Cosmos 3 in-process diffusers backend
+
+### Added: `Cosmos3Policy(backend="diffusers")`
+
+Cosmos3Policy gains a second backend that runs Cosmos 3 **in-process** via the
+optional native Hugging Face `diffusers` stack (the `Cosmos3OmniPipeline`),
+alongside the existing WebSocket `service` backend (the default, unchanged).
+
+- `backend="service"` (default) - WebSocket to the Cosmos Framework RoboLab
+  policy server. Zero behavioural change; all existing service output is
+  byte-identical.
+- `backend="diffusers"` - in-process load via native Hugging Face `diffusers`
+  (the upstream `Cosmos3OmniPipeline` driven by a `CosmosActionCondition`). One
+  forward pass returns the predicted world video + sound + the robot action
+  chunk. The action chunk is returned through the unchanged Policy ABC contract
+  (`get_actions -> list[dict]`, reusing the shared `_unpack_actions`); the world
+  video/sound are surfaced on the new `Cosmos3Policy.last_rollout` attribute
+  (a non-breaking auxiliary channel - the ABC return type is not changed). The
+  diffusers backend emits the model's raw unified action (DROID = 9D
+  end-effector pose + 1D gripper), named by the embodiment `raw_action_layout`,
+  rather than the service server's post-processed `joint_pos` (8D) layout.
+- Three Cosmos physics `mode`s thread through the diffusers backend: `policy`
+  (default), `forward_dynamics`, `inverse_dynamics`. These do not exist in
+  service mode - a non-`policy` mode under `backend="service"` raises a clear
+  unsupported error (no silent no-op).
+- Native `diffusers` (+ torch + transformers) is an optional dependency,
+  imported lazily inside the diffusers backend. When missing it raises an
+  actionable install error (the `cosmos3-diffusers` extra + the
+  diffusers-from-source pin that ships `Cosmos3OmniPipeline`). The extra composes
+  with `numpy>=2`, so it is co-installable with `cosmos3-service` and `lerobot`.
+- New `[cosmos3-diffusers]` extra in `pyproject.toml`; NOTICE attributes
+  Hugging Face diffusers (Apache-2.0).
+- GPU load path hardening (surfaces only on a real `from_pretrained` + run, not
+  the mocked unit tests): `Cosmos3OmniPipeline.__init__` builds a
+  `CosmosSafetyChecker` that hard-raises `ImportError: cosmos_guardrail is not
+  installed` unless the heavy optional `cosmos_guardrail` extra is present, so
+  the backend now passes `enable_safety_checker=False` to `from_pretrained` by
+  default (new `enable_safety_checker` arg opts back in when `cosmos_guardrail`
+  is installed). Cosmos runs in `bfloat16`, so the output action tensor is
+  `bfloat16` (or `float16`), which `np.asarray` cannot read
+  (`TypeError: Got unsupported ScalarType BFloat16`); `_to_numpy` now up-casts
+  half precision to `float32` before handing the chunk to NumPy.
+
+### Added: Cosmos 3 -> MuJoCo sim-loop bridge (de-normalize + inverse kinematics)
+
+The diffusers backend returns the model's raw unified action **quantile-
+normalized to `[-1, 1]`** and encoding a *relative end-effector pose delta* per
+step - **not joint radians**. Feeding it straight into MuJoCo joint actuators is
+physically meaningless (normalized columns land arbitrarily inside/outside real
+joint limits; MuJoCo silently clamps and the arm does not track). A new sim-loop
+bridge (`cosmos3-sim` extra: `mink` + `mujoco`) closes the loop in three honest
+geometric steps, applied *after* Cosmos (the Cosmos "modes" are world-model
+conditioning, not kinematics):
+
+- **De-normalize** (`action_decode.denormalize_quantile`) - inverts the quantile
+  transform with per-embodiment `q01`/`q99` stats bundled under
+  `policies/cosmos3/stats/` (`0.5 * (a + 1) * (q99 - q01) + q01`, mirroring
+  `cosmos_framework`'s `denormalize_action(method="quantile")`). New
+  `Cosmos3Embodiment.normalization` field (`"quantile"`).
+- **Decode poses** (`action_decode.decode_pose_trajectory`) - integrates the
+  per-step `[translation(3), rot6d(6)]` deltas into an absolute `(T+1, 4, 4)`
+  SE3 trajectory anchored at the robot's current EE pose.
+- **Inverse kinematics** (`sim_ik.MinkIKBridge`) - solves each Cartesian target
+  to joint angles via `mink` differential IK on the same `mujoco.MjModel`
+  (`FrameTask` + `PostureTask`, warm-started). Defaults to the `daqp` QP solver
+  that `mink` ships via `qpsolvers[daqp]`, so the `cosmos3-sim` extra needs no
+  extra solver dependency. `decode_cosmos_chunk_to_targets` composes all three
+  into `{qpos, gripper, poses, tracking_error}`.
+- Verified on Thor against real `nvidia/Cosmos3-Nano` weights: a reachable EE
+  trajectory tracks to **mean ~= 11.5 mm / max ~= 42.8 mm**, pinned by the
+  `tests/policies/cosmos3/test_sim_ik.py` regression (off-GPU, synthetic-but-
+  reachable) plus a GPU integration test exercising the path off real Cosmos
+  output.
+- New `[cosmos3-sim]` extra (`mink` + `mujoco`); `mink` added to the dev env.
+  numpy>=2 compatible (co-installable with `cosmos3-diffusers` /
+  `cosmos3-service` / `sim-mujoco` / `lerobot`). NOTICE attributes `mink` and
+  MuJoCo (Apache-2.0) and the cosmos_framework-derived quantile stats.
+
 ## Unreleased - serial_tool ASCII output
 
 ### Fixed: emojis in ``serial_tool`` result strings
