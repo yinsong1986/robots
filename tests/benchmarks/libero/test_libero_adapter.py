@@ -3297,16 +3297,53 @@ class TestInstallActionController:
             f"(round-23 bug) - check that sim_shim.data._data is hot-patched."
         )
 
-    def test_install_failure_logs_warning_and_continues(self, caplog):
-        """When OSC install fails (e.g. missing site, missing actuators),
-        ``_install_action_controller`` logs WARNING and returns without
-        raising. Eval continues with action no-op (round-22 behaviour).
+    def test_install_failure_raises_in_strict_mode(self, monkeypatch):
+        """#522: When OSC install fails for a fixable, deps-present reason
+        (a non-degrade ``_ControllerInstallError`` - e.g. the controller
+        was constructed but post-construction state restore failed, or the
+        numba/coverage clash) and ``strict_action_controller=True`` (the
+        default), ``_install_action_controller`` RAISES instead of silently
+        dropping every GR00T action.
 
-        Pin against silent install failure regression: previously a
-        bug (round 23's MjSim signature mismatch) caused the install
-        to silently fail and the user wasn't aware - actions became
-        no-ops at WARNING level so users can detect the install
-        failure in logs."""
+        Before #522, the install logged a single WARNING and returned, so
+        a broken setup scored ``success_rate=0`` indistinguishably from a
+        bad policy on a green run. Now the failure is surfaced: the raise
+        propagates out of ``on_episode_start`` and
+        ``PolicyRunner._evaluate_with_spec`` converts it into a structured
+        ``{"status": "error", ...}`` dict."""
+        from strands_robots.benchmarks.libero.adapter import (
+            _ControllerInstallError,
+            _LiberoOSCController,
+        )
+
+        pytest.importorskip("mujoco")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+        )
+        sim = FakeSim(data_config="panda")
+
+        def _boom(*_args, **_kwargs):
+            raise _ControllerInstallError("failed to restore qpos after controller construction")
+
+        monkeypatch.setattr(_LiberoOSCController, "from_sim", staticmethod(_boom))
+
+        with pytest.raises(_ControllerInstallError):
+            adapter._install_action_controller(sim)
+
+        # Failure recorded for tagging, no controller installed.
+        assert adapter._action_controller_error is not None
+        assert "action_controller" not in sim._world._backend_state
+
+    def test_missing_optional_dep_degrades_even_in_strict_mode(self, caplog):
+        """#522: A degrade condition (no compiled MuJoCo model/data on a
+        stub sim, robosuite/mujoco unavailable, or a scene that isn't a
+        controller-compatible Panda) degrades gracefully even in strict
+        mode - requiring robosuite / a full Panda scene here would break
+        unrelated lifecycle paths and installs without the optional extras.
+        The failure is still recorded on ``_action_controller_error``."""
         import logging
 
         pytest.importorskip("mujoco")
@@ -3317,7 +3354,41 @@ class TestInstallActionController:
             auto_generate_scene=False,
         )
         sim = FakeSim(data_config="panda")
-        # No model - install will fail at the world.model check.
+        # No compiled model -> _ControllerDependencyMissing -> degrade.
+
+        with caplog.at_level(logging.WARNING, logger="strands_robots.benchmarks.libero.adapter"):
+            adapter._install_action_controller(sim)  # must NOT raise
+
+        assert adapter._action_controller_error is not None
+        assert "action_controller" not in sim._world._backend_state
+
+    def test_install_failure_logs_warning_and_continues_non_strict(self, caplog, monkeypatch):
+        """#522: With ``strict_action_controller=False``, a deps-present
+        OSC install failure logs WARNING, records
+        ``_action_controller_error``, and returns without raising - the
+        pre-#522 best-effort behaviour, kept as an opt-out for callers
+        that want to run with actions no-op'd."""
+        import logging
+
+        from strands_robots.benchmarks.libero.adapter import (
+            _ControllerInstallError,
+            _LiberoOSCController,
+        )
+
+        pytest.importorskip("mujoco")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+            strict_action_controller=False,
+        )
+        sim = FakeSim(data_config="panda")
+
+        def _boom(*_args, **_kwargs):
+            raise _ControllerInstallError("failed to restore qpos after controller construction")
+
+        monkeypatch.setattr(_LiberoOSCController, "from_sim", staticmethod(_boom))
 
         with caplog.at_level(logging.WARNING, logger="strands_robots.benchmarks.libero.adapter"):
             adapter._install_action_controller(sim)
@@ -3325,8 +3396,67 @@ class TestInstallActionController:
         # Look for the warning about install failure.
         warned = any("_install_action_controller" in r.message and "no-op" in r.message for r in caplog.records)
         assert warned, f"expected WARNING about install failure; got: {[r.message for r in caplog.records]}"
+        # Failure recorded for tagging.
+        assert adapter._action_controller_error is not None
         # No controller installed.
         assert "action_controller" not in sim._world._backend_state
+
+    def test_install_dependency_clash_always_raises(self, monkeypatch):
+        """#522: A dependency-clash failure (ImportError / AttributeError
+        from the import chain, e.g. the numba/coverage>=7 incompatibility)
+        is ALWAYS re-raised with a remediation hint, even in non-strict
+        mode - it is fixable environment breakage, not a legitimate "no
+        controller needed" condition."""
+        from strands_robots.benchmarks.libero.adapter import (
+            _ControllerInstallError,
+            _LiberoOSCController,
+        )
+
+        pytest.importorskip("mujoco")
+        adapter = LiberoAdapter.from_text(
+            PICK_CUBE_BDDL,
+            scene_path="/some/scene.xml",
+            install_cameras=False,
+            auto_generate_scene=False,
+            strict_action_controller=False,  # non-strict; clash still fatal
+        )
+        sim = FakeSim(data_config="panda")
+
+        def _boom(*_args, **_kwargs):
+            raise AttributeError("module 'coverage.types' has no attribute 'Tracer'")
+
+        monkeypatch.setattr(_LiberoOSCController, "from_sim", staticmethod(_boom))
+
+        with pytest.raises(_ControllerInstallError) as excinfo:
+            adapter._install_action_controller(sim)
+
+        # Remediation hint names the numba/coverage clash.
+        assert "numba" in str(excinfo.value)
+        assert "coverage" in str(excinfo.value)
+        assert adapter._action_controller_error is not None
+        assert "action_controller" not in sim._world._backend_state
+
+    def test_is_numba_coverage_clash_detection(self):
+        """#522: ``_is_numba_coverage_clash`` recognises the coverage>=7
+        signature both directly and through the exception chain (the
+        AttributeError is often re-wrapped by an ImportError upstream)."""
+        from strands_robots.benchmarks.libero.adapter import _is_numba_coverage_clash
+
+        direct = AttributeError("module 'coverage.types' has no attribute 'Tracer'")
+        assert _is_numba_coverage_clash(direct)
+
+        # Chained: ImportError raised "from" the AttributeError.
+        try:
+            try:
+                raise AttributeError("module 'coverage.types' has no attribute 'Tracer'")
+            except AttributeError as inner:
+                raise ImportError("cannot import name 'NumbaTracer'") from inner
+        except ImportError as chained:
+            assert _is_numba_coverage_clash(chained)
+
+        # Unrelated errors are not misclassified.
+        assert not _is_numba_coverage_clash(ImportError("No module named 'robosuite'"))
+        assert not _is_numba_coverage_clash(AttributeError("module 'cv2.gapi.wip.draw' has no attribute 'Text'"))
 
     def test_apply_handles_list_shaped_gripper_value(self, libero_scene_xml):
         """GR00T-LIBERO outputs ``action.gripper`` as a 2-element list

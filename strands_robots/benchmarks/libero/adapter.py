@@ -157,6 +157,7 @@ class LiberoAdapter(BenchmarkProtocol):
         scene_robot_prefix: str = "robot0_",
         scene_gripper_prefix: str = "gripper0_",
         init_states: np.ndarray | None = None,
+        strict_action_controller: bool = True,
         bddl_source: str | None = None,
         bddl_path: str | None = None,
     ):
@@ -347,6 +348,25 @@ class LiberoAdapter(BenchmarkProtocol):
                 ``qpos=0`` (the joint-default "stretched flat" pose)
                 instead of the canonical "ready" pose GR00T-LIBERO
                 expects, which alone drives ``success_rate=0`` (#168 bug I).
+            strict_action_controller: When ``True`` (default), a failure
+                to install the OSC_POSE action controller in
+                :meth:`_install_action_controller` raises instead of
+                logging a WARNING and silently dropping every GR00T
+                action. ``PolicyRunner._evaluate_with_spec`` catches the
+                exception from ``on_episode_start`` and returns a
+                structured ``{"status": "error", ...}`` dict, so a broken
+                *setup* (e.g. the ``numba`` / ``coverage>=7`` import clash,
+                missing robosuite, missing site/actuator IDs) is no longer
+                indistinguishable from a bad *policy* scoring
+                ``success_rate=0`` on a green run (#522). Set to ``False``
+                to restore the pre-#522 best-effort behaviour (log + run
+                with actions no-op'd); the failure is still recorded on
+                :attr:`action_controller_error` so callers/CI can tag the
+                result. Dependency-clash failures (``ImportError`` /
+                ``AttributeError`` from the import chain) are ALWAYS
+                surfaced with a remediation hint regardless of this flag,
+                because they are fixable environment-level breakage rather
+                than a legitimate "no controller needed" case.
             bddl_source: Original BDDL text - stored on the adapter so
                 the scene generator can pass it back to ``libero`` (which
                 only accepts a *file* path). Set automatically by
@@ -480,6 +500,16 @@ class LiberoAdapter(BenchmarkProtocol):
         self._bddl_path = bddl_path
         self._success_fn: Callable[[SimEngine], bool] = compile_goal(problem.goal)
 
+        # #522 - surface OSC action-controller install failures instead
+        # of silently dropping every GR00T action. ``strict`` raises (so
+        # ``PolicyRunner`` returns a structured error); non-strict records
+        # the failure on ``_action_controller_error`` for tagging. Reset
+        # to ``None`` at the start of each ``_install_action_controller``
+        # attempt so a previously-failed episode that later succeeds
+        # clears the tag.
+        self._strict_action_controller = bool(strict_action_controller)
+        self._action_controller_error: str | None = None
+
         # #168 - diagnostic logging gate for the STATE side
         # of the policy interface. Set ``STRANDS_LIBERO_STATE_LOG=1`` to
         # emit one structured INFO log line per ``augment_observation``
@@ -538,6 +568,7 @@ class LiberoAdapter(BenchmarkProtocol):
         scene_robot_prefix: str = "robot0_",
         scene_gripper_prefix: str = "gripper0_",
         init_states: np.ndarray | None = None,
+        strict_action_controller: bool = True,
     ) -> LiberoAdapter:
         """Parse a ``.bddl`` file from disk and build an adapter.
 
@@ -566,6 +597,7 @@ class LiberoAdapter(BenchmarkProtocol):
             scene_robot_prefix=scene_robot_prefix,
             scene_gripper_prefix=scene_gripper_prefix,
             init_states=init_states,
+            strict_action_controller=strict_action_controller,
             bddl_path=str(bddl_path),
         )
 
@@ -592,6 +624,7 @@ class LiberoAdapter(BenchmarkProtocol):
         scene_robot_prefix: str = "robot0_",
         scene_gripper_prefix: str = "gripper0_",
         init_states: np.ndarray | None = None,
+        strict_action_controller: bool = True,
     ) -> LiberoAdapter:
         """Parse a BDDL string directly - useful in tests."""
         problem = parse_bddl(bddl_text)
@@ -615,6 +648,7 @@ class LiberoAdapter(BenchmarkProtocol):
             scene_robot_prefix=scene_robot_prefix,
             scene_gripper_prefix=scene_gripper_prefix,
             init_states=init_states,
+            strict_action_controller=strict_action_controller,
             bddl_source=bddl_text,
         )
 
@@ -1092,7 +1126,12 @@ class LiberoAdapter(BenchmarkProtocol):
         # Install the OSC_POSE action controller so GR00T's task-space
         # delta-EEF actions translate to joint torques (#168
         # bug). Same idempotency / best-effort pattern as the other
-        # prewarm steps.
+        # prewarm steps. NOTE (#522): prewarm stays best-effort even when
+        # strict_action_controller=True - it runs before the recorder
+        # starts and only primes rendering. on_episode_start re-installs
+        # the controller and is the authoritative gate that surfaces a
+        # strict failure as an eval error, so swallowing it here just
+        # avoids aborting the rendering warmup early.
         try:
             self._install_action_controller(sim)
         except Exception as e:  # noqa: BLE001
@@ -2264,10 +2303,28 @@ class LiberoAdapter(BenchmarkProtocol):
         PD with inverse-Jacobian) and a direct gripper-actuator
         write for the 7th channel.
 
-        Best-effort: missing robosuite, missing site, missing actuator
-        IDs - all log + skip without raising. The eval will run with
-        actions silently dropped (the #168 status quo), which at
-        least doesn't crash.
+        Failure handling (#522): a GR00T/torque-action policy that
+        needs this controller scores ``success_rate=0`` on EVERY episode
+        when the install fails and the actions get dropped - a broken
+        *setup* then reads as a bad *policy* on a green (exit-0) run.
+        To stop masking that:
+
+        * When ``strict_action_controller`` is ``True`` (default), any
+          install failure RAISES. ``on_episode_start`` propagates it and
+          :meth:`PolicyRunner._evaluate_with_spec` converts it into a
+          structured ``{"status": "error", ...}`` dict - the caller/CI
+          can tell "controller failed to install" apart from "policy
+          scored 0".
+        * When ``False``, the failure is logged at WARNING and recorded
+          on :attr:`_action_controller_error` (so callers can still tag
+          the result) before falling through to the no-op name-lookup
+          path - the pre-#522 best-effort behaviour.
+        * Dependency-clash failures (``ImportError`` / ``AttributeError``
+          from the import chain - e.g. the ``numba`` / ``coverage>=7``
+          incompatibility) are ALWAYS re-raised with a remediation hint,
+          regardless of the flag, because they are fixable
+          environment-level breakage, not a legitimate "no controller
+          needed" condition.
 
         Lifecycle: tied to the loaded scene's compiled model. Since
         ``_apply_canonical_state``'s init-state apply may have already
@@ -2277,6 +2334,9 @@ class LiberoAdapter(BenchmarkProtocol):
         ``_backend_state`` is fresh so callers must re-install via
         ``prewarm`` or another ``on_episode_start`` cycle.
         """
+        # Clear any prior-episode failure tag - a re-install that now
+        # succeeds must not leave a stale error around.
+        self._action_controller_error = None
         try:
             controller = _LiberoOSCController.from_sim(
                 sim,
@@ -2284,18 +2344,65 @@ class LiberoAdapter(BenchmarkProtocol):
                 arm_prefix=self._scene_robot_prefix,
                 gripper_prefix=self._scene_gripper_prefix,
             )
+        except (ImportError, AttributeError) as e:
+            # Defense-in-depth: an import/attribute error escaped from_sim's
+            # own classification (it normally wraps these). Treat the known
+            # numba/coverage>=7 clash as fatal (surface it, #522); anything
+            # else degrades like a missing optional dep.
+            if _is_numba_coverage_clash(e):
+                remediation = self._action_controller_remediation(e)
+                msg = (
+                    f"OSC action controller import failed ({type(e).__name__}: {e}). "
+                    f"GR00T/torque actions cannot be dispatched. {remediation}"
+                )
+                self._action_controller_error = msg
+                logger.error("LiberoAdapter._install_action_controller: %s", msg)
+                raise _ControllerInstallError(msg) from e
+            msg = f"OSC controller dependencies unavailable ({type(e).__name__}: {e}); GR00T actions will no-op."
+            self._action_controller_error = msg
+            logger.warning("LiberoAdapter._install_action_controller: %s", msg)
+            return
+        except _ControllerDependencyMissing as e:
+            # An optional dep (mujoco / robosuite) is genuinely absent.
+            # This is environmental, not a fixable setup bug, so degrade
+            # gracefully even in strict mode: requiring robosuite as a
+            # hard dep would break installs without the optional extras.
+            msg = (
+                f"{e}. GR00T actions will no-op: the OSC controller's optional "
+                "dependencies (robosuite + mujoco) are not available in this environment."
+            )
+            self._action_controller_error = msg
+            logger.warning("LiberoAdapter._install_action_controller: %s", msg)
+            return
         except _ControllerInstallError as e:
+            msg = (
+                f"{e}. GR00T actions would no-op without the OSC controller "
+                "(missing site/actuator IDs, broken import, etc.)."
+            )
+            self._action_controller_error = msg
+            if self._strict_action_controller:
+                logger.error("LiberoAdapter._install_action_controller: %s", msg)
+                raise _ControllerInstallError(msg) from e
             logger.warning(
-                "LiberoAdapter._install_action_controller: %s. "
-                "GR00T actions will silently no-op until this is resolved.",
-                e,
+                "LiberoAdapter._install_action_controller: %s "
+                "Running in non-strict mode: GR00T actions will no-op until this is resolved "
+                "(set strict_action_controller=True to surface this as an eval error).",
+                msg,
             )
             return
-        except Exception as e:  # noqa: BLE001 - never abort eval on controller failure
+        except Exception as e:
+            # Unexpected failure class. Treat the same as a controller
+            # install error: strict raises, non-strict records + warns.
+            msg = f"unexpected OSC controller install failure ({type(e).__name__}: {e})"
+            self._action_controller_error = msg
+            if self._strict_action_controller:
+                logger.error("LiberoAdapter._install_action_controller: %s", msg)
+                raise _ControllerInstallError(msg) from e
             logger.warning(
-                "LiberoAdapter._install_action_controller: unexpected failure (%s); "
-                "GR00T actions will silently no-op until this is resolved.",
-                e,
+                "LiberoAdapter._install_action_controller: %s; "
+                "GR00T actions will no-op until this is resolved "
+                "(set strict_action_controller=True to surface this as an eval error).",
+                msg,
             )
             return
 
@@ -2311,6 +2418,28 @@ class LiberoAdapter(BenchmarkProtocol):
             controller.eef_site_name,
             len(controller.arm_actuator_ids),
             len(controller.gripper_actuator_ids),
+        )
+
+    @staticmethod
+    def _action_controller_remediation(error: BaseException) -> str:
+        """Build a remediation hint for a dependency-clash install failure.
+
+        Detects the known ``numba`` / ``coverage>=7`` incompatibility
+        (#522) via :func:`_is_numba_coverage_clash` and surfaces a targeted
+        fix; falls back to a generic hint for other failures.
+        """
+        if _is_numba_coverage_clash(error):
+            return (
+                "This is the known numba/coverage>=7 incompatibility: numba's "
+                "coverage_support module subclasses coverage.types.Tracer, which "
+                "coverage>=7 removed. Remediation: uninstall the conflicting "
+                "coverage from the eval environment ('pip uninstall coverage'), or "
+                "pin coverage<7, or upgrade numba to a release that no longer "
+                "imports coverage.types.Tracer."
+            )
+        return (
+            "Ensure the OSC controller dependencies (robosuite and its "
+            "transitive imports) are importable in this environment."
         )
 
     def _install_libero_cameras(self, sim: SimEngine) -> None:
@@ -3405,10 +3534,48 @@ def _build_scene_robot_wrapper(
 
 class _ControllerInstallError(RuntimeError):
     """Raised inside :meth:`_LiberoOSCController.from_sim` when the
-    LIBERO action controller can't be built (missing robosuite,
-    missing site/actuator IDs, etc.). Caught by
-    :meth:`LiberoAdapter._install_action_controller` and converted to
-    a WARNING log + silent fall-through to ``_apply_action_by_name``."""
+    LIBERO action controller can't be built but the prerequisites ARE
+    present (missing site / actuator IDs, wrong arm-joint count, a
+    broken-but-installed import such as the numba/coverage>=7 clash,
+    etc.). With ``strict_action_controller=True`` (the default),
+    :meth:`LiberoAdapter._install_action_controller` re-raises this so
+    ``PolicyRunner`` returns a structured eval error instead of silently
+    dropping every GR00T action (#522)."""
+
+
+class _ControllerDependencyMissing(_ControllerInstallError):
+    """Raised when a required optional dependency for the OSC controller
+    is genuinely absent (``ModuleNotFoundError`` from importing mujoco /
+    robosuite, e.g. no EGL/OpenGL backend on a headless box, or the
+    ``[sim-mujoco]`` extra not installed). This is an environmental /
+    optional-dep condition, not a fixable setup bug, so
+    :meth:`LiberoAdapter._install_action_controller` always degrades
+    gracefully (WARNING + record + no-op) regardless of
+    ``strict_action_controller`` - requiring robosuite as a hard
+    dependency here would break every install without the optional
+    extras."""
+
+
+def _is_numba_coverage_clash(error: BaseException) -> bool:
+    """Recognise the ``numba`` / ``coverage>=7`` import incompatibility (#522).
+
+    ``numba/misc/coverage_support.py`` defines
+    ``class NumbaTracer(coverage.types.Tracer)``, but ``coverage>=7``
+    removed ``coverage.types.Tracer`` - so importing ``numba`` (pulled in
+    transitively by robosuite's OSC controller path) raises
+    ``AttributeError: module 'coverage.types' has no attribute 'Tracer'``.
+    Walk the exception chain so the signature is still recognised when the
+    AttributeError is wrapped by a later ImportError.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = error
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        text = str(cur)
+        if "coverage.types" in text and "Tracer" in text:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 class _LiberoOSCController:
@@ -3571,32 +3738,68 @@ class _LiberoOSCController:
         - EEF site ID (e.g. ``gripper0_grip_site``)
         - actuator force/torque limits (``model.actuator_ctrlrange``)
 
-        Raises :class:`_ControllerInstallError` with a diagnostic on
-        any discovery failure. The caller (``_install_action_controller``)
-        catches and logs at WARNING.
+        Raises :class:`_ControllerDependencyMissing` when an optional dep
+        (mujoco / robosuite / their transitive imports) is unavailable or
+        the sim has no compiled MuJoCo model - the caller degrades
+        gracefully. Raises the base :class:`_ControllerInstallError` for a
+        fixable setup failure (missing site / actuator IDs, wrong arm-joint
+        count, or the known numba/coverage>=7 clash) - in strict mode the
+        caller re-raises so ``PolicyRunner`` returns a structured eval
+        error instead of silently dropping every GR00T action (#522).
         """
         # Lazy imports - robosuite is a transitive dep via libero,
-        # not pinned directly. Skip silently if either is unavailable.
+        # not pinned directly. A genuinely-missing module
+        # (``ModuleNotFoundError`` - the package or one of its native
+        # extensions is not installed, e.g. no EGL/OpenGL backend on a
+        # headless box) raises ``_ControllerDependencyMissing`` so the
+        # caller degrades gracefully; that is an environmental / optional-
+        # dep condition, not a fixable setup bug. An import that fails for
+        # ANOTHER reason while the module IS importable-but-broken (e.g.
+        # the numba/coverage>=7 ``AttributeError`` clash) raises the base
+        # ``_ControllerInstallError`` so the caller can surface it (#522).
         try:
             import mujoco as _mj
+        except ModuleNotFoundError as e:
+            raise _ControllerDependencyMissing(f"mujoco not available: {e}") from e
         except ImportError as e:
-            raise _ControllerInstallError(f"mujoco not importable: {e}") from e
+            if _is_numba_coverage_clash(e):
+                raise _ControllerInstallError(f"mujoco import hit the numba/coverage clash: {e}") from e
+            raise _ControllerDependencyMissing(f"mujoco import failed (treated as unavailable): {e}") from e
         try:
             from robosuite.controllers import (  # type: ignore[import-not-found]
                 controller_factory,
                 load_controller_config,
             )
             from robosuite.utils.binding_utils import MjSim  # type: ignore[import-not-found]
-        except ImportError as e:
-            raise _ControllerInstallError(f"robosuite not importable: {e}") from e
+        except (ImportError, AttributeError) as e:
+            # The robosuite OSC import chain failed. Two cases:
+            #   1. The known numba/coverage>=7 clash (#522) - a FIXABLE
+            #      environment problem - surface it strictly so the eval
+            #      returns an error instead of scoring success_rate=0 with
+            #      every action dropped.
+            #   2. Any other import-time failure (robosuite/mujoco/cv2/EGL
+            #      simply not installed or unimportable on this host) -
+            #      degrade like a missing optional dep; requiring robosuite
+            #      as a hard dependency would break installs without the
+            #      optional extras.
+            if _is_numba_coverage_clash(e):
+                raise _ControllerInstallError(f"robosuite OSC import hit the numba/coverage clash: {e}") from e
+            raise _ControllerDependencyMissing(
+                f"robosuite OSC controller imports unavailable: {type(e).__name__}: {e}"
+            ) from e
 
         world = getattr(sim, "_world", None)
         if world is None:
-            raise _ControllerInstallError("sim has no _world")
+            # No MuJoCo world to bind to. In a real eval, on_episode_start
+            # loads the scene (and would surface that failure separately)
+            # before reaching here, so this only fires for non-MuJoCo
+            # backends / stub sims - a "controller not applicable" degrade,
+            # not the #522 strict-surface case.
+            raise _ControllerDependencyMissing("sim has no _world")
         model = getattr(world, "_model", None)
         data = getattr(world, "_data", None)
         if model is None or data is None:
-            raise _ControllerInstallError("sim._world has no compiled MuJoCo model/data")
+            raise _ControllerDependencyMissing("sim._world has no compiled MuJoCo model/data")
 
         # 1. Discover arm joints (robot0_joint1..7).
         arm_joint_ids: list[int] = []
@@ -3617,7 +3820,12 @@ class _LiberoOSCController:
             # complex, but arm joints are hinges.)
             arm_qvel_addrs.append(int(model.jnt_dofadr[i]))
         if len(arm_joint_ids) != 7:
-            raise _ControllerInstallError(
+            # The compiled scene isn't a RoboSuite/LIBERO Panda (or uses a
+            # different prefix). This is a "controller not applicable to
+            # this scene" condition, not the fixable #522 import clash, so
+            # degrade rather than abort the eval - a real LIBERO eval loads
+            # a validated Panda scene before reaching here.
+            raise _ControllerDependencyMissing(
                 f"expected 7 arm joints with prefix {arm_prefix!r}, found {len(arm_joint_ids)}"
             )
 
@@ -3630,7 +3838,7 @@ class _LiberoOSCController:
                     arm_actuator_ids.append(ai)
                     break
             else:
-                raise _ControllerInstallError(
+                raise _ControllerDependencyMissing(
                     f"no actuator found driving joint id={jid} (joint name "
                     f"{_mj.mj_id2name(model, _mj.mjtObj.mjOBJ_JOINT, jid)!r})"
                 )
@@ -3643,12 +3851,12 @@ class _LiberoOSCController:
             if isinstance(aname, str) and aname.startswith(gripper_prefix):
                 gripper_actuator_ids.append(ai)
         if not gripper_actuator_ids:
-            raise _ControllerInstallError(f"no gripper actuators with prefix {gripper_prefix!r}")
+            raise _ControllerDependencyMissing(f"no gripper actuators with prefix {gripper_prefix!r}")
 
         # 4. Verify EEF site exists.
         site_id = _mj.mj_name2id(model, _mj.mjtObj.mjOBJ_SITE, eef_site_name)
         if site_id < 0:
-            raise _ControllerInstallError(f"EEF site {eef_site_name!r} not found in model")
+            raise _ControllerDependencyMissing(f"EEF site {eef_site_name!r} not found in model")
 
         # 5. Build robosuite MjSim shim around our model + data.
         # robosuite==1.4.0 ``MjSim.__init__(self, model)`` takes only
